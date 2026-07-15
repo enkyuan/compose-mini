@@ -1,27 +1,24 @@
 #ifndef UTILS_H
 #define UTILS_H
 
-/* Phase 2 (core math) implements all functions below.
- * Every other component depends on this header. */
+/* Float-buffer allocation and row-major math primitives used by the model. */
 
-/* Allocate a zero-initialized float array of length n.
- * Phase 2: wrap calloc, assert on failure. */
+/* Allocate n zero-initialized floats; n must be positive. */
 float* utils_alloc(int n);
 
-/* Free a float array allocated by utils_alloc.
- * Phase 2: wrap free. */
+/* Free memory returned by utils_alloc; p may be NULL. */
 void utils_free(float* p);
 
-/* Matrix multiply: out[m x n] = a[m x k] @ b[k x n].
- * Phase 2: naive triple loop; Phase 6 (bench): swap loop order for cache efficiency. */
+/*
+ * Multiply row-major matrices: out[m x n] = a[m x k] @ b[k x n].
+ * Arrays are contiguous and row-major; output must not alias either input.
+ */
 void matmul(float* out, const float* a, const float* b, int m, int k, int n);
 
-/* In-place softmax over array x of length n.
- * Phase 2: subtract max for numerical stability before exp. */
+/* Apply max-shifted softmax to n finite values in place; n must be positive. */
 void softmax(float* x, int n);
 
-/* Transpose: out[cols x rows] = in[rows x cols]^T.
- * Phase 2: simple index swap. */
+/* Transpose a row-major [rows x cols] array into separate output storage. */
 void transpose(float* out, const float* in, int rows, int cols);
 
 #endif /* UTILS_H */

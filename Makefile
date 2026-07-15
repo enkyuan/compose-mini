@@ -1,5 +1,6 @@
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -Werror -Iinclude
+LDLIBS  = -lm
 SRC     = $(shell find src -name '*.c')
 OBJ     = $(patsubst src/%.c, build/%.o, $(SRC))
 BIN     = bin/transformer
@@ -12,7 +13,7 @@ TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(TEST_SRC))
 all: $(BIN)
 
 $(BIN): $(OBJ) build/main.o | bin
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 build/main.o: main.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -22,10 +23,10 @@ build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 bin/tests/%: tests/%.c $(OBJ) | bin/tests
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 test: $(TEST_BIN)
-	@for t in $(TEST_BIN); do echo "Running $$t..."; $$t; done
+	@set -e; for t in $(TEST_BIN); do echo "Running $$t..."; $$t; done
 
 clean:
 	rm -rf build bin

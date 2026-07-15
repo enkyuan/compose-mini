@@ -1,22 +1,42 @@
+/* Allocation and row-major math primitives shared by model components. */
+
+#include <assert.h>
+#include <math.h>
+#include <stdlib.h>
 #include "utils.h"
 
-/* Phase 2: implement utils_alloc — calloc(n, sizeof(float)), assert non-null. */
-float* utils_alloc(int n) { (void)n; return 0; }
-
-/* Phase 2: implement utils_free — free(p). */
-void utils_free(float* p) { (void)p; }
-
-/* Phase 2: implement matmul — triple loop: i,j,k over m,n,k dims.
- * Phase 6 (bench): reorder to k,i,j for better cache locality. */
-void matmul(float* out, const float* a, const float* b, int m, int k, int n) {
-    (void)out; (void)a; (void)b; (void)m; (void)k; (void)n;
+float* utils_alloc(int n) {
+    assert(n > 0);
+    float* p = calloc((size_t)n, sizeof *p);
+    assert(p);
+    return p;
 }
 
-/* Phase 2: implement softmax — find max, subtract, exp, normalize.
- * Numerical stability: x[i] = exp(x[i]-max) / sum(exp(x[j]-max)). */
-void softmax(float* x, int n) { (void)x; (void)n; }
+void utils_free(float* p) { free(p); }
 
-/* Phase 2: implement transpose — out[j*rows+i] = in[i*cols+j]. */
+void matmul(float* out, const float* a, const float* b, int m, int k, int n) {
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int p = 0; p < k; p++) sum += a[i * k + p] * b[p * n + j];
+            out[i * n + j] = sum;
+        }
+}
+
+/* Subtracting the maximum preserves softmax and prevents expf overflow. */
+void softmax(float* x, int n) {
+    assert(x && n > 0);
+    float max = x[0], sum = 0.0f;
+    for (int i = 1; i < n; i++) if (x[i] > max) max = x[i];
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - max);
+        sum += x[i];
+    }
+    const float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv_sum;
+}
+
 void transpose(float* out, const float* in, int rows, int cols) {
-    (void)out; (void)in; (void)rows; (void)cols;
+    for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++) out[j * rows + i] = in[i * cols + j];
 }
