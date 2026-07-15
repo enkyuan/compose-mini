@@ -1,13 +1,12 @@
 #ifndef NORM_H
 #define NORM_H
 
-/* Phase 3 (components) implements all functions below.
- * Depends on: utils.h */
+/* Layer normalization for individual encoder hidden-state vectors. */
 
-/* Layer normalization over vector x of dimension d.
- * out[i] = gamma[i] * (x[i] - mean) / sqrt(var + eps) + beta[i]
- * Phase 3: compute mean, variance, normalize, scale+shift.
- * eps = 1e-5 for numerical stability. */
+/*
+ * Normalize x[d] into out[d] with population variance and epsilon 1e-5,
+ * then apply gamma[d] and beta[d]; d must be positive.
+ */
 void layernorm(float* out, const float* x,
                const float* gamma, const float* beta, int d);
 
