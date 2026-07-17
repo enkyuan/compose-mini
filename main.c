@@ -1,11 +1,10 @@
 #include <stdio.h>
 
-/* Entry point — Phase 5 (inference loop) will:
- *   - parse CLI args for data path and model config
- *   - call data_load() to read and normalize OHLCV CSV
- *   - call transformer_init() to allocate model weights
- *   - run transformer_forward() over input windows
- *   - print next-step price predictions to stdout
+/*
+ * Planned forecasting CLI; main currently prints a placeholder.
+ * The CLI will load a trained model and scaler artifact, validate completed
+ * OHLCV windows, run the encoder and prediction head, and emit structured
+ * next-bar forecasts. Training, data retrieval, and trading are out of scope.
  */
 int main(void) {
     printf("compose-mini transformer scaffold\n");

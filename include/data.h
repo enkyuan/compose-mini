@@ -1,13 +1,13 @@
 #ifndef DATA_H
 #define DATA_H
 
-/* Phase 4 (data pipeline) implements all functions below.
- * Depends on: utils.h */
+/* Chronological OHLCV window preparation for inference. */
 
-/* Holds normalized sliding windows of OHLCV data.
- * windows: flat array [num_windows x seq_len x 5]
- * Phase 4: populated by data_load.
- * Phase 5 (inference): iterate windows to feed transformer_forward. */
+/*
+ * Model-feature windows in oldest-to-newest order.
+ * windows is [num_windows x seq_len x 5]. Request metadata and artifact-owned
+ * scaling are not represented yet.
+ */
 typedef struct {
     float* windows;    /* [num_windows x seq_len x 5] */
     int    num_windows;
@@ -15,14 +15,17 @@ typedef struct {
     int    in_dim;     /* always 5 for OHLCV */
 } DataSet;
 
-/* Load OHLCV CSV from path, min-max normalize each feature column,
- * then produce overlapping sliding windows of length seq_len.
- * CSV format: header row, then rows of open,high,low,close,volume.
- * Phase 4: fopen, parse with strtok/strtod, normalize, window.
- * Phase 6 (extensions): add stride parameter for non-overlapping windows. */
+/*
+ * Planned CSV loader; current implementation is a stub.
+ * Target CSV rows are timestamp,open,high,low,close,volume. Timestamp is
+ * request metadata, not a model feature. The caller supplies completed bars
+ * for one instrument and interval; this loader parses and windows them.
+ * TODO(contract): accept the artifact's training-fitted scaler and retain each
+ * window's as-of timestamp and raw close. Never fit a scaler on inference rows.
+ */
 DataSet data_load(const char* path, int seq_len);
 
-/* Free all memory allocated by data_load. */
+/* Release DataSet storage; current implementation is a stub. */
 void data_free(DataSet* ds);
 
 #endif /* DATA_H */

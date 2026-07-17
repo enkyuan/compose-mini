@@ -1,16 +1,16 @@
 #ifndef FFN_H
 #define FFN_H
 
-/* Phase 3 (components) implements all functions below.
- * Depends on: utils.h */
+/* Position-wise feed-forward network for encoder blocks. */
 
-/* Two-layer feed-forward network (per position).
- * hidden = GELU(x @ W1 + b1)   [model_dim → ff_dim]
- * out    = hidden @ W2 + b2     [ff_dim → model_dim]
+/*
+ * Apply a two-layer feed-forward network to one hidden-state vector.
+ * hidden = GELU(x @ W1 + b1)   [model_dim to ff_dim]
+ * out    = hidden @ W2 + b2     [ff_dim to model_dim]
  *
  * ff_dim is typically 4 * model_dim (standard transformer ratio).
- * Phase 3: implement with matmul + pointwise GELU.
- * Phase 6 (extensions): swap GELU for ReLU via compile flag. */
+ * The current implementation is a stub.
+ */
 void ffn_forward(float* out, const float* x,
                  const float* W1, const float* b1,
                  const float* W2, const float* b2,

@@ -5,21 +5,17 @@
 #include "embed.h"
 #include "utils.h"
 
-/* Phase 3: implement transformer_init — utils_alloc each weight field
- * sized according to cfg dimensions. Initialize to zeros. */
+/* Encoder-weight allocation; current implementation is a stub. */
 void transformer_init(TransformerWeights* w, TransformerConfig cfg) {
     (void)w; (void)cfg;
 }
 
-/* Phase 3: implement transformer_free — utils_free each weight field. */
+/* Encoder-weight cleanup; current implementation is a stub. */
 void transformer_free(TransformerWeights* w, TransformerConfig cfg) {
     (void)w; (void)cfg;
 }
 
-/* Phase 3: implement transformer_forward.
- * Loop num_layers times:
- *   embed → norm1 → attention → residual → norm2 → ffn → residual
- * Allocate intermediate buffers with utils_alloc, free after each block. */
+/* Encoder forward pass; current implementation is a stub. */
 void transformer_forward(float* out, const float* x,
                          const TransformerWeights* w,
                          TransformerConfig cfg) {

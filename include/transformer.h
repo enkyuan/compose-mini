@@ -1,8 +1,10 @@
 #ifndef TRANSFORMER_H
 #define TRANSFORMER_H
 
-/* Phase 3 (components) implements all functions below.
- * Depends on: attention.h, ffn.h, norm.h, utils.h */
+/*
+ * Encoder scaffold and hidden-state forward API.
+ * The scalar forecasting head is not defined yet.
+ */
 
 /* Model hyperparameters. Set at init time, immutable during inference. */
 typedef struct {
@@ -14,41 +16,42 @@ typedef struct {
     int in_dim;      /* input feature dimension; 5 for OHLCV */
 } TransformerConfig;
 
-/* Flat weight arrays for one encoder block.
- * Phase 3: allocate with utils_alloc sized by TransformerConfig.
- * Phase 5 (inference): load from binary weight file instead. */
+/*
+ * Flat encoder weights. embed_W is shared; every block field must contain
+ * num_layers consecutive parameter slices in the final artifact.
+ * The current implementation allocates no weights and defines no forecast head.
+ */
 typedef struct {
     float* embed_W;    /* [in_dim x model_dim] input projection */
-    float* Wq;         /* [model_dim x model_dim] query projection */
-    float* Wk;         /* [model_dim x model_dim] key projection */
-    float* Wv;         /* [model_dim x model_dim] value projection */
-    float* Wo;         /* [model_dim x model_dim] output projection */
-    float* norm1_g;    /* [model_dim] layernorm1 gamma */
-    float* norm1_b;    /* [model_dim] layernorm1 beta */
-    float* W1;         /* [model_dim x ff_dim] ffn first layer */
-    float* b1;         /* [ff_dim] ffn first bias */
-    float* W2;         /* [ff_dim x model_dim] ffn second layer */
-    float* b2;         /* [model_dim] ffn second bias */
-    float* norm2_g;    /* [model_dim] layernorm2 gamma */
-    float* norm2_b;    /* [model_dim] layernorm2 beta */
+    float* Wq;         /* [num_layers x model_dim x model_dim] */
+    float* Wk;         /* [num_layers x model_dim x model_dim] */
+    float* Wv;         /* [num_layers x model_dim x model_dim] */
+    float* Wo;         /* [num_layers x model_dim x model_dim] */
+    float* norm1_g;    /* [num_layers x model_dim] */
+    float* norm1_b;    /* [num_layers x model_dim] */
+    float* W1;         /* [num_layers x model_dim x ff_dim] */
+    float* b1;         /* [num_layers x ff_dim] */
+    float* W2;         /* [num_layers x ff_dim x model_dim] */
+    float* b2;         /* [num_layers x model_dim] */
+    float* norm2_g;    /* [num_layers x model_dim] */
+    float* norm2_b;    /* [num_layers x model_dim] */
 } TransformerWeights;
 
-/* Allocate all weight arrays sized by cfg.
- * Phase 3: call utils_alloc for each field.
- * Phase 5 (inference): replace with weight file loader. */
+/* Allocate all weight arrays sized by cfg; current implementation is a stub. */
 void transformer_init(TransformerWeights* w, TransformerConfig cfg);
 
-/* Free all weight arrays.
- * Phase 3: call utils_free for each field. */
+/* Release all weight arrays; current implementation is a stub. */
 void transformer_free(TransformerWeights* w, TransformerConfig cfg);
 
-/* Full forward pass: x[seq_len x in_dim] → out[seq_len x model_dim].
- * Per encoder block:
- *   1. embed_project + embed_positional
- *   2. layernorm1 → attention_forward → residual add
- *   3. layernorm2 → ffn_forward → residual add
- * Phase 3: implement the block loop.
- * Phase 6 (decoder): add causal mask flag to cfg. */
+/*
+ * Encode x[seq_len x in_dim] into out[seq_len x model_dim].
+ *   1. Project input and add positional encoding once.
+ *   2. For each layer: norm1 -> attention -> residual.
+ *   3. For each layer: norm2 -> FFN -> residual.
+ * This returns hidden states, not a forecast. The prediction head will use the
+ * final timestep to predict next-bar log return. The current implementation is
+ * a stub.
+ */
 void transformer_forward(float* out, const float* x,
                          const TransformerWeights* w,
                          TransformerConfig cfg);
