@@ -11,10 +11,10 @@ position sizing, and order execution are outside this runtime.
 
 ## Current status
 
-The core utilities and LayerNorm are implemented and behaviorally tested. Data
-loading, the remaining encoder components, artifact loading, the prediction
-head, and the CLI remain stubs or planned interfaces. The runtime does not yet
-produce forecasts.
+The core utilities, input projection, positional encoding, and LayerNorm are
+implemented and behaviorally tested. Data loading, attention, feed-forward
+blocks, encoder orchestration, artifact loading, the prediction head, and the
+CLI remain stubs or planned interfaces. The runtime does not yet produce forecasts.
 
 ## Runtime input
 
