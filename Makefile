@@ -10,10 +10,12 @@ BIN     = bin/transformer
 HEADERS = $(wildcard include/*.h)
 
 C_TEST_DIR = tests/c
+C_TEST_INCLUDE_DIR = tests/include
 PYTHON_TEST_DIR = tests/python
+TEST_CPPFLAGS = -I$(C_TEST_INCLUDE_DIR)
 TEST_SRC = $(wildcard $(C_TEST_DIR)/test_*.c)
 TEST_SUPPORT_SRC = $(C_TEST_DIR)/artifact_fixture.c
-TEST_SUPPORT_HEADERS = $(C_TEST_DIR)/artifact_fixture.h
+TEST_SUPPORT_HEADERS = $(C_TEST_INCLUDE_DIR)/artifact_fixture.h
 TEST_SUPPORT_OBJ = build/tests/artifact_fixture.o
 BEHAVIOR_TEST_SRC = $(addprefix $(C_TEST_DIR)/, test_artifact.c \
                     test_attention.c test_cli.c test_data.c test_embed.c \
@@ -46,10 +48,10 @@ build/%.o: src/%.c | build
 
 $(TEST_SUPPORT_OBJ): $(TEST_SUPPORT_SRC) $(TEST_SUPPORT_HEADERS) $(HEADERS) | build
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(TEST_CPPFLAGS) $(DEPFLAGS) -c $< -o $@
 
 bin/tests/%: $(C_TEST_DIR)/%.c $(TEST_SUPPORT_OBJ) $(OBJ) $(HEADERS) | bin/tests
-	$(CC) $(CFLAGS) $< $(TEST_SUPPORT_OBJ) $(OBJ) -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(TEST_CPPFLAGS) $< $(TEST_SUPPORT_OBJ) $(OBJ) -o $@ $(LDLIBS)
 
 test: $(BIN) $(BEHAVIOR_TEST_BIN)
 	@set -e; for t in $(BEHAVIOR_TEST_BIN); do echo "Running $$t..."; $$t; done
