@@ -11,8 +11,15 @@ static void assert_array_close(const float* actual, const float* expected, int n
 /* Two distinct layers expose parameter offsets and pre-norm residual order. */
 static void test_forward(void) {
     const TransformerConfig cfg = {2, 1, 2, 2, 2, 2};
+    size_t parameter_count = 0;
+    assert(transformer_parameter_count(cfg, &parameter_count));
+    assert(parameter_count == 79);
+    size_t workspace_count = 0;
+    assert(transformer_workspace_count(cfg, &workspace_count));
+    assert(workspace_count == 22);
+
     TransformerWeights w = {0};
-    transformer_init(&w, cfg);
+    assert(transformer_init(&w, cfg));
     assert(w.storage);
 
     const float g = sqrtf(1.00001f);
@@ -54,7 +61,7 @@ static void test_forward(void) {
 static void test_predict(void) {
     const TransformerConfig cfg = {3, 1, 1, 1, 2, 1};
     TransformerWeights w;
-    transformer_init(&w, cfg);
+    assert(transformer_init(&w, cfg));
 
     /* This configuration places the four head floats at storage[61..64]. */
     const float packed_head[] = {2, -1, .5f, .25f};
@@ -65,9 +72,18 @@ static void test_predict(void) {
     transformer_free(&w);
 }
 
+static void test_invalid_config(void) {
+    const TransformerConfig invalid = {3, 2, 1, 1, 2, 1};
+    TransformerWeights weights;
+    size_t count = 7;
+    assert(!transformer_parameter_count(invalid, &count) && count == 7);
+    assert(!transformer_init(&weights, invalid) && !weights.storage);
+}
+
 int main(void) {
     test_forward();
     test_predict();
+    test_invalid_config();
     printf("transformer tests passed\n");
     return 0;
 }

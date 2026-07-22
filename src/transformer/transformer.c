@@ -2,6 +2,8 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include "transformer.h"
 #include "attention.h"
 #include "embed.h"
@@ -9,25 +11,55 @@
 #include "norm.h"
 #include "utils.h"
 
-static void assert_config(TransformerConfig cfg) {
-    assert(cfg.model_dim > 0 && cfg.num_heads > 0 && cfg.ff_dim > 0);
-    assert(cfg.num_layers > 0 && cfg.seq_len > 0 && cfg.in_dim > 0);
-    assert(cfg.model_dim % cfg.num_heads == 0);
-    (void)cfg;
+static int try_add(size_t a, size_t b, size_t* out) {
+    if (b > SIZE_MAX - a) return 0;
+    *out = a + b;
+    return 1;
 }
 
-/* Embedding, per-layer attention/FFN parameters, then the scalar head. */
-static size_t parameter_count(TransformerConfig cfg) {
+static int try_mul(size_t a, size_t b, size_t* out) {
+    if (a && b > SIZE_MAX / a) return 0;
+    *out = a * b;
+    return 1;
+}
+
+int transformer_parameter_count(TransformerConfig cfg, size_t* count) {
+    if (!count || cfg.model_dim <= 0 || cfg.num_heads <= 0 || cfg.ff_dim <= 0 ||
+        cfg.num_layers <= 0 || cfg.seq_len <= 0 || cfg.in_dim <= 0 ||
+        cfg.model_dim % cfg.num_heads != 0)
+        return 0;
+
     const size_t d = (size_t)cfg.model_dim, f = (size_t)cfg.ff_dim;
     const size_t l = (size_t)cfg.num_layers, in = (size_t)cfg.in_dim;
-    const size_t d2 = utils_size_mul(d, d), df = utils_size_mul(d, f);
-    size_t per_layer = utils_size_add(utils_size_mul(4, d2),
-                                      utils_size_mul(2, df));
-    per_layer = utils_size_add(per_layer,
-                               utils_size_add(utils_size_mul(5, d), f));
-    size_t total = utils_size_add(utils_size_mul(in, d),
-                                  utils_size_mul(l, per_layer));
-    return utils_size_add(total, utils_size_add(d, 1));
+    size_t d2, df, matrices, vectors, per_layer, total, value;
+    if (!try_mul(d, d, &d2) || !try_mul(d, f, &df) ||
+        !try_mul(4, d2, &matrices) || !try_mul(2, df, &value) ||
+        !try_add(matrices, value, &matrices) || !try_mul(5, d, &vectors) ||
+        !try_add(vectors, f, &vectors) || !try_add(matrices, vectors, &per_layer) ||
+        !try_mul(in, d, &total) || !try_mul(l, per_layer, &value) ||
+        !try_add(total, value, &total) || !try_add(total, d, &total) ||
+        !try_add(total, 1, &total) || total > SIZE_MAX / sizeof(float))
+        return 0;
+    *count = total;
+    return 1;
+}
+
+int transformer_workspace_count(TransformerConfig cfg, size_t* count) {
+    size_t ignored, hidden, workspace;
+    if (!count || !transformer_parameter_count(cfg, &ignored) ||
+        !try_mul((size_t)cfg.seq_len, (size_t)cfg.model_dim, &hidden) ||
+        !try_mul(5, hidden, &workspace) ||
+        !try_add(workspace, (size_t)cfg.seq_len, &workspace) ||
+        workspace > SIZE_MAX / sizeof(float))
+        return 0;
+    *count = workspace;
+    return 1;
+}
+
+static size_t require_parameter_count(TransformerConfig cfg) {
+    size_t count;
+    if (!transformer_parameter_count(cfg, &count)) abort();
+    return count;
 }
 
 static float* take(float* storage, size_t* offset, size_t count) {
@@ -57,20 +89,27 @@ static void add_in_place(float* out, const float* residual, size_t n) {
     for (size_t i = 0; i < n; i++) out[i] += residual[i];
 }
 
-void transformer_init(TransformerWeights* w, TransformerConfig cfg) {
-    assert(w);
-    assert_config(cfg);
+int transformer_init(TransformerWeights* w, TransformerConfig cfg) {
+    if (!w) return 0;
 
+    TransformerWeights initialized = {0};
+    size_t total;
+    if (!transformer_parameter_count(cfg, &total)) {
+        *w = initialized;
+        return 0;
+    }
     const size_t d = (size_t)cfg.model_dim, f = (size_t)cfg.ff_dim;
     const size_t l = (size_t)cfg.num_layers, in = (size_t)cfg.in_dim;
     const size_t d2 = utils_size_mul(d, d), df = utils_size_mul(d, f);
     const size_t ld = utils_size_mul(l, d), lf = utils_size_mul(l, f);
     const size_t ld2 = utils_size_mul(l, d2), ldf = utils_size_mul(l, df);
-    const size_t total = parameter_count(cfg);
-    TransformerWeights initialized = {0};
     size_t offset = 0;
 
-    initialized.storage = utils_alloc(total);
+    initialized.storage = calloc(total, sizeof *initialized.storage);
+    if (!initialized.storage) {
+        *w = initialized;
+        return 0;
+    }
     initialized.embed_W = take(initialized.storage, &offset,
                                utils_size_mul(in, d));
     initialized.Wq = take(initialized.storage, &offset, ld2);
@@ -89,6 +128,7 @@ void transformer_init(TransformerWeights* w, TransformerConfig cfg) {
     initialized.head_b = take(initialized.storage, &offset, 1);
     assert(offset == total);
     *w = initialized;
+    return 1;
 }
 
 void transformer_free(TransformerWeights* w) {
@@ -101,7 +141,7 @@ void transformer_forward(float* out, const float* x,
                          const TransformerWeights* w,
                          TransformerConfig cfg) {
     assert(out && x && out != x);
-    assert_config(cfg);
+    (void)require_parameter_count(cfg);
     assert_encoder_weights(w);
 
     const int d = cfg.model_dim, f = cfg.ff_dim, s = cfg.seq_len;
@@ -147,7 +187,7 @@ float transformer_predict(const float* hidden,
                           const TransformerWeights* w,
                           TransformerConfig cfg) {
     assert(hidden && w && w->head_W && w->head_b);
-    assert_config(cfg);
+    (void)require_parameter_count(cfg);
 
     const size_t final_offset =
         (size_t)(cfg.seq_len - 1) * (size_t)cfg.model_dim;

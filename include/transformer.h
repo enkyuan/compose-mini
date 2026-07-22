@@ -1,6 +1,8 @@
 #ifndef TRANSFORMER_H
 #define TRANSFORMER_H
 
+#include <stddef.h>
+
 /* Encoder weights, hidden-state forward pass, and scalar prediction head. */
 
 /* Model hyperparameters. Set at init time, immutable during inference. */
@@ -36,8 +38,14 @@ typedef struct {
     float* head_b;     /* [1] */
 } TransformerWeights;
 
-/* Initialize a fresh object with one zeroed parameter block and field views. */
-void transformer_init(TransformerWeights* w, TransformerConfig cfg);
+/* Validate cfg and return its exact float count; false leaves count unchanged. */
+int transformer_parameter_count(TransformerConfig cfg, size_t* count);
+
+/* Return peak internal forward scratch in floats; false leaves count unchanged. */
+int transformer_workspace_count(TransformerConfig cfg, size_t* count);
+
+/* Initialize a fresh object and field views; return false on invalid cfg/OOM. */
+int transformer_init(TransformerWeights* w, TransformerConfig cfg);
 
 /* Release parameter storage and clear all field views; w may be NULL. */
 void transformer_free(TransformerWeights* w);

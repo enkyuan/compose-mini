@@ -13,9 +13,9 @@ position sizing, and order execution are outside this runtime.
 
 The core utilities, input projection, positional encoding, attention,
 feed-forward math, LayerNorm, pre-norm encoder orchestration, and scalar head
-are implemented and behaviorally tested. Data loading, artifact loading, and
-the CLI remain stubs or planned interfaces. The runtime does not yet produce
-forecasts.
+are implemented and behaviorally tested. The versioned artifact loader and
+training-fitted scalers are also implemented. Data loading and the CLI remain
+stubs or planned interfaces. The runtime does not yet produce forecasts.
 
 ## Runtime input
 
@@ -84,6 +84,9 @@ An offline training pipeline produces the artifact. It contains:
 
 Inference always uses the artifact's training-fitted statistics. It never fits
 normalization from an inference file or window.
+
+See [artifact-format.md](artifact-format.md) for the exact V1 byte layout and
+weight order.
 
 ## Internal boundary
 
