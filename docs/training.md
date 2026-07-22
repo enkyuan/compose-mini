@@ -152,18 +152,50 @@ zero-copy sliding views over one scaled feature tensor, trains on scaled log
 returns, restores the best validation weights, evaluates chronologically, and
 atomically writes a checksummed artifact. Its final JSON labels validation MSE
 as scaled-target loss and reports raw-return MSE/MAE, predicted-close MAE, and
-last-close baseline MAE for the test segment.
+last-close baseline MAE and direction accuracy for the test segment.
 
-Run the optional PyTorch integration test after installing the framework:
+## Compare configurations and baselines
+
+Run the same experiment independently over one or more instruments:
+
+```sh
+python tools/experiment.py experiments/sweep.example.json \
+  reports/market.json \
+  AAPL=data/aapl-30m.csv \
+  MSFT=data/msft-30m.csv
+```
+
+The sweep compares the Transformer with ridge linear regression, a one-hidden-
+layer MLP, a trailing-mean return, and the zero-return last-close baseline. It
+uses expanding walk-forward validation folds and repeated seeds. Candidates
+with different sequence lengths are aligned to identical target timestamps.
+Each model's configuration is selected only by mean validation scaled-return
+MSE, then evaluated once on a final untouched test holdout.
+
+Each CSV remains an independent model problem because artifact schema 1 stores
+one feature scaler and must never form windows across instruments. The report
+macro-averages return metrics so every instrument, fold, and seed has equal
+weight. It keeps dollar close MAE separate by instrument, including each seed's
+absolute and relative difference from last-close, and records sample counts,
+dataset hashes, runtime versions, and exact target-time ranges. Reports are
+atomic, strict JSON under the ignored `reports/` directory. Run and diagnostic
+model-size limits reject accidental compute or memory explosions; raise
+`--max-runs` only after estimating the required compute.
+
+After choosing a Transformer candidate, pass its values to `tools/train.py` to
+fit and export the deployable V1 artifact. Diagnostic linear and MLP models are
+not serialized as Transformer artifacts.
+
+Run the optional PyTorch integration tests after installing the framework:
 
 ```sh
 make check-training
 ```
 
-It performs a tiny deterministic optimization, restores and exports the chosen
-checkpoint, and compares its PyTorch forecasts with C using the learned
-scalers. A separate fixture compares exported operators with the scalar
-reference.
+They perform a tiny deterministic optimization, restore and export the chosen
+checkpoint, compare PyTorch forecasts with C, and verify fold alignment,
+validation-only selection, baselines, run limits, and strict experiment JSON.
+A separate fixture compares exported operators with the scalar reference.
 
 Run inference by supplying the next target timestamp for the newest window:
 

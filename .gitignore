@@ -59,6 +59,7 @@ dkms.conf
 /bin/
 /data/
 /models/
+/reports/
 
 # Python bytecode
 __pycache__/

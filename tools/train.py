@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import argparse
 import json
@@ -124,6 +125,26 @@ class Windows(Dataset):
         )
 
 
+@dataclass(frozen=True)
+class TrainingData:
+    """Own one leakage-safe chronological split and its fitted scalers."""
+
+    train: Windows
+    validation: Windows
+    test: Windows
+    feature_mean: torch.Tensor
+    feature_scale: torch.Tensor
+    target_mean: torch.Tensor
+    target_scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Fit:
+    best_validation_scaled_mse: float
+    best_epoch: int
+    epochs_trained: int
+
+
 def mean_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     total = 0.0
@@ -153,7 +174,8 @@ def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Opt
 def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
              target_scale: torch.Tensor, device: torch.device) -> dict[str, float]:
     totals = {"return_squared": 0.0, "return_absolute": 0.0,
-              "close_absolute": 0.0, "baseline_close_absolute": 0.0}
+              "close_absolute": 0.0, "baseline_close_absolute": 0.0,
+              "direction_correct": 0.0}
     model.eval()
     with torch.no_grad():
         for features, targets, latest, actual in loader:
@@ -165,12 +187,16 @@ def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
             totals["return_absolute"] += difference.abs().sum().item()
             totals["close_absolute"] += (predicted_close - actual).abs().sum().item()
             totals["baseline_close_absolute"] += (latest - actual).abs().sum().item()
+            totals["direction_correct"] += (
+                predicted_return.sign() == actual_return.sign()
+            ).sum().item()
     count = len(loader.dataset)
     return {
         "return_mse": totals["return_squared"] / count,
         "return_mae": totals["return_absolute"] / count,
         "close_mae": totals["close_absolute"] / count,
         "last_close_baseline_mae": totals["baseline_close_absolute"] / count,
+        "direction_accuracy": totals["direction_correct"] / count,
     }
 
 
@@ -202,6 +228,102 @@ def split_counts(samples: int, train_fraction: float,
     if min(train, validation, test) <= 0:
         raise ValueError("chronological train, validation, and test splits must be nonempty")
     return train, validation, test
+
+
+def prepare_data(path: Path, config: Config, train_fraction: float,
+                 validation_fraction: float,
+                 split: tuple[int, int, int] | None = None,
+                 sample_start: int = 0) -> TrainingData:
+    """Scale one target-time split using only rows reachable by its training inputs."""
+    rows = read_csv(path)
+    row_count = len(rows) // FEATURE_COUNT
+    if row_count <= config.seq_len:
+        raise ValueError("training requires at least seq_len + 1 rows")
+    # The clone gives PyTorch ownership before the compact parser buffer is released.
+    raw = torch.frombuffer(rows, dtype=torch.float32).view(
+        row_count, FEATURE_COUNT,
+    ).clone()
+    del rows
+    if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
+        raise ValueError("CSV values must remain finite binary32 with positive closes")
+    closes = raw[:, 3].clone()
+    raw_targets = torch.log(closes[1:] / closes[:-1])[config.seq_len - 1:]
+    if not torch.isfinite(raw_targets).all():
+        raise ValueError("close ratios must produce finite log returns")
+
+    available = len(raw_targets) - sample_start
+    counts = split or split_counts(available, train_fraction, validation_fraction)
+    if sample_start < 0 or len(counts) != 3 or min(counts) <= 0 or \
+       sum(counts) > available:
+        raise ValueError("chronological split is outside the available target range")
+    train_count, validation_count, test_count = counts
+    training_rows = raw[
+        sample_start:sample_start + config.seq_len + train_count - 1
+    ]
+    training_targets = raw_targets[sample_start:sample_start + train_count]
+    feature_mean = training_rows.mean(0)
+    feature_scale = training_rows.std(0, unbiased=False)
+    target_mean = training_targets.mean()
+    target_scale = training_targets.std(unbiased=False)
+    if not torch.isfinite(feature_mean).all() or \
+       not torch.isfinite(feature_scale).all() or \
+       not torch.all(feature_scale > 0) or not torch.isfinite(target_mean) or \
+       not torch.isfinite(target_scale) or target_scale <= 0:
+        raise ValueError("training rows require positive finite feature and target scales")
+    features = raw.sub_(feature_mean).div_(feature_scale)
+    targets = (raw_targets - target_mean) / target_scale
+    validation_start = sample_start + train_count
+    test_start = validation_start + validation_count
+    return TrainingData(
+        Windows(features, targets, closes, config.seq_len,
+                sample_start, train_count),
+        Windows(features, targets, closes, config.seq_len,
+                validation_start, validation_count),
+        Windows(features, targets, closes, config.seq_len,
+                test_start, test_count),
+        feature_mean, feature_scale, target_mean, target_scale,
+    )
+
+
+def data_loaders(data: TrainingData, batch_size: int,
+                 seed: int) -> tuple[DataLoader, DataLoader, DataLoader]:
+    generator = torch.Generator().manual_seed(seed)
+    return (
+        DataLoader(data.train, batch_size, shuffle=True, generator=generator),
+        DataLoader(data.validation, batch_size, shuffle=False),
+        DataLoader(data.test, batch_size, shuffle=False),
+    )
+
+
+def fit_model(model: nn.Module, data: TrainingData, batch_size: int,
+              epochs: int, patience: int, learning_rate: float,
+              weight_decay: float, seed: int, device: torch.device,
+              log_epochs: bool = False) -> tuple[Fit, tuple[DataLoader, ...]]:
+    """Fit and restore the checkpoint selected by chronological validation loss."""
+    loaders = data_loaders(data, batch_size, seed)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
+                                  weight_decay=weight_decay)
+    best_loss, best_state, best_epoch, stale = math.inf, None, 0, 0
+    for epoch in range(1, epochs + 1):
+        training_loss = train_epoch(model, loaders[0], optimizer, device)
+        validation_loss = mean_loss(model, loaders[1], device)
+        if not math.isfinite(training_loss) or not math.isfinite(validation_loss):
+            raise FloatingPointError(f"epoch {epoch} produced a non-finite loss")
+        if log_epochs:
+            print(f"epoch={epoch} train={training_loss:.6g} val={validation_loss:.6g}",
+                  file=sys.stderr)
+        if validation_loss < best_loss:
+            best_loss, best_epoch, stale = validation_loss, epoch, 0
+            best_state = {name: value.detach().cpu().clone()
+                          for name, value in model.state_dict().items()}
+        else:
+            stale += 1
+            if stale == patience:
+                break
+    if best_state is None:
+        raise FloatingPointError("training did not produce a finite validation checkpoint")
+    model.load_state_dict(best_state)
+    return Fit(best_loss, best_epoch, epoch), loaders
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -243,84 +365,27 @@ def train(args: argparse.Namespace) -> tuple[ForecastTransformer, Artifact, dict
                         args.layers, args.seq_len)
         config.validate()
         validate_identifiers(args.model_version, args.interval)
-        rows = read_csv(args.csv)
         device = torch.device(args.device)
         if device.type == "meta":
             raise ValueError("device must execute tensors")
         torch.empty(0, device=device)
+        data = prepare_data(args.csv, config, args.train_fraction,
+                            args.validation_fraction)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
-    row_count = len(rows) // FEATURE_COUNT
-    if row_count <= config.seq_len:
-        raise SystemExit("training requires at least seq_len + 1 rows")
 
     torch.manual_seed(args.seed)
     torch.use_deterministic_algorithms(True)
-    # The clone gives PyTorch ownership before the compact parser buffer is released.
-    raw = torch.frombuffer(rows, dtype=torch.float32).view(row_count, FEATURE_COUNT).clone()
-    del rows
-    if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
-        raise SystemExit("CSV values must remain finite binary32 with positive closes")
-    closes = raw[:, 3].clone()
-    raw_targets = torch.log(closes[1:] / closes[:-1])[config.seq_len - 1:]
-    if not torch.isfinite(raw_targets).all():
-        raise SystemExit("close ratios must produce finite log returns")
-    train_count, validation_count, test_count = split_counts(
-        len(raw_targets), args.train_fraction, args.validation_fraction,
-    )
-    # Fit scalers only on unique rows and targets reachable by training samples.
-    training_rows = raw[:config.seq_len + train_count - 1]
-    feature_mean = training_rows.mean(0)
-    feature_scale = training_rows.std(0, unbiased=False)
-    target_mean = raw_targets[:train_count].mean()
-    target_scale = raw_targets[:train_count].std(unbiased=False)
-    if not torch.isfinite(feature_mean).all() or not torch.isfinite(feature_scale).all() or \
-       not torch.all(feature_scale > 0) or not torch.isfinite(target_mean) or \
-       not torch.isfinite(target_scale) or target_scale <= 0:
-        raise SystemExit("training rows require positive finite feature and target scales")
-    features = raw.sub_(feature_mean).div_(feature_scale)
-    targets = (raw_targets - target_mean) / target_scale
-
-    datasets = (
-        Windows(features, targets, closes, config.seq_len, 0, train_count),
-        Windows(features, targets, closes, config.seq_len,
-                train_count, validation_count),
-        Windows(features, targets, closes, config.seq_len,
-                train_count + validation_count, test_count),
-    )
-    generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(datasets[0], args.batch_size, shuffle=True,
-                              generator=generator)
-    validation_loader = DataLoader(datasets[1], args.batch_size, shuffle=False)
-    test_loader = DataLoader(datasets[2], args.batch_size, shuffle=False)
     model = ForecastTransformer(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
-                                  weight_decay=args.weight_decay)
-
-    best_loss, best_state, stale = math.inf, None, 0
-    for epoch in range(1, args.epochs + 1):
-        try:
-            training_loss = train_epoch(model, train_loader, optimizer, device)
-        except FloatingPointError as error:
-            raise SystemExit(str(error)) from error
-        validation_loss = mean_loss(model, validation_loader, device)
-        if not math.isfinite(training_loss) or not math.isfinite(validation_loss):
-            raise SystemExit(f"epoch {epoch} produced a non-finite loss")
-        print(f"epoch={epoch} train={training_loss:.6g} val={validation_loss:.6g}",
-              file=sys.stderr)
-        if validation_loss < best_loss:
-            best_loss = validation_loss
-            best_state = {name: value.detach().cpu().clone()
-                          for name, value in model.state_dict().items()}
-            stale = 0
-        else:
-            stale += 1
-            if stale == args.patience:
-                break
-    if best_state is None:
-        raise SystemExit("training did not produce a finite validation checkpoint")
-    model.load_state_dict(best_state)
-    metrics = evaluate(model, test_loader, target_mean, target_scale, device)
+    try:
+        fit, loaders = fit_model(
+            model, data, args.batch_size, args.epochs, args.patience,
+            args.learning_rate, args.weight_decay, args.seed, device, True,
+        )
+    except FloatingPointError as error:
+        raise SystemExit(str(error)) from error
+    metrics = evaluate(model, loaders[2], data.target_mean,
+                       data.target_scale, device)
     if not all(math.isfinite(value) for value in metrics.values()):
         raise SystemExit("test evaluation produced non-finite metrics")
     if any(not torch.isfinite(parameter).all() for parameter in model.parameters()):
@@ -330,14 +395,16 @@ def train(args: argparse.Namespace) -> tuple[ForecastTransformer, Artifact, dict
         config=config,
         model_version=args.model_version,
         interval=args.interval,
-        feature_mean=tuple(float(value) for value in feature_mean),
-        feature_scale=tuple(float(value) for value in feature_scale),
-        target_mean=float(target_mean),
-        target_scale=float(target_scale),
+        feature_mean=tuple(float(value) for value in data.feature_mean),
+        feature_scale=tuple(float(value) for value in data.feature_scale),
+        target_mean=float(data.target_mean),
+        target_scale=float(data.target_scale),
         weights=export_weights(model),
     )
     report = {"artifact": str(args.artifact),
-              "best_validation_scaled_mse": best_loss, "test": metrics}
+              "best_validation_scaled_mse": fit.best_validation_scaled_mse,
+              "best_epoch": fit.best_epoch,
+              "epochs_trained": fit.epochs_trained, "test": metrics}
     return model, artifact, report
 
 

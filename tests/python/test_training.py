@@ -142,7 +142,7 @@ def verify_restoration(csv: Path, directory: Path) -> None:
         return float(epoch)
 
     metrics = {"return_mse": 0.0, "return_mae": 0.0, "close_mae": 0.0,
-               "last_close_baseline_mae": 0.0}
+               "last_close_baseline_mae": 0.0, "direction_accuracy": 0.0}
     with patch("tools.train.train_epoch", step), \
          patch("tools.train.mean_loss", validate), \
          patch("tools.train.evaluate", return_value=metrics):

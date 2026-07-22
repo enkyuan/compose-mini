@@ -26,6 +26,8 @@ STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, $(STUB_TEST_SRC))
 PYTHON_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_artifact_v1.py \
               test_data_v1.py test_e2e.py test_massive.py)
+PYTORCH_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_training.py \
+               test_experiment.py)
 
 .PHONY: all check check-training test compile-stubs clean run
 
@@ -34,7 +36,8 @@ all: $(BIN)
 check: all test compile-stubs
 
 check-training: all
-	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) $(PYTHON_TEST_DIR)/test_training.py $(BIN)
+	@set -e; for t in $(PYTORCH_TEST); do echo "Running $$t..."; \
+		PYTHONDONTWRITEBYTECODE=1 $(PYTHON) $$t $(BIN); done
 
 $(BIN): $(OBJ) build/main.o | bin
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)

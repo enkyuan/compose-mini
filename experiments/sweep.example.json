@@ -1,0 +1,43 @@
+{
+  "batch_size": 128,
+  "candidates": [
+    {
+      "ff_dim": 64,
+      "heads": 4,
+      "layers": 2,
+      "learning_rate": 0.0003,
+      "mlp_dim": 32,
+      "model_dim": 32,
+      "name": "short-small",
+      "ridge": 0.001,
+      "rolling_window": 8,
+      "seq_len": 16,
+      "weight_decay": 0.0001
+    },
+    {
+      "ff_dim": 256,
+      "heads": 4,
+      "layers": 4,
+      "learning_rate": 0.0003,
+      "mlp_dim": 64,
+      "model_dim": 64,
+      "name": "base",
+      "ridge": 0.001,
+      "rolling_window": 8,
+      "seq_len": 32,
+      "weight_decay": 0.0001
+    }
+  ],
+  "epochs": 100,
+  "fold_fraction": 0.1,
+  "folds": 3,
+  "models": [
+    "transformer",
+    "linear",
+    "mlp",
+    "rolling_mean",
+    "last_close"
+  ],
+  "patience": 10,
+  "seeds": [7, 19, 31]
+}
