@@ -46,9 +46,9 @@ void artifact_free(ModelArtifact* artifact);
 /* Return stable text for logs and CLI errors. */
 const char* artifact_status_string(ArtifactStatus status);
 
-/* Apply training-fitted z-score scaling to row-major OHLCV values in place. */
-void artifact_scale_features(float* values, size_t rows,
-                             const ModelArtifact* artifact);
+/* Scale row-major OHLCV in place; return false if a result is non-finite. */
+int artifact_scale_features(float* values, size_t rows,
+                            const ModelArtifact* artifact);
 
 /* Map the scalar head output from model space back to log-return space. */
 float artifact_unscale_target(float value, const ModelArtifact* artifact);

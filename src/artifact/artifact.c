@@ -245,17 +245,20 @@ const char* artifact_status_string(ArtifactStatus status) {
         messages[status] : "unknown artifact error";
 }
 
-void artifact_scale_features(float* values, size_t rows,
-                             const ModelArtifact* artifact) {
+int artifact_scale_features(float* values, size_t rows,
+                            const ModelArtifact* artifact) {
     assert(values && artifact);
+    int valid = 1;
     for (size_t row = 0; row < rows; row++) {
         for (size_t feature = 0; feature < ARTIFACT_FEATURE_COUNT; feature++) {
             values[feature] =
                 (values[feature] - artifact->feature_mean[feature]) /
                 artifact->feature_scale[feature];
+            valid &= isfinite(values[feature]);
         }
         values += ARTIFACT_FEATURE_COUNT;
     }
+    return valid;
 }
 
 float artifact_unscale_target(float value, const ModelArtifact* artifact) {

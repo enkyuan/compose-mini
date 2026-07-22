@@ -9,9 +9,9 @@ BIN     = bin/transformer
 HEADERS = $(wildcard include/*.h)
 
 TEST_SRC = $(wildcard tests/test_*.c)
-BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_embed.c \
-                    tests/test_ffn.c tests/test_norm.c tests/test_transformer.c \
-                    tests/test_utils.c
+BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_data.c \
+                    tests/test_embed.c tests/test_ffn.c tests/test_norm.c \
+                    tests/test_transformer.c tests/test_utils.c
 BEHAVIOR_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(BEHAVIOR_TEST_SRC))
 STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(STUB_TEST_SRC))

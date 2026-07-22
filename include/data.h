@@ -1,31 +1,51 @@
 #ifndef DATA_H
 #define DATA_H
 
-/* Chronological OHLCV window preparation for inference. */
+#include <stddef.h>
+#include "artifact.h"
 
-/*
- * Model-feature windows in oldest-to-newest order.
- * windows is [num_windows x seq_len x 5]. Request metadata and artifact-owned
- * scaling are not represented yet.
- */
+/* Validated chronological OHLCV rows and zero-copy inference windows. */
+
+#define DATA_TIMESTAMP_CAP 21
+
+typedef enum {
+    DATA_OK = 0,
+    DATA_ARGUMENT,
+    DATA_IO,
+    DATA_FORMAT,
+    DATA_ORDER,
+    DATA_RANGE,
+    DATA_TOO_SHORT,
+    DATA_NOMEM
+} DataStatus;
+
 typedef struct {
-    float* windows;    /* [num_windows x seq_len x 5] */
-    int    num_windows;
-    int    seq_len;
-    int    in_dim;     /* always 5 for OHLCV */
+    void* storage;   /* sole owner of every row buffer below */
+    float* features; /* scaled [num_rows x 5] */
+    float* closes;   /* raw close per row */
+    char (*timestamps)[DATA_TIMESTAMP_CAP];
+    size_t num_rows;
+    size_t num_windows;
+    size_t seq_len;
 } DataSet;
 
-/*
- * Planned CSV loader; current implementation is a stub.
- * Target CSV rows are timestamp,open,high,low,close,volume. Timestamp is
- * request metadata, not a model feature. The caller supplies completed bars
- * for one instrument and interval; this loader parses and windows them.
- * TODO(contract): accept the artifact's training-fitted scaler and retain each
- * window's as-of timestamp and raw close. Never fit a scaler on inference rows.
- */
-DataSet data_load(const char* path, int seq_len);
+typedef struct {
+    const float* features; /* borrowed [seq_len x 5] */
+    const char* as_of;     /* borrowed final-row timestamp */
+    float latest_close;    /* raw final-row close */
+} DataWindow;
 
-/* Release DataSet storage; current implementation is a stub. */
+/* Parse, validate, and scale an exact timestamp,OHLCV CSV into a fresh ds. */
+DataStatus data_load(DataSet* ds, const char* path,
+                     const ModelArtifact* artifact);
+
+/* Borrow window metadata and features; return false when index is invalid. */
+int data_window(const DataSet* ds, size_t index, DataWindow* window);
+
+/* Release row storage and clear the dataset; ds may be NULL. */
 void data_free(DataSet* ds);
+
+/* Return stable text for logs and CLI errors. */
+const char* data_status_string(DataStatus status);
 
 #endif /* DATA_H */

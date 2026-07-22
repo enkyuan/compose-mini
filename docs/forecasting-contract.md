@@ -14,8 +14,9 @@ position sizing, and order execution are outside this runtime.
 The core utilities, input projection, positional encoding, attention,
 feed-forward math, LayerNorm, pre-norm encoder orchestration, and scalar head
 are implemented and behaviorally tested. The versioned artifact loader and
-training-fitted scalers are also implemented. Data loading and the CLI remain
-stubs or planned interfaces. The runtime does not yet produce forecasts.
+training-fitted scalers are also implemented, as is chronological CSV loading
+with zero-copy windows. The CLI remains a stub. The runtime does not yet
+produce forecasts.
 
 ## Runtime input
 
@@ -23,6 +24,7 @@ The process loads one versioned model artifact. A single-window request supplies
 
 - Exactly `seq_len` completed bars for one instrument and interval.
 - Bars ordered oldest to newest with strictly increasing timestamps.
+- Timestamps encoded as canonical UTC `YYYY-MM-DDTHH:MM:SSZ` values.
 - Features in the fixed order `open, high, low, close, volume`.
 - The instrument and interval as metadata. `as_of` is the final bar's timestamp;
   the scheduling layer supplies `target_time`.
@@ -38,8 +40,9 @@ time, and requests whose interval, feature order, or dimensions do not match
 the artifact. The artifact fixes the forecast horizon; callers do not change
 it.
 
-The current CSV and `DataSet` scaffold do not yet carry all required metadata.
-Their interfaces must be extended before artifact-backed inference is complete.
+`DataSet` stores each scaled row, raw close, and timestamp once. Overlapping
+windows borrow row offsets, so input memory remains O(N) instead of
+O(N * seq_len).
 
 ## Runtime output
 

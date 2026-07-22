@@ -113,7 +113,7 @@ static void test_valid(const char* path) {
     assert(artifact.weights.head_b == artifact.weights.storage + 94);
 
     float values[] = {1, 2, 3, 4, 5, 3, 5, 7, 9, 11};
-    artifact_scale_features(values, 2, &artifact);
+    assert(artifact_scale_features(values, 2, &artifact));
     for (size_t i = 0; i < ARTIFACT_FEATURE_COUNT; i++) {
         assert_close(values[i], 0.0f);
         assert_close(values[ARTIFACT_FEATURE_COUNT + i], 1.0f);
