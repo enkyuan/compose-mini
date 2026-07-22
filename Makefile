@@ -9,17 +9,21 @@ DEP     = $(OBJ:.o=.d) build/main.d build/tests/artifact_fixture.d
 BIN     = bin/transformer
 HEADERS = $(wildcard include/*.h)
 
-TEST_SRC = $(wildcard tests/test_*.c)
-TEST_SUPPORT_SRC = tests/artifact_fixture.c
-TEST_SUPPORT_HEADERS = tests/artifact_fixture.h
+C_TEST_DIR = tests/c
+PYTHON_TEST_DIR = tests/python
+TEST_SRC = $(wildcard $(C_TEST_DIR)/test_*.c)
+TEST_SUPPORT_SRC = $(C_TEST_DIR)/artifact_fixture.c
+TEST_SUPPORT_HEADERS = $(C_TEST_DIR)/artifact_fixture.h
 TEST_SUPPORT_OBJ = build/tests/artifact_fixture.o
-BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_cli.c \
-                    tests/test_data.c tests/test_embed.c tests/test_ffn.c \
-                    tests/test_norm.c tests/test_transformer.c tests/test_utils.c
-BEHAVIOR_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(BEHAVIOR_TEST_SRC))
+BEHAVIOR_TEST_SRC = $(addprefix $(C_TEST_DIR)/, test_artifact.c \
+                    test_attention.c test_cli.c test_data.c test_embed.c \
+                    test_ffn.c test_norm.c test_transformer.c test_utils.c)
+BEHAVIOR_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, \
+                    $(BEHAVIOR_TEST_SRC))
 STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
-STUB_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(STUB_TEST_SRC))
-PYTHON_TEST = tests/test_artifact_v1.py tests/test_data_v1.py tests/test_e2e.py
+STUB_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, $(STUB_TEST_SRC))
+PYTHON_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_artifact_v1.py \
+              test_data_v1.py test_e2e.py)
 
 .PHONY: all check check-training test compile-stubs clean run
 
@@ -28,7 +32,7 @@ all: $(BIN)
 check: all test compile-stubs
 
 check-training: all
-	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/test_training.py $(BIN)
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) $(PYTHON_TEST_DIR)/test_training.py $(BIN)
 
 $(BIN): $(OBJ) build/main.o | bin
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
@@ -44,7 +48,7 @@ $(TEST_SUPPORT_OBJ): $(TEST_SUPPORT_SRC) $(TEST_SUPPORT_HEADERS) $(HEADERS) | bu
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-bin/tests/%: tests/%.c $(TEST_SUPPORT_OBJ) $(OBJ) $(HEADERS) | bin/tests
+bin/tests/%: $(C_TEST_DIR)/%.c $(TEST_SUPPORT_OBJ) $(OBJ) $(HEADERS) | bin/tests
 	$(CC) $(CFLAGS) $< $(TEST_SUPPORT_OBJ) $(OBJ) -o $@ $(LDLIBS)
 
 test: $(BIN) $(BEHAVIOR_TEST_BIN)
