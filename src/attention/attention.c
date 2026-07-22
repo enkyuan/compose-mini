@@ -14,9 +14,12 @@ void attention_forward(float* out, const float* x,
     assert(model_dim % num_heads == 0);
 
     const int head_dim = model_dim / num_heads;
-    const int matrix_size = seq_len * model_dim;
+    const size_t matrix_size = utils_size_mul((size_t)seq_len,
+                                              (size_t)model_dim);
+    const size_t scratch_size = utils_size_add(utils_size_mul(3, matrix_size),
+                                               (size_t)seq_len);
     const float scale = 1.0f / sqrtf((float)head_dim);
-    float* scratch = utils_alloc(3 * matrix_size + seq_len);
+    float* scratch = utils_alloc(scratch_size);
     float* key = scratch;
     float* value = key + matrix_size;
     float* context = value + matrix_size;
@@ -29,13 +32,14 @@ void attention_forward(float* out, const float* x,
     for (int t = 0; t < seq_len; t++)
         for (int h = 0; h < num_heads; h++) {
             const int head = h * head_dim;
-            const int query = t * model_dim + head;
+            const size_t query = (size_t)t * (size_t)model_dim + (size_t)head;
 
             for (int s = 0; s < seq_len; s++) {
-                const int source = s * model_dim + head;
+                const size_t source =
+                    (size_t)s * (size_t)model_dim + (size_t)head;
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; d++)
-                    dot += out[query + d] * key[source + d];
+                    dot += out[query + (size_t)d] * key[source + (size_t)d];
                 scores[s] = dot * scale;
             }
 
@@ -43,8 +47,9 @@ void attention_forward(float* out, const float* x,
             for (int d = 0; d < head_dim; d++) {
                 float sum = 0.0f;
                 for (int s = 0; s < seq_len; s++)
-                    sum += scores[s] * value[s * model_dim + head + d];
-                context[query + d] = sum;
+                    sum += scores[s] * value[(size_t)s * (size_t)model_dim +
+                                             (size_t)head + (size_t)d];
+                context[query + (size_t)d] = sum;
             }
         }
 

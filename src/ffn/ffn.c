@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <stddef.h>
 #include "ffn.h"
 
 void ffn_forward(float* out, const float* x,
@@ -13,10 +14,12 @@ void ffn_forward(float* out, const float* x,
 
     for (int h = 0; h < ff_dim; h++) {
         float sum = b1[h];
-        for (int i = 0; i < model_dim; i++) sum += x[i] * W1[i * ff_dim + h];
+        for (int i = 0; i < model_dim; i++)
+            sum += x[i] * W1[(size_t)i * (size_t)ff_dim + (size_t)h];
         const float activation = 0.5f * sum *
             (1.0f + erff(sum * 0.7071067811865475f));
         for (int j = 0; j < model_dim; j++)
-            out[j] += activation * W2[h * model_dim + j];
+            out[j] += activation *
+                      W2[(size_t)h * (size_t)model_dim + (size_t)j];
     }
 }

@@ -18,6 +18,11 @@ static void test_alloc_free(void) {
     utils_free(values);
 }
 
+static void test_size_math(void) {
+    assert(utils_size_add(7, 5) == 12);
+    assert(utils_size_mul(7, 5) == 35);
+}
+
 static void test_matmul(void) {
     const float a[] = {1, 2, 3, 4, 5, 6};
     const float b[] = {7, 8, 9, 10, 11, 12};
@@ -46,6 +51,7 @@ static void test_transpose(void) {
 
 int main(void) {
     test_alloc_free();
+    test_size_math();
     test_matmul();
     test_softmax();
     test_transpose();

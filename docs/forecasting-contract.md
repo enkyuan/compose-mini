@@ -12,9 +12,10 @@ position sizing, and order execution are outside this runtime.
 ## Current status
 
 The core utilities, input projection, positional encoding, attention,
-feed-forward math, and LayerNorm are implemented and behaviorally tested. Data
-loading, encoder orchestration, artifact loading, the prediction head, and the
-CLI remain stubs or planned interfaces. The runtime does not yet produce forecasts.
+feed-forward math, LayerNorm, pre-norm encoder orchestration, and scalar head
+are implemented and behaviorally tested. Data loading, artifact loading, and
+the CLI remain stubs or planned interfaces. The runtime does not yet produce
+forecasts.
 
 ## Runtime input
 
@@ -30,10 +31,12 @@ A batch CSV may contain `N >= seq_len` bars. It produces
 `N - seq_len + 1` overlapping windows and the same number of forecast records.
 
 Only the scaled `[seq_len x 5]` feature tensor enters the model. Metadata names
-and timestamps the result. Reject incomplete bars, mixed instruments or
-intervals, invalid timestamps, non-finite values, non-positive closes, and
-requests whose interval, feature order, or dimensions do not match the
-artifact. The artifact fixes the forecast horizon; callers do not change it.
+and timestamps the result. The six-column CSV cannot prove bar completeness or
+single-series provenance, so callers guarantee both. The runtime rejects
+invalid timestamps, non-finite values, non-positive closes, non-increasing
+time, and requests whose interval, feature order, or dimensions do not match
+the artifact. The artifact fixes the forecast horizon; callers do not change
+it.
 
 The current CSV and `DataSet` scaffold do not yet carry all required metadata.
 Their interfaces must be extended before artifact-backed inference is complete.
@@ -85,7 +88,7 @@ normalization from an inference file or window.
 ## Internal boundary
 
 ```text
-validate completed bars
+validate values and chronology of caller-certified completed bars
   -> scale with artifact statistics
   -> project features and add positional encoding once
   -> run every encoder block

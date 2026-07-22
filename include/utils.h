@@ -1,10 +1,16 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+#include <stddef.h>
+
 /* Float-buffer allocation and row-major math primitives used by the model. */
 
-/* Allocate n zero-initialized floats; n must be positive. */
-float* utils_alloc(int n);
+/* Add or multiply allocation counts; abort if the result cannot fit size_t. */
+size_t utils_size_add(size_t a, size_t b);
+size_t utils_size_mul(size_t a, size_t b);
+
+/* Allocate n zeroed floats; abort on zero, byte overflow, or allocation failure. */
+float* utils_alloc(size_t n);
 
 /* Free memory returned by utils_alloc; p may be NULL. */
 void utils_free(float* p);
