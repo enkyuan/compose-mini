@@ -29,6 +29,42 @@ from tools.artifact_v1 import (
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.float32 import f32
 
+FEATURE_NAMES = {
+    "ohlcv": ("open", "high", "low", "close", "volume"),
+    "stationary-v1": (
+        "log_gap", "log_body", "log_upper_wick", "log_lower_wick",
+        "log_volume_change",
+    ),
+}
+FEATURE_SETS = tuple(FEATURE_NAMES)
+
+
+def feature_lookback(feature_set: str) -> int:
+    """Return raw bars required before the first model feature row."""
+    if feature_set not in FEATURE_SETS:
+        raise ValueError(f"unsupported feature set: {feature_set}")
+    return int(feature_set != "ohlcv")
+
+
+def feature_values(raw: torch.Tensor, feature_set: str) -> torch.Tensor:
+    """Return five features aligned to each completed source bar."""
+    if feature_set == "ohlcv":
+        return raw
+    feature_lookback(feature_set)
+    open_, high, low, close, volume = raw.unbind(1)
+    if not torch.all(raw[:, :4] > 0) or not torch.all(volume >= 0) or \
+       not torch.all(low <= torch.minimum(open_, close)) or \
+       not torch.all(torch.maximum(open_, close) <= high):
+        raise ValueError("stationary features require valid positive OHLC and volume")
+    current_open, current_close = open_[1:], close[1:]
+    return torch.stack((
+        torch.log(current_open / close[:-1]),
+        torch.log(current_close / current_open),
+        torch.log(high[1:] / torch.maximum(current_open, current_close)),
+        torch.log(torch.minimum(current_open, current_close) / low[1:]),
+        torch.log1p(volume[1:]) - torch.log1p(volume[:-1]),
+    ), 1)
+
 
 def positional_encoding(seq_len: int, model_dim: int) -> torch.Tensor:
     values = [0.0] * (seq_len * model_dim)
@@ -136,6 +172,7 @@ class TrainingData:
     feature_scale: torch.Tensor
     target_mean: torch.Tensor
     target_scale: torch.Tensor
+    feature_set: str = "ohlcv"
 
 
 @dataclass(frozen=True)
@@ -233,12 +270,14 @@ def split_counts(samples: int, train_fraction: float,
 def prepare_data(path: Path, config: Config, train_fraction: float,
                  validation_fraction: float,
                  split: tuple[int, int, int] | None = None,
-                 sample_start: int = 0) -> TrainingData:
+                 sample_start: int = 0,
+                 feature_set: str = "ohlcv") -> TrainingData:
     """Scale one target-time split using only rows reachable by its training inputs."""
     rows = read_csv(path)
     row_count = len(rows) // FEATURE_COUNT
-    if row_count <= config.seq_len:
-        raise ValueError("training requires at least seq_len + 1 rows")
+    lookback = feature_lookback(feature_set)
+    if row_count <= config.seq_len + lookback:
+        raise ValueError("training requires lookback + seq_len + 1 rows")
     # The clone gives PyTorch ownership before the compact parser buffer is released.
     raw = torch.frombuffer(rows, dtype=torch.float32).view(
         row_count, FEATURE_COUNT,
@@ -246,7 +285,8 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
     del rows
     if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
         raise ValueError("CSV values must remain finite binary32 with positive closes")
-    closes = raw[:, 3].clone()
+    closes = raw[lookback:, 3].clone()
+    values = feature_values(raw, feature_set)
     raw_targets = torch.log(closes[1:] / closes[:-1])[config.seq_len - 1:]
     if not torch.isfinite(raw_targets).all():
         raise ValueError("close ratios must produce finite log returns")
@@ -257,7 +297,7 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
        sum(counts) > available:
         raise ValueError("chronological split is outside the available target range")
     train_count, validation_count, test_count = counts
-    training_rows = raw[
+    training_rows = values[
         sample_start:sample_start + config.seq_len + train_count - 1
     ]
     training_targets = raw_targets[sample_start:sample_start + train_count]
@@ -270,7 +310,7 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
        not torch.all(feature_scale > 0) or not torch.isfinite(target_mean) or \
        not torch.isfinite(target_scale) or target_scale <= 0:
         raise ValueError("training rows require positive finite feature and target scales")
-    features = raw.sub_(feature_mean).div_(feature_scale)
+    features = values.sub_(feature_mean).div_(feature_scale)
     targets = (raw_targets - target_mean) / target_scale
     validation_start = sample_start + train_count
     test_start = validation_start + validation_count
@@ -281,7 +321,7 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
                 validation_start, validation_count),
         Windows(features, targets, closes, config.seq_len,
                 test_start, test_count),
-        feature_mean, feature_scale, target_mean, target_scale,
+        feature_mean, feature_scale, target_mean, target_scale, feature_set,
     )
 
 

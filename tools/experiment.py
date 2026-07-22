@@ -27,13 +27,14 @@ except ModuleNotFoundError as error:
 from tools.artifact_v1 import Config
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.train import (
-    Fit, ForecastTransformer, TrainingData, Windows, data_loaders, evaluate,
-    fit_model, mean_loss, prepare_data,
+    FEATURE_NAMES, FEATURE_SETS, Fit, ForecastTransformer, TrainingData, Windows,
+    data_loaders, evaluate, feature_lookback, fit_model, mean_loss, prepare_data,
 )
 
 MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
 NEURAL = frozenset(("transformer", "mlp"))
 RETURN_METRICS = ("return_mse", "return_mae", "direction_accuracy")
+EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "last_close_baseline_mae")
 SERIES_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_FLAT_FEATURES = 2_048
 MAX_MLP_PARAMETERS = 8_388_608
@@ -69,6 +70,7 @@ class Candidate:
     mlp_dim: int
     rolling_window: int
     ridge: float
+    feature_set: str = "ohlcv"
 
     @classmethod
     def parse(cls, value: object) -> Candidate:
@@ -81,6 +83,9 @@ class Candidate:
         name = value.get("name")
         if not isinstance(name, str) or not SERIES_NAME.fullmatch(name):
             raise ValueError("candidate name is invalid")
+        feature_set = value.get("feature_set", "ohlcv")
+        if feature_set not in FEATURE_SETS:
+            raise ValueError(f"{name}.feature_set is unsupported")
         seq_len = _integer(value.get("seq_len"), f"{name}.seq_len", 2)
         candidate = cls(
             name,
@@ -97,6 +102,7 @@ class Candidate:
             _integer(value.get("rolling_window", min(8, seq_len - 1)),
                      f"{name}.rolling_window"),
             _number(value.get("ridge", 1e-3), f"{name}.ridge", 0.0, True),
+            feature_set,
         )
         candidate.config().validate()
         if candidate.rolling_window >= candidate.seq_len:
@@ -204,17 +210,19 @@ class RollingMean(nn.Module):
     def __init__(self, data: TrainingData, window: int) -> None:
         super().__init__()
         self.window = window
+        self.stationary = data.feature_set != "ohlcv"
         for name, value in (
-            ("close_mean", data.feature_mean[3]),
-            ("close_scale", data.feature_scale[3]),
+            ("feature_mean", data.feature_mean),
+            ("feature_scale", data.feature_scale),
             ("target_mean", data.target_mean),
             ("target_scale", data.target_scale),
         ):
             self.register_buffer(name, value)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        closes = values[:, :, 3] * self.close_scale + self.close_mean
-        returns = torch.log(closes[:, 1:] / closes[:, :-1])
+        raw = values * self.feature_scale + self.feature_mean
+        returns = (raw[:, :, :2].sum(2) if self.stationary else
+                   torch.log(raw[:, 1:, 3] / raw[:, :-1, 3]))
         prediction = returns[:, -self.window:].mean(1)
         return (prediction - self.target_mean) / self.target_scale
 
@@ -308,12 +316,13 @@ def _deterministic(model_name: str, candidate: Candidate,
 
 def _validation_record(model_name: str, candidate: Candidate, series: str,
                        fold: int, boundary: dict[str, list[str]], seed: int | None,
-                       samples: int, loss: float,
+                       samples: int, loss: float, metrics: Mapping[str, float],
                        fit: Fit | None) -> dict[str, object]:
     record: dict[str, object] = {
         "model": model_name, "candidate": candidate.name, "series": series,
-        "fold": fold, "seed": seed, "targets": boundary,
-        "samples": samples, "validation_scaled_mse": loss,
+        "feature_set": candidate.feature_set, "fold": fold, "seed": seed,
+        "targets": boundary, "samples": samples,
+        "validation_scaled_mse": loss, "metrics": dict(metrics),
     }
     if fit:
         record.update(asdict(fit))
@@ -346,16 +355,77 @@ def _means(records: Sequence[Mapping[str, object]],
             for metric in metrics}
 
 
-def _statistics(values: Sequence[float | None]) -> dict[str, float | None]:
+def _statistics(values: Sequence[float | None]) -> dict[str, object]:
     finite = [value for value in values if value is not None]
-    return ({"mean": fmean(finite), "stddev": pstdev(finite)} if finite else
-            {"mean": None, "stddev": None})
+    return ({"count": len(finite), "mean": fmean(finite),
+             "stddev": pstdev(finite)} if finite else
+            {"count": 0, "mean": None, "stddev": None})
+
+
+def _validation_metric(record: Mapping[str, object], metric: str) -> float:
+    return float(record[metric] if metric == "validation_scaled_mse" else
+                 record["metrics"][metric])
+
+
+def summarize_validation(records: Sequence[Mapping[str, object]],
+                         models: Sequence[str], candidates: Sequence[Candidate]
+                         ) -> dict[str, object]:
+    metrics = ("validation_scaled_mse", *EVALUATION_METRICS)
+    indexed = {
+        (record["model"], record["candidate"], record["series"],
+         record["fold"], record["seed"]): record
+        for record in records
+    }
+    summary: dict[str, object] = {}
+    for model in models:
+        candidate_records = {
+            candidate.name: [record for record in records
+                             if record["model"] == model and
+                             record["candidate"] == candidate.name]
+            for candidate in candidates
+        }
+        pairs = {}
+        for candidate in candidates:
+            if candidate.feature_set == "ohlcv":
+                continue
+            for control in candidates:
+                if control.feature_set != "ohlcv":
+                    continue
+                deltas = {metric: [] for metric in metrics}
+                for record in candidate_records[candidate.name]:
+                    key = (model, control.name, record["series"],
+                           record["fold"], record["seed"])
+                    if comparison := indexed.get(key):
+                        for metric in metrics:
+                            deltas[metric].append(
+                                _validation_metric(record, metric) -
+                                _validation_metric(comparison, metric)
+                            )
+                pairs[f"{candidate.name}-minus-{control.name}"] = {
+                    metric: _statistics(values) for metric, values in deltas.items()
+                }
+        summary[model] = {
+            "candidates": {
+                candidate.name: {
+                    "feature_set": candidate.feature_set,
+                    "metrics": {
+                        metric: _statistics([
+                            _validation_metric(record, metric)
+                            for record in candidate_records[candidate.name]
+                        ])
+                        for metric in metrics
+                    },
+                }
+                for candidate in candidates
+            },
+            "paired_deltas": pairs,
+        }
+    return summary
 
 
 def summarize(records: Sequence[Mapping[str, object]],
               models: Sequence[str]) -> dict[str, object]:
-    metrics = ("return_mse", "return_mae", "close_mae",
-               "last_close_baseline_mae", "direction_accuracy")
+    metrics = EVALUATION_METRICS
     summary: dict[str, object] = {}
     for model in models:
         model_records = [record for record in records if record["model"] == model]
@@ -422,16 +492,17 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     if runs > max_runs:
         raise ValueError(f"experiment requires {runs} runs; --max-runs is {max_runs}")
     torch.use_deterministic_algorithms(True)
-    max_seq_len = max(candidate.seq_len for candidate in sweep.candidates)
+    max_history = max(candidate.seq_len + feature_lookback(candidate.feature_set)
+                      for candidate in sweep.candidates)
     metadata, folds_by_series = [], {}
     for name, path in series:
         rows = read_csv(path)
         row_count = len(rows) // FEATURE_COUNT
         del rows
         timestamps = _timestamps(path, row_count)
-        splits = walk_forward_splits(row_count - max_seq_len,
+        splits = walk_forward_splits(row_count - max_history,
                                      sweep.folds, sweep.fold_fraction)
-        holdout = holdout_split(row_count - max_seq_len, sweep.fold_fraction)
+        holdout = holdout_split(row_count - max_history, sweep.fold_fraction)
         folds_by_series[name] = (path, timestamps, splits, holdout)
         metadata.append({"name": name, "csv": str(path), "rows": row_count,
                          "sha256": _sha256(path),
@@ -441,12 +512,14 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     validation: list[dict[str, object]] = []
     for candidate in sweep.candidates:
         for name, (path, timestamps, splits, _) in folds_by_series.items():
-            sample_start = max_seq_len - candidate.seq_len
+            sample_start = max_history - candidate.seq_len - \
+                feature_lookback(candidate.feature_set)
             for fold, (train_count, validation_count) in enumerate(splits):
                 data = prepare_data(path, candidate.config(), 0.7, 0.15,
-                                    (train_count, validation_count, 1), sample_start)
+                                    (train_count, validation_count, 1), sample_start,
+                                    candidate.feature_set)
                 boundary = _boundary(
-                    timestamps, max_seq_len, (train_count, validation_count),
+                    timestamps, max_history, (train_count, validation_count),
                 )
                 for model_name in sweep.models:
                     if model_name in NEURAL:
@@ -457,14 +530,18 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                             validation.append(_validation_record(
                                 model_name, candidate, name, fold, boundary, seed,
                                 len(data.validation),
-                                mean_loss(model, loaders[1], device), fit,
+                                mean_loss(model, loaders[1], device),
+                                evaluate(model, loaders[1], data.target_mean,
+                                         data.target_scale, device), fit,
                             ))
                     else:
                         model = _deterministic(model_name, candidate, data).to(device)
                         loader = data_loaders(data, sweep.batch_size, 0)[1]
                         validation.append(_validation_record(
                             model_name, candidate, name, fold, boundary, None,
-                            len(data.validation), mean_loss(model, loader, device), None,
+                            len(data.validation), mean_loss(model, loader, device),
+                            evaluate(model, loader, data.target_mean,
+                                     data.target_scale, device), None,
                         ))
 
     selection = select_candidates(validation, sweep.models, sweep.candidates)
@@ -473,10 +550,11 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     for model_name in sweep.models:
         candidate = candidates[str(selection[model_name]["candidate"])]
         for name, (path, timestamps, _, split) in folds_by_series.items():
-            sample_start = max_seq_len - candidate.seq_len
+            sample_start = max_history - candidate.seq_len - \
+                feature_lookback(candidate.feature_set)
             data = prepare_data(path, candidate.config(), 0.7, 0.15,
-                                split, sample_start)
-            boundary = _boundary(timestamps, max_seq_len, split)
+                                split, sample_start, candidate.feature_set)
+            boundary = _boundary(timestamps, max_history, split)
             seeds = sweep.seeds if model_name in NEURAL else (None,)
             for seed in seeds:
                 if seed is None:
@@ -489,8 +567,9 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                     loader = loaders[2]
                 record = {
                     "model": model_name, "candidate": candidate.name,
-                    "series": name, "fold": "holdout", "seed": seed,
-                    "targets": boundary, "samples": len(data.test),
+                    "feature_set": candidate.feature_set, "series": name,
+                    "fold": "holdout", "seed": seed, "targets": boundary,
+                    "samples": len(data.test),
                     "metrics": evaluate(model, loader, data.target_mean,
                                         data.target_scale, device),
                 }
@@ -498,14 +577,25 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                     record.update(asdict(fit))
                 test.append(record)
 
+    for metadata_record, (_, path) in zip(metadata, series, strict=True):
+        if _sha256(path) != metadata_record["sha256"]:
+            raise ValueError("CSV changed during the experiment")
+
     return {
-        "schema": 1,
+        "schema": 2,
         "protocol": {
             "split": "expanding walk-forward by target time",
             "selection": "minimum mean validation scaled-return MSE",
-            "aggregation": "macro mean over series, folds, and seeds",
+            "selection_aggregation": "macro mean over series, folds, and seeds",
+            "holdout_aggregation": "macro mean over series and seeds",
             "test_policy": "evaluate selected candidates on one final holdout",
-            "aligned_sequence_length": max_seq_len,
+            "aligned_history_bars": max_history,
+            "feature_contract": "experiment-only; artifact V1 remains OHLCV",
+            "feature_sets": {
+                name: list(FEATURE_NAMES[name])
+                for name in dict.fromkeys(candidate.feature_set
+                                          for candidate in sweep.candidates)
+            },
             "folds": sweep.folds, "fold_fraction": sweep.fold_fraction,
             "run_count": runs,
             "diagnostic_caps": {
@@ -525,6 +615,9 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
         },
         "selection": selection,
         "validation": validation,
+        "validation_summary": summarize_validation(
+            validation, sweep.models, sweep.candidates,
+        ),
         "test": test,
         "summary": summarize(test, sweep.models),
     }

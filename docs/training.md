@@ -182,6 +182,36 @@ atomic, strict JSON under the ignored `reports/` directory. Run and diagnostic
 model-size limits reject accidental compute or memory explosions; raise
 `--max-runs` only after estimating the required compute.
 
+To isolate input representation from model size, run the paired feature sweep:
+
+```sh
+python tools/experiment.py experiments/features.example.json \
+  reports/features.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --max-runs 300
+```
+
+The stationarity-oriented `stationary-v1` representation encodes each completed
+candle as log gap, log body, upper and lower log wick, and log-volume change. It
+uses only that candle and its previous completed bar; it does not claim that the
+resulting series is statistically stationary. The raw 17-bar control matches
+its total history, while the raw 16-bar control matches its token count. All
+variants share target timestamps, folds, optimizer settings, seeds, and the
+untouched final holdout.
+
+```text
+[log(open[t] / close[t-1]), log(close[t] / open[t]),
+ log(high[t] / max(open[t], close[t])),
+ log(min(open[t], close[t]) / low[t]),
+ log1p(volume[t]) - log1p(volume[t-1])]
+```
+
+This representation is diagnostic only. Artifact V1 and the C runtime still
+require raw OHLCV; promote it only through an explicit artifact schema after it
+shows consistent validation improvement across instruments, folds, and seeds.
+The report includes per-candidate validation distributions and paired
+candidate-minus-control deltas; negative error deltas favor the candidate.
+
 After choosing a Transformer candidate, pass its values to `tools/train.py` to
 fit and export the deployable V1 artifact. Diagnostic linear and MLP models are
 not serialized as Transformer artifacts.
