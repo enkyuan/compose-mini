@@ -15,12 +15,14 @@
  * V1 predicts after the final completed bar, so full context attention is safe.
  * A per-position forecasting objective must mask later bars.
  * Wq, Wk, Wv, and Wo are [model_dim x model_dim]. Buffers are row-major; out
- * must not alias inputs. Dimensions must be positive, and model_dim must be
- * divisible by num_heads.
+ * and workspace must not alias inputs or each other. workspace holds
+ * 3 * seq_len * model_dim + seq_len floats. Dimensions must be positive, and
+ * model_dim must be divisible by num_heads.
  */
 void attention_forward(float* out, const float* x,
                        const float* Wq, const float* Wk,
                        const float* Wv, const float* Wo,
-                       int seq_len, int model_dim, int num_heads);
+                       int seq_len, int model_dim, int num_heads,
+                       float* workspace);
 
 #endif /* ATTENTION_H */

@@ -55,12 +55,13 @@ void transformer_free(TransformerWeights* w);
  *   1. Project input and add positional encoding once.
  *   2. For each layer: h = h + attention(norm1(h)).
  *   3. For each layer: h = h + FFN(norm2(h)).
- * Input and output storage must be separate. This returns hidden states, not a
- * forecast.
+ * workspace holds transformer_workspace_count(cfg) floats and may be reused
+ * across calls. Input, output, and workspace storage must be separate. This
+ * returns hidden states, not a forecast.
  */
 void transformer_forward(float* out, const float* x,
                          const TransformerWeights* w,
-                         TransformerConfig cfg);
+                         TransformerConfig cfg, float* workspace);
 
 /* Apply the scalar head to the final hidden row; return the model-space target. */
 float transformer_predict(const float* hidden,

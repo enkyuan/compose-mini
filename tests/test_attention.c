@@ -17,8 +17,8 @@ static void assert_array_close(const float* actual, const float* expected, int n
 static void test_uniform(void) {
     const float x[] = {1, 2, 3, 4, 5, 6, 7, 8};
     const float expected[] = {3, 4, 5, 6, 3, 4, 5, 6};
-    float out[8] = {0};
-    attention_forward(out, x, Z4, Z4, I4, I4, 2, 4, 2);
+    float out[8] = {0}, workspace[3 * 2 * 4 + 2];
+    attention_forward(out, x, Z4, Z4, I4, I4, 2, 4, 2, workspace);
     assert_array_close(out, expected, 8);
 }
 
@@ -29,8 +29,8 @@ static void test_scaled_heads(void) {
         0.66976154f, 0.33023846f, 0.33023846f, 0.66976154f,
         0.33023846f, 0.66976154f, 0.66976154f, 0.33023846f,
     };
-    float out[8] = {0};
-    attention_forward(out, x, I4, I4, I4, I4, 2, 4, 2);
+    float out[8] = {0}, workspace[3 * 2 * 4 + 2];
+    attention_forward(out, x, I4, I4, I4, I4, 2, 4, 2, workspace);
     assert_array_close(out, expected, 8);
 }
 
@@ -40,8 +40,8 @@ static void test_projection(void) {
     const float Wq[] = {1, 0, 0, 2}, Wk[] = {0, 1, 1, 0};
     const float Wv[] = {1, 2, 3, 4}, Wo[] = {1, -1, 2, 1};
     const float expected[] = {9.018569f, 1, 6.173422f, 1};
-    float out[4] = {0};
-    attention_forward(out, x, Wq, Wk, Wv, Wo, 2, 2, 1);
+    float out[4] = {0}, workspace[3 * 2 * 2 + 2];
+    attention_forward(out, x, Wq, Wk, Wv, Wo, 2, 2, 1, workspace);
     assert_array_close(out, expected, 4);
 }
 

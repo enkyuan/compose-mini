@@ -139,8 +139,9 @@ void transformer_free(TransformerWeights* w) {
 
 void transformer_forward(float* out, const float* x,
                          const TransformerWeights* w,
-                         TransformerConfig cfg) {
-    assert(out && x && out != x);
+                         TransformerConfig cfg, float* workspace) {
+    assert(out && x && workspace);
+    assert(out != x && out != workspace && x != workspace);
     (void)require_parameter_count(cfg);
     assert_encoder_weights(w);
 
@@ -148,10 +149,9 @@ void transformer_forward(float* out, const float* x,
     const size_t hidden_size = utils_size_mul((size_t)s, (size_t)d);
     const size_t d2 = utils_size_mul((size_t)d, (size_t)d);
     const size_t df = utils_size_mul((size_t)d, (size_t)f);
-    /* Both buffers are reused across layers, keeping scratch independent of L. */
-    float* scratch = utils_alloc(utils_size_mul(2, hidden_size));
-    float* normalized = scratch;
-    float* branch = scratch + hidden_size;
+    float* normalized = workspace;
+    float* branch = normalized + hidden_size;
+    float* attention_workspace = branch + hidden_size;
 
     embed_project(out, x, w->embed_W, s, cfg.in_dim, d);
     embed_positional(out, s, d);
@@ -166,7 +166,8 @@ void transformer_forward(float* out, const float* x,
                        w->norm1_b + d_offset, s, d);
         attention_forward(branch, normalized, w->Wq + d2_offset,
                           w->Wk + d2_offset, w->Wv + d2_offset,
-                          w->Wo + d2_offset, s, d, cfg.num_heads);
+                          w->Wo + d2_offset, s, d, cfg.num_heads,
+                          attention_workspace);
         add_in_place(out, branch, hidden_size);
 
         normalize_rows(normalized, out, w->norm2_g + d_offset,
@@ -179,8 +180,6 @@ void transformer_forward(float* out, const float* x,
         }
         add_in_place(out, branch, hidden_size);
     }
-
-    utils_free(scratch);
 }
 
 float transformer_predict(const float* hidden,

@@ -49,8 +49,8 @@ static void test_forward(void) {
 
     const float x[] = {1, -2, -1 - sinf(1), 1 - cosf(1)};
     const float expected[] = {5.6706667f, 3.6706667f, 6.3293333f, 8.3293333f};
-    float out[4];
-    transformer_forward(out, x, &w, cfg);
+    float out[4], workspace[22];
+    transformer_forward(out, x, &w, cfg, workspace);
     assert_array_close(out, expected, 4);
 
     transformer_free(&w);
