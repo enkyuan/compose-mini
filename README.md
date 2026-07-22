@@ -4,8 +4,13 @@
 encoder-only Transformer. Its target is the next completed bar's close from a
 fixed window of completed OHLCV history.
 
-The core encoder, scalar head, versioned artifact loader, and chronological CSV
-windowing are implemented and tested. Forecast emission remains to be wired;
-training and trading decisions are outside this runtime. See
+The core encoder, scalar head, versioned artifact loader, chronological CSV
+windowing, and JSONL inference CLI are implemented and tested. External model
+training and trading decisions remain outside this runtime. See
 [docs/forecasting-contract.md](docs/forecasting-contract.md) for the system
 boundary and delivery stages.
+
+```sh
+make check
+bin/transformer MODEL CSV INSTRUMENT INTERVAL FINAL_TARGET_TIME
+```

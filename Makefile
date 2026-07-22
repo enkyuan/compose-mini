@@ -4,14 +4,17 @@ DEPFLAGS = -MMD -MP
 LDLIBS  = -lm
 SRC     = $(shell find src -name '*.c')
 OBJ     = $(patsubst src/%.c, build/%.o, $(SRC))
-DEP     = $(OBJ:.o=.d) build/main.d
+DEP     = $(OBJ:.o=.d) build/main.d build/tests/artifact_fixture.d
 BIN     = bin/transformer
 HEADERS = $(wildcard include/*.h)
 
 TEST_SRC = $(wildcard tests/test_*.c)
-BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_data.c \
-                    tests/test_embed.c tests/test_ffn.c tests/test_norm.c \
-                    tests/test_transformer.c tests/test_utils.c
+TEST_SUPPORT_SRC = tests/artifact_fixture.c
+TEST_SUPPORT_HEADERS = tests/artifact_fixture.h
+TEST_SUPPORT_OBJ = build/tests/artifact_fixture.o
+BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_cli.c \
+                    tests/test_data.c tests/test_embed.c tests/test_ffn.c \
+                    tests/test_norm.c tests/test_transformer.c tests/test_utils.c
 BEHAVIOR_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(BEHAVIOR_TEST_SRC))
 STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(STUB_TEST_SRC))
@@ -32,8 +35,12 @@ build/%.o: src/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-bin/tests/%: tests/%.c $(OBJ) $(HEADERS) | bin/tests
-	$(CC) $(CFLAGS) $< $(OBJ) -o $@ $(LDLIBS)
+$(TEST_SUPPORT_OBJ): $(TEST_SUPPORT_SRC) $(TEST_SUPPORT_HEADERS) $(HEADERS) | build
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+bin/tests/%: tests/%.c $(TEST_SUPPORT_OBJ) $(OBJ) $(HEADERS) | bin/tests
+	$(CC) $(CFLAGS) $< $(TEST_SUPPORT_OBJ) $(OBJ) -o $@ $(LDLIBS)
 
 test: $(BEHAVIOR_TEST_BIN)
 	@set -e; for t in $(BEHAVIOR_TEST_BIN); do echo "Running $$t..."; $$t; done

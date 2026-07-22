@@ -15,8 +15,9 @@ The core utilities, input projection, positional encoding, attention,
 feed-forward math, LayerNorm, pre-norm encoder orchestration, and scalar head
 are implemented and behaviorally tested. The versioned artifact loader and
 training-fitted scalers are also implemented, as is chronological CSV loading
-with zero-copy windows. The CLI remains a stub. The runtime does not yet
-produce forecasts.
+with zero-copy windows. The CLI now runs artifact-backed inference and streams
+validated JSONL forecasts. External training, export, and framework parity are
+the remaining delivery work.
 
 ## Runtime input
 
@@ -31,18 +32,38 @@ The process loads one versioned model artifact. A single-window request supplies
 
 A batch CSV may contain `N >= seq_len` bars. It produces
 `N - seq_len + 1` overlapping windows and the same number of forecast records.
+V1 fixes `horizon_bars` to one. For every historical window, the following CSV
+row supplies `target_time`; the caller supplies only the newest window's final
+target time, which must follow the final input timestamp.
 
 Only the scaled `[seq_len x 5]` feature tensor enters the model. Metadata names
 and timestamps the result. The six-column CSV cannot prove bar completeness or
-single-series provenance, so callers guarantee both. The runtime rejects
-invalid timestamps, non-finite values, non-positive closes, non-increasing
-time, and requests whose interval, feature order, or dimensions do not match
-the artifact. The artifact fixes the forecast horizon; callers do not change
-it.
+single-series provenance, so callers guarantee both. In particular, callers
+certify that adjacent timestamps and `FINAL_TARGET_TIME` are consecutive bars
+on the instrument's exchange calendar; the runtime cannot infer sessions,
+holidays, or halts from an interval token. It rejects invalid timestamps,
+non-finite values, non-positive closes, non-increasing time, and requests whose
+interval, feature order, or dimensions do not match the artifact. The artifact
+fixes the forecast horizon; callers do not change it.
 
 `DataSet` stores each scaled row, raw close, and timestamp once. Overlapping
 windows borrow row offsets, so input memory remains O(N) instead of
 O(N * seq_len).
+
+The executable contract is:
+
+```text
+bin/transformer MODEL CSV INSTRUMENT INTERVAL FINAL_TARGET_TIME
+```
+
+`INTERVAL` must exactly match the artifact. `INSTRUMENT` is visible, non-space
+ASCII up to 63 bytes. The reusable C API requires the `C` numeric locale; the
+standalone process starts there by definition. Forecast records go to standard
+output and diagnostics go to standard error. The runtime validates every
+forecast before emitting the first record. Exit status is `0` for success, `2`
+for invalid command metadata or CSV content, and `1` for artifact, locale, I/O,
+allocation, numeric, or output failures. An output-device failure can still
+leave a partial stream.
 
 ## Runtime output
 
@@ -114,8 +135,9 @@ later bars.
 2. Implement and test the core math utilities.
 3. Implement embeddings, encoder blocks, per-layer weights, and prediction head.
 4. Parse and validate chronological windows without fitting a runtime scaler.
-5. Train externally, export a versioned artifact, and load it in C.
-6. Implement the CLI inference loop and structured output.
-7. Compare C output with the training framework and evaluate chronologically
+5. Export a versioned artifact and load it in C.
+6. Run the CLI inference loop and emit structured output.
+7. Train externally, compare C output with the training framework, and evaluate
+   chronologically
    against a last-close baseline.
 8. Optimize only after correctness and parity are established.

@@ -11,6 +11,7 @@
 typedef enum {
     DATA_OK = 0,
     DATA_ARGUMENT,
+    DATA_LOCALE,
     DATA_IO,
     DATA_FORMAT,
     DATA_ORDER,
@@ -35,7 +36,10 @@ typedef struct {
     float latest_close;    /* raw final-row close */
 } DataWindow;
 
-/* Parse, validate, and scale an exact timestamp,OHLCV CSV into a fresh ds. */
+/* Return true for a real canonical UTC YYYY-MM-DDTHH:MM:SSZ timestamp. */
+int data_timestamp_valid(const char* value);
+
+/* Parse and scale exact timestamp,OHLCV CSV; LC_NUMERIC must remain "C". */
 DataStatus data_load(DataSet* ds, const char* path,
                      const ModelArtifact* artifact);
 

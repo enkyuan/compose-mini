@@ -15,6 +15,9 @@ float* utils_alloc(size_t n);
 /* Free memory returned by utils_alloc; p may be NULL. */
 void utils_free(float* p);
 
+/* Return true when portable dot-decimal CSV and JSON formatting is active. */
+int utils_c_numeric_locale(void);
+
 /*
  * Multiply row-major matrices: out[m x n] = a[m x k] @ b[k x n].
  * Arrays are contiguous and row-major; output must not alias either input.

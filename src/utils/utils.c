@@ -1,9 +1,11 @@
 /* Allocation and row-major math primitives shared by model components. */
 
 #include <assert.h>
+#include <locale.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include "utils.h"
 
 size_t utils_size_add(size_t a, size_t b) {
@@ -25,6 +27,11 @@ float* utils_alloc(size_t n) {
 }
 
 void utils_free(float* p) { free(p); }
+
+int utils_c_numeric_locale(void) {
+    const char* locale = setlocale(LC_NUMERIC, NULL);
+    return locale && !strcmp(locale, "C");
+}
 
 void matmul(float* out, const float* a, const float* b, int m, int k, int n) {
     for (int i = 0; i < m; i++) {

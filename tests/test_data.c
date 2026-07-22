@@ -139,6 +139,8 @@ int main(void) {
     test_valid(path);
     test_invalid(path);
     assert(remove(path) == 0);
+    assert(data_timestamp_valid("2028-02-29T13:00:00Z"));
+    assert(!data_timestamp_valid(NULL));
     assert(!strcmp(data_status_string(DATA_ORDER), "timestamps out of order"));
     assert(!strcmp(data_status_string((DataStatus)99), "unknown data error"));
     data_free(NULL);

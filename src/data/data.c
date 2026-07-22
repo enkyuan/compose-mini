@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "data.h"
+#include "utils.h"
 
 enum { LINE_CAP = 512 };
 
@@ -54,7 +55,8 @@ static DataStatus open_csv(FILE** out, const char* path) {
     return status;
 }
 
-static int timestamp_valid(const char* value) {
+int data_timestamp_valid(const char* value) {
+    if (!value) return 0;
     static const int month_days[] =
         {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     if (strlen(value) != 20 || value[4] != '-' || value[7] != '-' ||
@@ -108,7 +110,7 @@ typedef struct {
 static DataStatus parse_row(char* line, const char* previous, ParsedRow* row) {
     char* fields[6];
     DataStatus status = split_row(line, fields);
-    if (status != DATA_OK || !timestamp_valid(fields[0])) return DATA_FORMAT;
+    if (status != DATA_OK || !data_timestamp_valid(fields[0])) return DATA_FORMAT;
     if (*previous && strcmp(previous, fields[0]) >= 0) return DATA_ORDER;
     for (int i = 0; i < ARTIFACT_FEATURE_COUNT; i++) {
         status = parse_number(fields[i + 1], row->features + i);
@@ -165,6 +167,7 @@ DataStatus data_load(DataSet* ds, const char* path,
     if (!path || !artifact || artifact->config.seq_len <= 0 ||
         artifact->config.in_dim != ARTIFACT_FEATURE_COUNT)
         return DATA_ARGUMENT;
+    if (!utils_c_numeric_locale()) return DATA_LOCALE;
 
     FILE* file;
     DataStatus status = open_csv(&file, path);
@@ -221,7 +224,7 @@ void data_free(DataSet* ds) {
 
 const char* data_status_string(DataStatus status) {
     static const char* const messages[] = {
-        "ok", "invalid argument", "I/O error", "invalid CSV",
+        "ok", "invalid argument", "LC_NUMERIC must be C", "I/O error", "invalid CSV",
         "timestamps out of order", "value out of range", "not enough rows",
         "out of memory"
     };

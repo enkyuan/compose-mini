@@ -134,9 +134,7 @@ static int decode_token(char* out, const uint8_t* slot, size_t size) {
 static ArtifactStatus validate_metadata(ModelArtifact* artifact,
                                         const uint8_t* body,
                                         int weights_finite) {
-    artifact->horizon_bars = decode_u32(body + 24);
-    if (!artifact->horizon_bars || decode_u32(body + 28) || !weights_finite)
-        return ARTIFACT_FORMAT;
+    if (!weights_finite) return ARTIFACT_FORMAT;
     if (!decode_token(artifact->model_version, body + 32,
                       ARTIFACT_MODEL_VERSION_CAP) ||
         !decode_token(artifact->interval, body + 96, ARTIFACT_INTERVAL_CAP))
@@ -184,6 +182,16 @@ ArtifactStatus artifact_load(ModelArtifact* artifact, const char* path) {
     BodyReader reader = {file, body_size, FNV_OFFSET};
     status = read_body(&reader, body, sizeof body);
     if (status != ARTIFACT_OK) goto done;
+
+    loaded.horizon_bars = decode_u32(body + 24);
+    if (!loaded.horizon_bars || decode_u32(body + 28)) {
+        status = ARTIFACT_FORMAT;
+        goto done;
+    }
+    if (loaded.horizon_bars != 1) {
+        status = ARTIFACT_UNSUPPORTED;
+        goto done;
+    }
 
     size_t parameter_count;
     status = decode_config(body, &loaded.config, &parameter_count);

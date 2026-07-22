@@ -28,7 +28,7 @@ FNV-1a uses offset basis `14695981039346656037` and prime
 | Offset | Bytes | Value |
 | ---: | ---: | --- |
 | 0 | 24 | `model_dim`, `num_heads`, `ff_dim`, `num_layers`, `seq_len`, `in_dim` |
-| 24 | 4 | Forecast horizon in bars |
+| 24 | 4 | Forecast horizon in bars; must be `1` in V1 |
 | 28 | 4 | Reserved; zero in V1 |
 | 32 | 64 | NUL-terminated, zero-padded model version |
 | 96 | 16 | NUL-terminated, zero-padded interval |
