@@ -57,6 +57,8 @@ dkms.conf
 # Project build output
 /build/
 /bin/
+/data/
+/models/
 
 # Python bytecode
 __pycache__/

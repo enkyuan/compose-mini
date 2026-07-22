@@ -23,7 +23,7 @@ BEHAVIOR_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, \
 STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, $(STUB_TEST_SRC))
 PYTHON_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_artifact_v1.py \
-              test_data_v1.py test_e2e.py)
+              test_data_v1.py test_e2e.py test_massive.py)
 
 .PHONY: all check check-training test compile-stubs clean run
 

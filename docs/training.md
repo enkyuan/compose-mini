@@ -110,6 +110,21 @@ the test segment once after selection.
 
 ## Start training
 
+Fetch split-adjusted Massive aggregates after placing the API key in the
+ignored `.env` file:
+
+```sh
+python tools/fetch_massive.py AAPL 2024-07-22 2026-07-21 \
+  data/aapl-30m.csv --minutes 30
+```
+
+The downloader follows pagination, keeps regular-session bars, verifies that
+each observed session starts at 09:30 US Eastern with no internal interval
+gaps, converts timestamps to canonical UTC, and atomically writes the runtime's
+six-column CSV. Missing sessions cannot be distinguished from exchange holidays
+without an exchange calendar, so retain the provider and query parameters with
+every experiment.
+
 Create an isolated environment and install PyTorch for the machine's CPU or
 accelerator:
 

@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Fetch Massive stock aggregates into compose-mini's strict CSV format."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date, datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from tools.data_v1 import CSV_HEADER, read_csv
+from tools.float32 import f32
+
+API_HOST = "api.massive.com"
+EASTERN = ZoneInfo("America/New_York")
+TICKER = re.compile(r"[A-Z0-9.-]{1,32}")
+Bar = tuple[int, float, float, float, float, float]
+Requester = Callable[[str], Mapping[str, object]]
+
+
+def api_key(path: Path) -> str:
+    """Read the key from the process first, then a local environment file."""
+    value = os.environ.get("MASSIVE_API_KEY", "")
+    if not value and path.exists():
+        for line in path.read_text(encoding="ascii").splitlines():
+            name, separator, candidate = line.partition("=")
+            if separator and name == "MASSIVE_API_KEY":
+                value = candidate.strip()
+                break
+    if not value or any(character.isspace() for character in value):
+        raise ValueError("MASSIVE_API_KEY is missing or invalid")
+    return value
+
+
+def aggregate_url(ticker: str, start: date, end: date, minutes: int,
+                  adjusted: bool) -> str:
+    if not TICKER.fullmatch(ticker) or not 1 <= minutes <= 59 or start > end:
+        raise ValueError("invalid ticker, minute interval, or date range")
+    path = f"/v2/aggs/ticker/{quote(ticker)}/range/{minutes}/minute/{start}/{end}"
+    query = urlencode({"adjusted": str(adjusted).lower(), "sort": "asc",
+                       "limit": 50000})
+    return urlunsplit(("https", API_HOST, path, query, ""))
+
+
+def authorized_url(url: str, key: str) -> str:
+    """Attach the secret only after verifying Massive owns the destination."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != API_HOST:
+        raise ValueError("Massive pagination returned an untrusted URL")
+    query = [(name, value) for name, value in parse_qsl(parts.query)
+             if name != "apiKey"]
+    query.append(("apiKey", key))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(query), parts.fragment))
+
+
+def request_json(url: str) -> Mapping[str, object]:
+    for attempt in range(5):
+        try:
+            request = Request(url, headers={"User-Agent": "compose-mini/1"})
+            with urlopen(request, timeout=60) as response:
+                payload = json.load(response)
+        except HTTPError as error:
+            if error.code != 429 or attempt == 4:
+                raise ValueError(
+                    f"Massive request failed with HTTP {error.code}"
+                ) from error
+            try:
+                delay = float(error.headers.get("Retry-After", "13"))
+            except ValueError:
+                delay = 13.0
+            error.close()
+            time.sleep(min(60.0, max(1.0, delay)))
+            continue
+        except (OSError, URLError, json.JSONDecodeError) as error:
+            raise ValueError("Massive request failed") from error
+        if not isinstance(payload, dict):
+            raise ValueError("Massive returned a non-object response")
+        return payload
+    raise AssertionError("unreachable")
+
+
+def _bar(value: object) -> Bar:
+    if not isinstance(value, dict) or type(value.get("t")) is not int:
+        raise ValueError("Massive returned an invalid aggregate")
+    timestamp = value["t"]
+    try:
+        prices = tuple(float(value[name]) for name in ("o", "h", "l", "c", "v"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Massive returned an invalid aggregate") from error
+    open_, high, low, close, volume = prices
+    if timestamp < 0 or timestamp % 1000 or \
+       not all(math.isfinite(number) for number in prices) or \
+       min(open_, high, low, close) <= 0 or volume < 0 or \
+       low > min(open_, close) or high < max(open_, close) or low > high:
+        raise ValueError("Massive returned an invalid aggregate")
+    rounded = tuple(f32(number) for number in prices)
+    if not all(math.isfinite(number) for number in rounded):
+        raise ValueError("Massive aggregate exceeds binary32")
+    return (timestamp, *rounded)
+
+
+def fetch_bars(url: str, key: str, ticker: str,
+               requester: Requester = request_json) -> list[Bar]:
+    bars, seen, previous = [], set(), -1
+    while url:
+        if url in seen:
+            raise ValueError("Massive pagination contains a cycle")
+        seen.add(url)
+        payload = requester(authorized_url(url, key))
+        if payload.get("status") != "OK" or \
+           payload.get("ticker", ticker) != ticker or \
+           not isinstance(payload.get("results", []), list):
+            raise ValueError("Massive returned an unsuccessful response")
+        for value in payload.get("results", []):
+            bar = _bar(value)
+            if bar[0] <= previous:
+                raise ValueError("Massive bars are not strictly chronological")
+            bars.append(bar)
+            previous = bar[0]
+        next_url = payload.get("next_url", "")
+        if not isinstance(next_url, str):
+            raise ValueError("Massive returned an invalid pagination URL")
+        url = next_url
+    if not bars:
+        raise ValueError("Massive returned no bars")
+    return bars
+
+
+def regular_bars(bars: Sequence[Bar], minutes: int) -> tuple[list[Bar], int]:
+    """Keep regular hours and reject internal gaps in each observed session."""
+    sessions: dict[date, list[tuple[int, Bar]]] = {}
+    for bar in bars:
+        local = datetime.fromtimestamp(bar[0] / 1000, timezone.utc).astimezone(EASTERN)
+        minute = local.hour * 60 + local.minute
+        if local.weekday() < 5 and 570 <= minute < 960:
+            if local.second or local.microsecond or (minute - 570) % minutes:
+                raise ValueError("Massive bar is not aligned to the requested interval")
+            sessions.setdefault(local.date(), []).append((minute, bar))
+    selected: list[Bar] = []
+    for session in sessions.values():
+        if session[0][0] != 570 or any(
+            right[0] - left[0] != minutes for left, right in zip(session, session[1:])
+        ):
+            raise ValueError("Massive regular session has an internal gap")
+        selected.extend(bar for _, bar in session)
+    if not selected:
+        raise ValueError("Massive returned no regular-session bars")
+    return selected, len(sessions)
+
+
+def write_csv(path: Path, bars: Sequence[Bar]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="ascii", newline="") as file:
+            writer = csv.writer(file, lineterminator="\n")
+            writer.writerow(CSV_HEADER.split(","))
+            for timestamp, *values in bars:
+                instant = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
+                writer.writerow((instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                 *(format(value, ".9g") for value in values)))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    read_csv(path)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ticker", type=str.upper)
+    parser.add_argument("start", type=date.fromisoformat)
+    parser.add_argument("end", type=date.fromisoformat)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--minutes", type=int, default=30)
+    parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    parser.add_argument("--unadjusted", action="store_true")
+    parser.add_argument("--all-sessions", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        key = api_key(args.env_file)
+        url = aggregate_url(args.ticker, args.start, args.end,
+                            args.minutes, not args.unadjusted)
+        source = fetch_bars(url, key, args.ticker)
+        bars, sessions = ((list(source), 0) if args.all_sessions else
+                          regular_bars(source, args.minutes))
+        write_csv(args.output, bars)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    report = {"adjusted": not args.unadjusted, "interval_minutes": args.minutes,
+              "output": str(args.output), "rows": len(bars),
+              "sessions": sessions, "source_rows": len(source),
+              "ticker": args.ticker}
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
