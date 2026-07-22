@@ -110,6 +110,8 @@ the test segment once after selection.
 
 ## Start training
 
+The Python tooling requires Python 3.10 or newer.
+
 Fetch split-adjusted Massive aggregates after placing the API key in the
 ignored `.env` file:
 
@@ -237,6 +239,47 @@ require raw OHLCV; promote it only through an explicit artifact schema after it
 shows consistent validation improvement across instruments, folds, and seeds.
 The report includes per-candidate validation distributions and paired
 candidate-minus-control deltas; negative error deltas favor the candidate.
+
+## Backtest a frozen holdout
+
+Export timestamped test predictions while running a frozen experiment:
+
+```sh
+python tools/experiment.py experiments/horizons.example.json \
+  reports/horizon-13.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --horizon-bars 13 --max-runs 117 \
+  --predictions reports/horizon-13-predictions.jsonl
+```
+
+Then run each series, model, and seed independently from `$100`:
+
+```sh
+python tools/backtest.py reports/horizon-13-predictions.jsonl \
+  reports/horizon-13-backtest.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --spread-bps 1 --slippage-bps 1 --fee-bps 0
+```
+
+The frozen policy is long when predicted log return is positive and otherwise
+cash. Each entry invests all available equity in fractional shares without
+leverage, enters at the next bar's open, exits at the target bar's close, and
+ignores signals made before that exit.
+Spread is the full quoted spread; slippage and proportional fees apply per side.
+The report compares the forecast rule with cash, buy-and-hold, and an always-up
+rule over identical bars. Equity is marked to cost-adjusted liquidation value at
+each close and summarized by UTC day, ISO week, and month, with final return,
+maximum drawdown, win rate, and gross notional turnover.
+
+The model target measures close-to-close return, while the tradable return starts
+at the next open. Opening gaps can therefore change the sign and economics of a
+forecast. Cash earns no yield, dividends are not credited separately, period
+endpoints may be partial, and drawdown is sampled from bar-close equity rather
+than intrabar lows.
+
+These results are hypothetical. Because the current holdout has already informed
+model and horizon discussion, label its P&L exploratory and freeze the complete
+policy before evaluating a later untouched period.
 
 After choosing a Transformer candidate, pass its values to `tools/train.py` to
 fit and export the deployable V1 artifact. Diagnostic linear and MLP models are

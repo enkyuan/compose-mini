@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
+from typing import TextIO
 import argparse
-import hashlib
 import json
 import math
-import os
 import re
 import sys
 
@@ -25,7 +24,10 @@ except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
 
 from tools.artifact_v1 import Config
-from tools.data_v1 import FEATURE_COUNT, read_csv
+from tools.data_v1 import FEATURE_COUNT, read_bars
+from tools.files import (
+    atomic_text, file_sha256 as _sha256, require_disjoint, series_arg, write_json,
+)
 from tools.train import (
     FEATURE_NAMES, FEATURE_SETS, Fit, ForecastTransformer, TrainingData, Windows,
     data_loaders, evaluate, feature_lookback, fit_model, mean_loss, prepare_data,
@@ -286,23 +288,6 @@ def linear_model(data: TrainingData, ridge: float) -> Affine:
     return Affine(weight.float(), bias.float())
 
 
-def _timestamps(path: Path, expected: int) -> list[str]:
-    with path.open("r", encoding="ascii") as file:
-        next(file, None)
-        values = [line.partition(",")[0] for line in file]
-    if len(values) != expected:
-        raise ValueError("CSV changed while the experiment was reading it")
-    return values
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _boundary(timestamps: list[str], target_offset: int,
               split: tuple[int, ...], gap: int) -> dict[str, list[str]]:
     starts, offset = [], target_offset
@@ -328,6 +313,29 @@ def _candidate_data(path: Path, candidate: Candidate, split: tuple[int, int, int
         horizon_bars=sweep.target_horizon_bars,
         split_gap=sweep.alignment_horizon_bars - 1,
     )
+
+
+def _prediction_records(model: str, candidate: Candidate, series: str,
+                        seed: int | None, data: TrainingData,
+                        timestamps: Sequence[str], csv_sha256: str,
+                        predictions: Sequence[float]
+                        ) -> Iterator[dict[str, object]]:
+    if len(predictions) != len(data.test):
+        raise ValueError("prediction count does not match the test split")
+    start = feature_lookback(candidate.feature_set) + data.test.start + \
+        candidate.seq_len - 1
+    for offset, prediction in enumerate(predictions):
+        as_of = start + offset
+        target = as_of + data.horizon_bars
+        yield {
+            "schema": 1, "split": "test", "series": series,
+            "model": model, "candidate": candidate.name,
+            "feature_set": candidate.feature_set, "seed": seed,
+            "csv_sha256": csv_sha256,
+            "as_of": timestamps[as_of], "target_time": timestamps[target],
+            "horizon_bars": data.horizon_bars,
+            "predicted_log_return": prediction,
+        }
 
 
 def _fit_neural(model_name: str, candidate: Candidate, data: TrainingData,
@@ -523,7 +531,9 @@ def expected_runs(sweep: Sweep, series_count: int) -> int:
 
 
 def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
-                   device: torch.device, max_runs: int) -> dict[str, object]:
+                   device: torch.device, max_runs: int,
+                   prediction_records: list[dict[str, object]] | None = None
+                   ) -> dict[str, object]:
     if not series or len({name for name, _ in series}) != len(series):
         raise ValueError("series names must be nonempty and unique")
     runs = expected_runs(sweep, len(series))
@@ -538,10 +548,12 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     gap = alignment - 1
     metadata, folds_by_series = [], {}
     for name, path in series:
-        rows = read_csv(path)
-        row_count = len(rows) // FEATURE_COUNT
+        checksum = _sha256(path)
+        timestamps, rows = read_bars(path)
+        if _sha256(path) != checksum:
+            raise ValueError("CSV changed while the experiment was reading it")
+        row_count = len(timestamps)
         del rows
-        timestamps = _timestamps(path, row_count)
         samples = row_count - target_offset
         splits = tuple(
             purged_split(split, gap, preserve_last=False)
@@ -550,15 +562,15 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
             )
         )
         holdout = purged_split(holdout_split(samples, sweep.fold_fraction), gap)
-        folds_by_series[name] = (path, timestamps, splits, holdout)
+        folds_by_series[name] = (path, timestamps, checksum, splits, holdout)
         metadata.append({"name": name, "csv": str(path), "rows": row_count,
-                         "sha256": _sha256(path),
+                         "sha256": checksum,
                          "first_timestamp": timestamps[0],
                          "last_timestamp": timestamps[-1]})
 
     validation: list[dict[str, object]] = []
     for candidate in sweep.candidates:
-        for name, (path, timestamps, splits, _) in folds_by_series.items():
+        for name, (path, timestamps, _, splits, _) in folds_by_series.items():
             for fold, (train_count, validation_count) in enumerate(splits):
                 data = _candidate_data(
                     path, candidate, (train_count, validation_count, 1),
@@ -595,7 +607,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     test: list[dict[str, object]] = []
     for model_name in sweep.models:
         candidate = candidates[str(selection[model_name]["candidate"])]
-        for name, (path, timestamps, _, split) in folds_by_series.items():
+        for name, (path, timestamps, checksum, _, split) in folds_by_series.items():
             data = _candidate_data(path, candidate, split, max_history, sweep)
             boundary = _boundary(timestamps, target_offset, split, gap)
             seeds = sweep.seeds if model_name in NEURAL else (None,)
@@ -608,24 +620,30 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                         model_name, candidate, data, sweep, seed, device,
                     )
                     loader = loaders[2]
+                predictions = [] if prediction_records is not None else None
                 record = {
                     "model": model_name, "candidate": candidate.name,
                     "feature_set": candidate.feature_set, "series": name,
                     "fold": "holdout", "seed": seed, "targets": boundary,
                     "samples": len(data.test),
                     "metrics": evaluate(model, loader, data.target_mean,
-                                        data.target_scale, device),
+                                        data.target_scale, device, predictions),
                 }
                 if fit:
                     record.update(asdict(fit))
                 test.append(record)
+                if prediction_records is not None and predictions is not None:
+                    prediction_records.extend(_prediction_records(
+                        model_name, candidate, name, seed, data, timestamps, checksum,
+                        predictions,
+                    ))
 
     for metadata_record, (_, path) in zip(metadata, series, strict=True):
         if _sha256(path) != metadata_record["sha256"]:
             raise ValueError("CSV changed during the experiment")
 
     return {
-        "schema": 3,
+        "schema": 4,
         "protocol": {
             "split": "embargoed expanding walk-forward by target time",
             "selection": "minimum mean validation scaled-return MSE",
@@ -672,24 +690,21 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
 
 
 def write_report(path: Path, report: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(report, file, allow_nan=False, indent=2, sort_keys=True)
+    write_json(path, report)
+
+
+def write_predictions(path: Path,
+                      records: Sequence[Mapping[str, object]]) -> None:
+    def write(file: TextIO) -> None:
+        for record in records:
+            json.dump(record, file, allow_nan=False, sort_keys=True)
             file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+
+    atomic_text(path, write)
 
 
 def _series(value: str) -> tuple[str, Path]:
-    name, separator, path = value.partition("=")
-    if not separator or not SERIES_NAME.fullmatch(name) or not path:
-        raise argparse.ArgumentTypeError("series must be NAME=CSV")
-    return name, Path(path)
+    return series_arg(value, SERIES_NAME)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -700,12 +715,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--horizon-bars", type=int)
     parser.add_argument("--max-runs", type=int, default=256)
+    parser.add_argument("--predictions", type=Path)
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     try:
+        outputs = [args.report] + ([args.predictions] if args.predictions else [])
+        require_disjoint([args.sweep, *(path for _, path in args.series)], outputs)
         device = torch.device(args.device)
         if device.type == "meta" or args.max_runs <= 0:
             raise ValueError("device must execute tensors and max-runs must be positive")
@@ -713,13 +731,23 @@ def main() -> None:
         sweep = Sweep.read(args.sweep)
         if args.horizon_bars is not None:
             sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
-        report = run_experiment(sweep, args.series, device, args.max_runs)
+        predictions = [] if args.predictions else None
+        report = run_experiment(
+            sweep, args.series, device, args.max_runs, predictions,
+        )
+        if args.predictions and predictions is not None:
+            write_predictions(args.predictions, predictions)
+            report["prediction_ledger"] = {
+                "schema": 1, "path": str(args.predictions),
+                "records": len(predictions), "sha256": _sha256(args.predictions),
+            }
         write_report(args.report, report)
     except (FloatingPointError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
-    print(json.dumps({"report": str(args.report),
-                      "selection": report["selection"]},
-                     allow_nan=False, sort_keys=True))
+    result = {"report": str(args.report), "selection": report["selection"]}
+    if args.predictions:
+        result["predictions"] = str(args.predictions)
+    print(json.dumps(result, allow_nan=False, sort_keys=True))
 
 
 if __name__ == "__main__":

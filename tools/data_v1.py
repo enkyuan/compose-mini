@@ -66,8 +66,7 @@ def _number(field: str, number: int) -> float:
     return value
 
 
-def read_csv(path: Path) -> array:
-    """Return flat chronological float32 OHLCV from one exact six-field file."""
+def _records(path: Path) -> Iterator[tuple[str, list[float]]]:
     if locale.setlocale(locale.LC_NUMERIC) != "C":
         raise ValueError("LC_NUMERIC must be C")
     lines = _lines(path)
@@ -78,7 +77,7 @@ def read_csv(path: Path) -> array:
     if header != CSV_HEADER:
         raise ValueError(f"CSV header must be {CSV_HEADER}")
 
-    rows, previous = array("f"), ""
+    previous = ""
     for number, line in lines:
         fields = line.split(",")
         if len(fields) != FEATURE_COUNT + 1 or any(not field for field in fields):
@@ -91,6 +90,22 @@ def read_csv(path: Path) -> array:
         values = [_number(field, number) for field in fields[1:]]
         if values[3] <= 0.0:
             raise ValueError(f"line {number}: close must be positive")
-        rows.extend(values)
+        yield timestamp, values
         previous = timestamp
+
+
+def read_csv(path: Path) -> array:
+    """Return flat chronological float32 OHLCV from one exact six-field file."""
+    rows = array("f")
+    for _, values in _records(path):
+        rows.extend(values)
     return rows
+
+
+def read_bars(path: Path) -> tuple[tuple[str, ...], array]:
+    """Return timestamps and flat OHLCV without duplicating CSV validation."""
+    timestamps, rows = [], array("f")
+    for timestamp, values in _records(path):
+        timestamps.append(timestamp)
+        rows.extend(values)
+    return tuple(timestamps), rows

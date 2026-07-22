@@ -8,7 +8,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.data_v1 import CSV_HEADER, read_csv
+from tools.data_v1 import CSV_HEADER, read_bars, read_csv
 from tools.float32 import f32
 
 VALID_ROWS = (
@@ -36,6 +36,9 @@ def main() -> None:
             (1.0, 0.5, 2.0 ** -149, 100.0, 1000.0,
              2.0, 3.0, 0.25, 101.0, 1100.0)
         ]
+        timestamps, values = read_bars(path)
+        assert timestamps == tuple(row.partition(",")[0] for row in VALID_ROWS)
+        assert list(values) == list(read_csv(path))
         for row in invalid:
             path.write_bytes((CSV_HEADER + "\n" + row).encode("ascii"))
             try:

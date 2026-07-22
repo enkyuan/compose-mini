@@ -20,7 +20,7 @@ except ModuleNotFoundError as error:
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, expected_runs, holdout_split,
     linear_model, purged_split, run_experiment, select_candidates,
-    walk_forward_splits, write_report,
+    walk_forward_splits, write_predictions, write_report,
 )
 from tools.train import (
     TrainingData, Windows, data_loaders, evaluate, feature_lookback,
@@ -177,13 +177,14 @@ def verify_horizon_targets(csv: Path) -> TrainingData:
 
 
 def verify_horizon_reports(csv: Path) -> None:
+    ledgers: list[list[dict[str, object]]] = [[], []]
     reports = tuple(
         run_experiment(
             Sweep((candidate("raw-3", 3),), ("last_close",), (3,), 1, 0.2,
                   1, 1, 8, horizon, 3),
-            (("SYNTH", csv),), torch.device("cpu"), 2,
+            (("SYNTH", csv),), torch.device("cpu"), 2, ledger,
         )
-        for horizon in (1, 3)
+        for horizon, ledger in zip((1, 3), ledgers, strict=True)
     )
     for section in ("validation", "test"):
         assert [record["targets"] for record in reports[0][section]] == \
@@ -192,6 +193,14 @@ def verify_horizon_reports(csv: Path) -> None:
             [record["samples"] for record in reports[1][section]]
     assert [report["protocol"]["target_horizon_bars"] for report in reports] == [1, 3]
     assert all(report["protocol"]["embargo_bars"] == 2 for report in reports)
+    for report, ledger in zip(reports, ledgers, strict=True):
+        assert len(ledger) == report["test"][0]["samples"]
+        assert all(record["schema"] == 1 and record["split"] == "test"
+                   for record in ledger)
+        assert all(record["predicted_log_return"] == 0.0 for record in ledger)
+        assert all(record["csv_sha256"] == report["series"][0]["sha256"]
+                   for record in ledger)
+        assert ledger[0]["target_time"] == report["test"][0]["targets"]["test"][0]
     for record in (*reports[1]["validation"], *reports[1]["test"]):
         targets = record["targets"]
         assert datetime.fromisoformat(targets["validation"][0]) - \
@@ -236,6 +245,8 @@ def main() -> None:
         changed = Path(directory) / "changed.csv"
         output = Path(directory) / "report.json"
         repeated_output = Path(directory) / "report-again.json"
+        predictions_output = Path(directory) / "predictions.jsonl"
+        repeated_predictions_output = Path(directory) / "predictions-again.jsonl"
         write_csv(csv)
         three_horizon = verify_horizon_targets(csv)
         verify_horizon_reports(csv)
@@ -340,10 +351,18 @@ def main() -> None:
             assert "requires 25 runs" in str(error)
         else:
             raise AssertionError("run limit was not enforced")
-        report = run_experiment(sweep, (("SYNTH", csv),), torch.device("cpu"), 25)
-        repeated = run_experiment(sweep, (("SYNTH", csv),), torch.device("cpu"), 25)
+        predictions: list[dict[str, object]] = []
+        repeated_predictions: list[dict[str, object]] = []
+        report = run_experiment(
+            sweep, (("SYNTH", csv),), torch.device("cpu"), 25, predictions,
+        )
+        repeated = run_experiment(
+            sweep, (("SYNTH", csv),), torch.device("cpu"), 25,
+            repeated_predictions,
+        )
         assert repeated == report
-        assert report["schema"] == 3
+        assert repeated_predictions == predictions
+        assert report["schema"] == 4
         assert report["protocol"]["aligned_history_bars"] == 6
         assert report["protocol"]["target_horizon_bars"] == 1
         assert report["protocol"]["alignment_horizon_bars"] == 1
@@ -370,13 +389,20 @@ def main() -> None:
         assert validation_end < test_start
         write_report(output, report)
         write_report(repeated_output, repeated)
+        write_predictions(predictions_output, predictions)
+        write_predictions(repeated_predictions_output, repeated_predictions)
         assert output.read_bytes() == repeated_output.read_bytes()
+        assert predictions_output.read_bytes() == \
+            repeated_predictions_output.read_bytes()
         assert json.loads(output.read_text(encoding="utf-8")) == report
         assert "NaN" not in output.read_text(encoding="utf-8")
         integrity_sweep = Sweep(
             (candidate("integrity", 3),), ("last_close",), (3,), 1, 0.2, 1, 1, 8,
         )
-        with patch("tools.experiment._sha256", side_effect=("before", "after")):
+        with patch(
+            "tools.experiment._sha256",
+            side_effect=("before", "before", "after"),
+        ):
             try:
                 run_experiment(integrity_sweep, (("SYNTH", csv),),
                                torch.device("cpu"), 2)

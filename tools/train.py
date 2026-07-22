@@ -212,7 +212,8 @@ def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Opt
 
 
 def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
-             target_scale: torch.Tensor, device: torch.device) -> dict[str, float]:
+             target_scale: torch.Tensor, device: torch.device,
+             predictions: list[float] | None = None) -> dict[str, float]:
     totals = {"return_squared": 0.0, "return_absolute": 0.0,
               "close_absolute": 0.0, "baseline_close_absolute": 0.0,
               "direction_correct": 0.0}
@@ -221,6 +222,8 @@ def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
         for features, targets, latest, actual in loader:
             predicted_return = model(features.to(device)).cpu() * target_scale + target_mean
             actual_return = targets * target_scale + target_mean
+            if predictions is not None:
+                predictions.extend(predicted_return.tolist())
             difference = predicted_return - actual_return
             predicted_close = latest * predicted_return.exp()
             totals["return_squared"] += difference.square().sum().item()
