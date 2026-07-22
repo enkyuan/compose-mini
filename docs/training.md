@@ -182,6 +182,32 @@ atomic, strict JSON under the ignored `reports/` directory. Run and diagnostic
 model-size limits reject accidental compute or memory explosions; raise
 `--max-runs` only after estimating the required compute.
 
+### Compare target horizons
+
+For 30-minute bars, compare 30 minutes, 2 hours, and roughly one 6.5-hour
+regular session with one raw-17 sweep:
+
+```sh
+for horizon in 1 4 13; do
+  python tools/experiment.py experiments/horizons.example.json \
+    "reports/horizon-${horizon}.json" \
+    AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+    --horizon-bars "$horizon" --max-runs 117
+done
+```
+
+Horizon `H` predicts `log(close[t + H] / close[t])`. The shared 13-bar
+alignment keeps target timestamps, folds, sample counts, and the final holdout
+identical across reports. A fixed 12-bar embargo removes labels that would not
+yet be known at the next split's earliest forecast origin. The trailing-mean
+baseline scales its one-bar mean by `H`; last-close remains zero return.
+
+Each horizon has a different target scaler, so do not rank horizons by scaled
+MSE. Compare each model with its horizon-matched last-close and rolling-mean
+baselines using return MAE, per-series close-MAE difference, direction accuracy,
+and variation across seeds. These reports are diagnostic: artifact V1 and the C
+runtime still forecast only the next bar.
+
 To isolate input representation from model size, run the paired feature sweep:
 
 ```sh

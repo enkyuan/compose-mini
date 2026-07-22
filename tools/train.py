@@ -145,9 +145,11 @@ class ForecastTransformer(nn.Module):
 
 class Windows(Dataset):
     def __init__(self, features: torch.Tensor, targets: torch.Tensor,
-                 closes: torch.Tensor, seq_len: int, start: int, count: int) -> None:
+                 closes: torch.Tensor, seq_len: int, start: int, count: int,
+                 horizon_bars: int = 1) -> None:
         self.features, self.targets, self.closes = features, targets, closes
         self.seq_len, self.start, self.count = seq_len, start, count
+        self.horizon_bars = horizon_bars
 
     def __len__(self) -> int:
         return self.count
@@ -157,7 +159,7 @@ class Windows(Dataset):
         final_row = sample + self.seq_len - 1
         return (
             self.features[sample:sample + self.seq_len], self.targets[sample],
-            self.closes[final_row], self.closes[final_row + 1],
+            self.closes[final_row], self.closes[final_row + self.horizon_bars],
         )
 
 
@@ -173,6 +175,7 @@ class TrainingData:
     target_mean: torch.Tensor
     target_scale: torch.Tensor
     feature_set: str = "ohlcv"
+    horizon_bars: int = 1
 
 
 @dataclass(frozen=True)
@@ -271,13 +274,16 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
                  validation_fraction: float,
                  split: tuple[int, int, int] | None = None,
                  sample_start: int = 0,
-                 feature_set: str = "ohlcv") -> TrainingData:
-    """Scale one target-time split using only rows reachable by its training inputs."""
+                 feature_set: str = "ohlcv", horizon_bars: int = 1,
+                 split_gap: int = 0) -> TrainingData:
+    """Scale purged target-time splits using only their retained training rows."""
+    if horizon_bars < 1 or split_gap < 0:
+        raise ValueError("horizon must be positive and split gap nonnegative")
     rows = read_csv(path)
     row_count = len(rows) // FEATURE_COUNT
     lookback = feature_lookback(feature_set)
-    if row_count <= config.seq_len + lookback:
-        raise ValueError("training requires lookback + seq_len + 1 rows")
+    if row_count < config.seq_len + lookback + horizon_bars:
+        raise ValueError("training requires lookback + seq_len + horizon rows")
     # The clone gives PyTorch ownership before the compact parser buffer is released.
     raw = torch.frombuffer(rows, dtype=torch.float32).view(
         row_count, FEATURE_COUNT,
@@ -287,14 +293,17 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
         raise ValueError("CSV values must remain finite binary32 with positive closes")
     closes = raw[lookback:, 3].clone()
     values = feature_values(raw, feature_set)
-    raw_targets = torch.log(closes[1:] / closes[:-1])[config.seq_len - 1:]
+    raw_targets = torch.log(
+        closes[horizon_bars:] / closes[:-horizon_bars]
+    )[config.seq_len - 1:]
     if not torch.isfinite(raw_targets).all():
         raise ValueError("close ratios must produce finite log returns")
 
     available = len(raw_targets) - sample_start
-    counts = split or split_counts(available, train_fraction, validation_fraction)
+    usable = available - split_gap * 2
+    counts = split or split_counts(usable, train_fraction, validation_fraction)
     if sample_start < 0 or len(counts) != 3 or min(counts) <= 0 or \
-       sum(counts) > available:
+       sum(counts) > usable:
         raise ValueError("chronological split is outside the available target range")
     train_count, validation_count, test_count = counts
     training_rows = values[
@@ -312,16 +321,17 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
         raise ValueError("training rows require positive finite feature and target scales")
     features = values.sub_(feature_mean).div_(feature_scale)
     targets = (raw_targets - target_mean) / target_scale
-    validation_start = sample_start + train_count
-    test_start = validation_start + validation_count
+    validation_start = sample_start + train_count + split_gap
+    test_start = validation_start + validation_count + split_gap
     return TrainingData(
         Windows(features, targets, closes, config.seq_len,
-                sample_start, train_count),
+                sample_start, train_count, horizon_bars),
         Windows(features, targets, closes, config.seq_len,
-                validation_start, validation_count),
+                validation_start, validation_count, horizon_bars),
         Windows(features, targets, closes, config.seq_len,
-                test_start, test_count),
+                test_start, test_count, horizon_bars),
         feature_mean, feature_scale, target_mean, target_scale, feature_set,
+        horizon_bars,
     )
 
 

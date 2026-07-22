@@ -19,8 +19,8 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, expected_runs, holdout_split,
-    linear_model, run_experiment, select_candidates, walk_forward_splits,
-    write_report,
+    linear_model, purged_split, run_experiment, select_candidates,
+    walk_forward_splits, write_report,
 )
 from tools.train import (
     TrainingData, Windows, data_loaders, evaluate, feature_lookback,
@@ -28,11 +28,15 @@ from tools.train import (
 )
 
 
+def close_value(index: int) -> float:
+    return 100.0 + 0.08 * index + 0.05 * (index % 7) - 0.03 * (index % 3)
+
+
 def write_csv(path: Path, count: int = 56) -> None:
     start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
     lines = ["timestamp,open,high,low,close,volume"]
     for index in range(count):
-        close = 100.0 + 0.08 * index + 0.05 * (index % 7) - 0.03 * (index % 3)
+        close = close_value(index)
         values = (close - 0.1 - 0.01 * (index % 2), close + 0.4,
                   close - 0.5, close, 1_000.0 + 11.0 * index + index % 5)
         timestamp = (start + timedelta(minutes=index)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -135,9 +139,88 @@ def verify_caps(directory: Path) -> None:
             raise AssertionError(f"{model} size cap was not enforced")
 
 
+def verify_horizon_targets(csv: Path) -> TrainingData:
+    config = candidate("horizon", 3).config()
+    implicit = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10))
+    explicit = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10),
+                            horizon_bars=1)
+    torch.testing.assert_close(outcomes(implicit.train), outcomes(explicit.train),
+                               rtol=0.0, atol=0.0)
+    automatic = prepare_data(csv, config, 0.6, 0.2,
+                             horizon_bars=3, split_gap=2)
+    assert sum(map(len, (automatic.train, automatic.validation,
+                        automatic.test))) + 4 == 51
+
+    one = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10), 2,
+                       horizon_bars=1, split_gap=2)
+    three = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10), 0,
+                         horizon_bars=3, split_gap=2)
+    _, target, latest, actual = three.train[0]
+    torch.testing.assert_close(latest, torch.tensor(close_value(2)))
+    torch.testing.assert_close(actual, torch.tensor(close_value(5)))
+    torch.testing.assert_close(latest * (target * three.target_scale +
+                                         three.target_mean).exp(), actual)
+    for left, right in zip((one.train, one.validation, one.test),
+                           (three.train, three.validation, three.test), strict=True):
+        torch.testing.assert_close(
+            torch.stack([left[index][3] for index in range(len(left))]),
+            torch.stack([right[index][3] for index in range(len(right))]),
+            rtol=0.0, atol=0.0,
+        )
+    try:
+        prepare_data(csv, config, 0.7, 0.15, horizon_bars=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nonpositive horizon was accepted")
+    return three
+
+
+def verify_horizon_reports(csv: Path) -> None:
+    reports = tuple(
+        run_experiment(
+            Sweep((candidate("raw-3", 3),), ("last_close",), (3,), 1, 0.2,
+                  1, 1, 8, horizon, 3),
+            (("SYNTH", csv),), torch.device("cpu"), 2,
+        )
+        for horizon in (1, 3)
+    )
+    for section in ("validation", "test"):
+        assert [record["targets"] for record in reports[0][section]] == \
+            [record["targets"] for record in reports[1][section]]
+        assert [record["samples"] for record in reports[0][section]] == \
+            [record["samples"] for record in reports[1][section]]
+    assert [report["protocol"]["target_horizon_bars"] for report in reports] == [1, 3]
+    assert all(report["protocol"]["embargo_bars"] == 2 for report in reports)
+    for record in (*reports[1]["validation"], *reports[1]["test"]):
+        targets = record["targets"]
+        assert datetime.fromisoformat(targets["validation"][0]) - \
+            timedelta(minutes=3) >= datetime.fromisoformat(targets["train"][1])
+        if "test" in targets:
+            assert datetime.fromisoformat(targets["test"][0]) - \
+                timedelta(minutes=3) >= datetime.fromisoformat(
+                    targets["validation"][1]
+                )
+    selection_end = max(record["targets"]["validation"][1]
+                        for record in reports[1]["validation"])
+    test_start = min(record["targets"]["test"][0]
+                     for record in reports[1]["test"])
+    assert datetime.fromisoformat(test_start) - timedelta(minutes=3) >= \
+        datetime.fromisoformat(selection_end)
+    try:
+        Sweep((candidate("invalid", 3),), ("last_close",), (3,), 1, 0.2,
+              1, 1, 8, 3, 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("horizon greater than alignment was accepted")
+
+
 def main() -> None:
     assert walk_forward_splits(20, 2, 0.2) == ((8, 4), (12, 4))
     assert holdout_split(20, 0.2) == (12, 4, 4)
+    assert purged_split((12, 4, 4), 2) == (10, 2, 4)
+    assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
     verify_selection_is_validation_only()
     verify_ridge()
     verify_stationary_features()
@@ -154,12 +237,25 @@ def main() -> None:
         output = Path(directory) / "report.json"
         repeated_output = Path(directory) / "report-again.json"
         write_csv(csv)
+        three_horizon = verify_horizon_targets(csv)
+        verify_horizon_reports(csv)
         lines = csv.read_text(encoding="ascii").splitlines()
         for index in range(27, len(lines)):
             fields = lines[index].split(",")
             fields[1:] = [str(float(value) * 1.5) for value in fields[1:]]
             lines[index] = ",".join(fields)
         changed.write_text("\n".join(lines), encoding="ascii")
+        changed_horizon = prepare_data(
+            changed, candidate("horizon-leak", 3).config(), 0.7, 0.15,
+            (20, 10, 10), horizon_bars=3, split_gap=2,
+        )
+        for left, right in zip(
+            (three_horizon.feature_mean, three_horizon.feature_scale,
+             three_horizon.target_mean, three_horizon.target_scale),
+            (changed_horizon.feature_mean, changed_horizon.feature_scale,
+             changed_horizon.target_mean, changed_horizon.target_scale), strict=True,
+        ):
+            assert torch.equal(left, right)
         base = prepare_data(csv, candidate("leak", 5).config(), 0.7, 0.15,
                             (20, 10, 10))
         perturbed = prepare_data(changed, candidate("leak", 5).config(), 0.7, 0.15,
@@ -214,14 +310,28 @@ def main() -> None:
         closes = features[:, :, 3] * base.feature_scale[3] + base.feature_mean[3]
         expected = torch.log(closes[:, 1:] / closes[:, :-1])[:, -2:].mean(1)
         torch.testing.assert_close(rolling, expected)
-        stationary_loader = data_loaders(stationary, 8, 0)[1]
+        horizon_features = next(iter(data_loaders(three_horizon, 8, 0)[1]))[0]
+        horizon_rolling = RollingMean(three_horizon, 2)(horizon_features) * \
+            three_horizon.target_scale + three_horizon.target_mean
+        horizon_closes = horizon_features[:, :, 3] * three_horizon.feature_scale[3] + \
+            three_horizon.feature_mean[3]
+        horizon_expected = torch.log(
+            horizon_closes[:, 1:] / horizon_closes[:, :-1]
+        )[:, -2:].mean(1) * 3
+        torch.testing.assert_close(horizon_rolling, horizon_expected)
+        stationary_three = prepare_data(
+            csv, candidate("stationary-horizon", 5).config(), 0.7, 0.15,
+            (20, 10, 10), feature_set="stationary-v1", horizon_bars=3,
+        )
+        stationary_loader = data_loaders(stationary_three, 8, 0)[1]
         stationary_features = next(iter(stationary_loader))[0]
-        stationary_rolling = RollingMean(stationary, 2)(stationary_features)
-        stationary_raw = stationary_features * stationary.feature_scale + \
-            stationary.feature_mean
-        stationary_expected = stationary_raw[:, -2:, :2].sum(2).mean(1)
+        stationary_rolling = RollingMean(stationary_three, 2)(stationary_features)
+        stationary_raw = stationary_features * stationary_three.feature_scale + \
+            stationary_three.feature_mean
+        stationary_expected = stationary_raw[:, -2:, :2].sum(2).mean(1) * 3
         torch.testing.assert_close(
-            stationary_rolling * stationary.target_scale + stationary.target_mean,
+            stationary_rolling * stationary_three.target_scale +
+            stationary_three.target_mean,
             stationary_expected,
         )
         try:
@@ -233,8 +343,11 @@ def main() -> None:
         report = run_experiment(sweep, (("SYNTH", csv),), torch.device("cpu"), 25)
         repeated = run_experiment(sweep, (("SYNTH", csv),), torch.device("cpu"), 25)
         assert repeated == report
-        assert report["schema"] == 2
+        assert report["schema"] == 3
         assert report["protocol"]["aligned_history_bars"] == 6
+        assert report["protocol"]["target_horizon_bars"] == 1
+        assert report["protocol"]["alignment_horizon_bars"] == 1
+        assert report["protocol"]["embargo_bars"] == 0
         assert set(report["protocol"]["feature_sets"]) == {"ohlcv", "stationary-v1"}
         paired = report["validation_summary"]["transformer"]["paired_deltas"]
         assert paired["stationary-minus-short"]["return_mae"]["count"] == 2

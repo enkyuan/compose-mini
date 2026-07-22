@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
 import argparse
@@ -124,6 +124,14 @@ class Sweep:
     epochs: int
     patience: int
     batch_size: int
+    target_horizon_bars: int = 1
+    alignment_horizon_bars: int = 1
+
+    def __post_init__(self) -> None:
+        _integer(self.target_horizon_bars, "target_horizon_bars")
+        _integer(self.alignment_horizon_bars, "alignment_horizon_bars")
+        if self.target_horizon_bars > self.alignment_horizon_bars:
+            raise ValueError("target_horizon_bars cannot exceed alignment_horizon_bars")
 
     @classmethod
     def read(cls, path: Path) -> Sweep:
@@ -134,7 +142,8 @@ class Sweep:
         if not isinstance(value, dict):
             raise ValueError("sweep must be an object")
         allowed = {"candidates", "models", "seeds", "folds", "fold_fraction",
-                   "epochs", "patience", "batch_size"}
+                   "epochs", "patience", "batch_size", "target_horizon_bars",
+                   "alignment_horizon_bars"}
         extra = set(value) - allowed
         if extra:
             raise ValueError(f"unknown sweep field: {sorted(extra)[0]}")
@@ -167,11 +176,15 @@ class Sweep:
                            "fold_fraction", 0.0, True)
         if fraction * (folds + 1) >= 1.0:
             raise ValueError("fold_fraction leaves no initial training segment")
+        horizon = _integer(value.get("target_horizon_bars", 1),
+                           "target_horizon_bars")
         return cls(
             candidates, tuple(models_value), seeds, folds, fraction,
             _integer(value.get("epochs", 100), "epochs"),
             _integer(value.get("patience", 10), "patience"),
             _integer(value.get("batch_size", 64), "batch_size"),
+            horizon, _integer(value.get("alignment_horizon_bars", horizon),
+                              "alignment_horizon_bars"),
         )
 
 
@@ -210,6 +223,7 @@ class RollingMean(nn.Module):
     def __init__(self, data: TrainingData, window: int) -> None:
         super().__init__()
         self.window = window
+        self.horizon_bars = data.horizon_bars
         self.stationary = data.feature_set != "ohlcv"
         for name, value in (
             ("feature_mean", data.feature_mean),
@@ -223,7 +237,7 @@ class RollingMean(nn.Module):
         raw = values * self.feature_scale + self.feature_mean
         returns = (raw[:, :, :2].sum(2) if self.stationary else
                    torch.log(raw[:, 1:, 3] / raw[:, :-1, 3]))
-        prediction = returns[:, -self.window:].mean(1)
+        prediction = returns[:, -self.window:].mean(1) * self.horizon_bars
         return (prediction - self.target_mean) / self.target_scale
 
 
@@ -241,6 +255,17 @@ def holdout_split(samples: int, fraction: float) -> tuple[int, int, int]:
     if block <= 0 or samples - 2 * block <= 0:
         raise ValueError("series is too short for validation and test holdouts")
     return samples - 2 * block, block, block
+
+
+def purged_split(split: tuple[int, ...], gap: int,
+                 preserve_last: bool = True) -> tuple[int, ...]:
+    """Remove boundary labels whose horizons overlap the following split."""
+    purge_count = len(split) - int(preserve_last)
+    result = tuple(count - gap if index < purge_count else count
+                   for index, count in enumerate(split))
+    if min(result) <= 0:
+        raise ValueError("series blocks must exceed the horizon embargo")
+    return result
 
 
 def _matrix(dataset: Windows) -> tuple[torch.Tensor, torch.Tensor]:
@@ -278,18 +303,31 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _boundary(timestamps: list[str], max_seq_len: int,
-              split: tuple[int, ...]) -> dict[str, list[str]]:
-    starts, offset = [], max_seq_len
+def _boundary(timestamps: list[str], target_offset: int,
+              split: tuple[int, ...], gap: int) -> dict[str, list[str]]:
+    starts, offset = [], target_offset
     for count in split:
         starts.append(offset)
-        offset += count
+        offset += count + gap
     return {
         name: [timestamps[start], timestamps[start + count - 1]]
         for name, start, count in zip(
             ("train", "validation", "test"), starts, split, strict=False,
         )
     }
+
+
+def _candidate_data(path: Path, candidate: Candidate, split: tuple[int, int, int],
+                    max_history: int, sweep: Sweep) -> TrainingData:
+    history = candidate.seq_len + feature_lookback(candidate.feature_set)
+    return prepare_data(
+        path, candidate.config(), 0.7, 0.15, split=split,
+        sample_start=max_history - history + sweep.alignment_horizon_bars -
+        sweep.target_horizon_bars,
+        feature_set=candidate.feature_set,
+        horizon_bars=sweep.target_horizon_bars,
+        split_gap=sweep.alignment_horizon_bars - 1,
+    )
 
 
 def _fit_neural(model_name: str, candidate: Candidate, data: TrainingData,
@@ -494,15 +532,24 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     torch.use_deterministic_algorithms(True)
     max_history = max(candidate.seq_len + feature_lookback(candidate.feature_set)
                       for candidate in sweep.candidates)
+    horizon = sweep.target_horizon_bars
+    alignment = sweep.alignment_horizon_bars
+    target_offset = max_history + alignment - 1
+    gap = alignment - 1
     metadata, folds_by_series = [], {}
     for name, path in series:
         rows = read_csv(path)
         row_count = len(rows) // FEATURE_COUNT
         del rows
         timestamps = _timestamps(path, row_count)
-        splits = walk_forward_splits(row_count - max_history,
-                                     sweep.folds, sweep.fold_fraction)
-        holdout = holdout_split(row_count - max_history, sweep.fold_fraction)
+        samples = row_count - target_offset
+        splits = tuple(
+            purged_split(split, gap, preserve_last=False)
+            for split in walk_forward_splits(
+                samples, sweep.folds, sweep.fold_fraction,
+            )
+        )
+        holdout = purged_split(holdout_split(samples, sweep.fold_fraction), gap)
         folds_by_series[name] = (path, timestamps, splits, holdout)
         metadata.append({"name": name, "csv": str(path), "rows": row_count,
                          "sha256": _sha256(path),
@@ -512,14 +559,13 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     validation: list[dict[str, object]] = []
     for candidate in sweep.candidates:
         for name, (path, timestamps, splits, _) in folds_by_series.items():
-            sample_start = max_history - candidate.seq_len - \
-                feature_lookback(candidate.feature_set)
             for fold, (train_count, validation_count) in enumerate(splits):
-                data = prepare_data(path, candidate.config(), 0.7, 0.15,
-                                    (train_count, validation_count, 1), sample_start,
-                                    candidate.feature_set)
+                data = _candidate_data(
+                    path, candidate, (train_count, validation_count, 1),
+                    max_history, sweep,
+                )
                 boundary = _boundary(
-                    timestamps, max_history, (train_count, validation_count),
+                    timestamps, target_offset, (train_count, validation_count), gap,
                 )
                 for model_name in sweep.models:
                     if model_name in NEURAL:
@@ -550,11 +596,8 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     for model_name in sweep.models:
         candidate = candidates[str(selection[model_name]["candidate"])]
         for name, (path, timestamps, _, split) in folds_by_series.items():
-            sample_start = max_history - candidate.seq_len - \
-                feature_lookback(candidate.feature_set)
-            data = prepare_data(path, candidate.config(), 0.7, 0.15,
-                                split, sample_start, candidate.feature_set)
-            boundary = _boundary(timestamps, max_history, split)
+            data = _candidate_data(path, candidate, split, max_history, sweep)
+            boundary = _boundary(timestamps, target_offset, split, gap)
             seeds = sweep.seeds if model_name in NEURAL else (None,)
             for seed in seeds:
                 if seed is None:
@@ -582,14 +625,17 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
             raise ValueError("CSV changed during the experiment")
 
     return {
-        "schema": 2,
+        "schema": 3,
         "protocol": {
-            "split": "expanding walk-forward by target time",
+            "split": "embargoed expanding walk-forward by target time",
             "selection": "minimum mean validation scaled-return MSE",
             "selection_aggregation": "macro mean over series, folds, and seeds",
             "holdout_aggregation": "macro mean over series and seeds",
             "test_policy": "evaluate selected candidates on one final holdout",
             "aligned_history_bars": max_history,
+            "target_horizon_bars": horizon,
+            "alignment_horizon_bars": alignment,
+            "embargo_bars": gap,
             "feature_contract": "experiment-only; artifact V1 remains OHLCV",
             "feature_sets": {
                 name: list(FEATURE_NAMES[name])
@@ -612,6 +658,8 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
             "folds": sweep.folds, "fold_fraction": sweep.fold_fraction,
             "epochs": sweep.epochs, "patience": sweep.patience,
             "batch_size": sweep.batch_size,
+            "target_horizon_bars": horizon,
+            "alignment_horizon_bars": alignment,
         },
         "selection": selection,
         "validation": validation,
@@ -650,6 +698,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("report", type=Path)
     parser.add_argument("series", nargs="+", type=_series, metavar="NAME=CSV")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--horizon-bars", type=int)
     parser.add_argument("--max-runs", type=int, default=256)
     return parser.parse_args(argv)
 
@@ -662,6 +711,8 @@ def main() -> None:
             raise ValueError("device must execute tensors and max-runs must be positive")
         torch.empty(0, device=device)
         sweep = Sweep.read(args.sweep)
+        if args.horizon_bars is not None:
+            sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
         report = run_experiment(sweep, args.series, device, args.max_runs)
         write_report(args.report, report)
     except (FloatingPointError, OSError, RuntimeError, TypeError, ValueError) as error:
