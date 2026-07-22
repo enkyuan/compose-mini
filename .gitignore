@@ -61,3 +61,8 @@ dkms.conf
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Local credentials
+.env
+.env.*
+!.env.example
