@@ -89,6 +89,8 @@ def verify_training(binary: Path, directory: Path) -> int:
                                capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout)
+    assert report["test"]["last_close_baseline_mae"] == \
+        report["test"]["zero_return_baseline_mae"]
     metrics = (report["best_validation_scaled_mse"], *report["test"].values())
     assert all(math.isfinite(value) for value in metrics)
 
@@ -142,7 +144,7 @@ def verify_restoration(csv: Path, directory: Path) -> None:
         return float(epoch)
 
     metrics = {"return_mse": 0.0, "return_mae": 0.0, "close_mae": 0.0,
-               "last_close_baseline_mae": 0.0, "direction_accuracy": 0.0}
+               "zero_return_baseline_mae": 0.0, "direction_accuracy": 0.0}
     with patch("tools.train.train_epoch", step), \
          patch("tools.train.mean_loss", validate), \
          patch("tools.train.evaluate", return_value=metrics):

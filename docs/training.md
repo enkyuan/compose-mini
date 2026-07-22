@@ -154,7 +154,7 @@ zero-copy sliding views over one scaled feature tensor, trains on scaled log
 returns, restores the best validation weights, evaluates chronologically, and
 atomically writes a checksummed artifact. Its final JSON labels validation MSE
 as scaled-target loss and reports raw-return MSE/MAE, predicted-close MAE, and
-last-close baseline MAE and direction accuracy for the test segment.
+zero-return reference-price MAE and direction accuracy for the test segment.
 
 ## Compare configurations and baselines
 
@@ -164,21 +164,23 @@ Run the same experiment independently over one or more instruments:
 python tools/experiment.py experiments/sweep.example.json \
   reports/market.json \
   AAPL=data/aapl-30m.csv \
-  MSFT=data/msft-30m.csv
+  MSFT=data/msft-30m.csv \
+  --validation-only
 ```
 
 The sweep compares the Transformer with ridge linear regression, a one-hidden-
-layer MLP, a trailing-mean return, and the zero-return last-close baseline. It
-uses expanding walk-forward validation folds and repeated seeds. Candidates
+layer MLP, a trailing-mean return, and a zero-return baseline. The legacy model
+name `last_close` uses the target's reference price. The sweep uses expanding
+walk-forward validation folds and repeated seeds. Candidates
 with different sequence lengths are aligned to identical target timestamps.
 Each model's configuration is selected only by mean validation scaled-return
-MSE, then evaluated once on a final untouched test holdout.
+MSE. A holdout is evaluated only through the frozen-policy workflow below.
 
 Each CSV remains an independent model problem because artifact schema 1 stores
 one feature scaler and must never form windows across instruments. The report
 macro-averages return metrics so every instrument, fold, and seed has equal
 weight. It keeps dollar close MAE separate by instrument, including each seed's
-absolute and relative difference from last-close, and records sample counts,
+absolute and relative difference from zero return, and records sample counts,
 dataset hashes, runtime versions, and exact target-time ranges. Reports are
 atomic, strict JSON under the ignored `reports/` directory. Run and diagnostic
 model-size limits reject accidental compute or memory explosions; raise
@@ -194,21 +196,38 @@ for horizon in 1 4 13; do
   python tools/experiment.py experiments/horizons.example.json \
     "reports/horizon-${horizon}.json" \
     AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-    --horizon-bars "$horizon" --max-runs 117
+    --horizon-bars "$horizon" --max-runs 78 --validation-only
 done
 ```
 
-Horizon `H` predicts `log(close[t + H] / close[t])`. The shared 13-bar
+By default, horizon `H` predicts `log(close[t + H] / close[t])`. The shared 13-bar
 alignment keeps target timestamps, folds, sample counts, and the final holdout
 identical across reports. A fixed 12-bar embargo removes labels that would not
 yet be known at the next split's earliest forecast origin. The trailing-mean
-baseline scales its one-bar mean by `H`; last-close remains zero return.
+baseline scales its one-bar mean by `H`; `last_close` remains zero return.
 
 Each horizon has a different target scaler, so do not rank horizons by scaled
-MSE. Compare each model with its horizon-matched last-close and rolling-mean
-baselines using return MAE, per-series close-MAE difference, direction accuracy,
-and variation across seeds. These reports are diagnostic: artifact V1 and the C
-runtime still forecast only the next bar.
+MSE. Compare validation return MAE, direction accuracy, and variation across
+seeds against horizon-matched baselines. These reports are diagnostic: artifact
+V1 and the C runtime still forecast only the next bar.
+
+To align an experiment with the prices available to the backtest, predict the
+return from the next executable open instead:
+
+```sh
+python tools/experiment.py experiments/horizons.example.json \
+  reports/executable-13-validation.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 78 \
+  --validation-predictions reports/executable-13-validation.jsonl \
+  --validation-only
+```
+
+`executable-return-v1` is
+`log(close[t + H] / open[t + 1])`: the same entry and exit prices simulated by
+the backtest. The default `close-to-close-v1` target remains the Artifact V1
+contract. The executable target is experiment-only and requires a future
+artifact schema before deployment through the C runtime.
 
 To isolate input representation from model size, run the paired feature sweep:
 
@@ -216,7 +235,7 @@ To isolate input representation from model size, run the paired feature sweep:
 python tools/experiment.py experiments/features.example.json \
   reports/features.json \
   AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --max-runs 300
+  --max-runs 300 --validation-only
 ```
 
 The stationarity-oriented `stationary-v1` representation encodes each completed
@@ -224,8 +243,8 @@ candle as log gap, log body, upper and lower log wick, and log-volume change. It
 uses only that candle and its previous completed bar; it does not claim that the
 resulting series is statistically stationary. The raw 17-bar control matches
 its total history, while the raw 16-bar control matches its token count. All
-variants share target timestamps, folds, optimizer settings, seeds, and the
-untouched final holdout.
+variants share target timestamps, folds, optimizer settings, and seeds without
+opening the final holdout.
 
 ```text
 [log(open[t] / close[t-1]), log(close[t] / open[t]),
@@ -242,40 +261,82 @@ candidate-minus-control deltas; negative error deltas favor the candidate.
 
 ## Backtest a frozen holdout
 
-Export timestamped test predictions while running a frozen experiment:
+Run validation first; this phase cannot emit test predictions or metrics:
 
 ```sh
 python tools/experiment.py experiments/horizons.example.json \
-  reports/horizon-13.json \
+  reports/horizon-13-validation.json \
   AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --horizon-bars 13 --max-runs 117 \
-  --predictions reports/horizon-13-predictions.jsonl
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 78 \
+  --validation-predictions reports/horizon-13-validation.jsonl \
+  --validation-only
 ```
 
-Then run each series, model, and seed independently from `$100`:
+Select the model's MSE-chosen candidate and one predeclared log-return safety
+margin from validation only:
 
 ```sh
-python tools/backtest.py reports/horizon-13-predictions.jsonl \
-  reports/horizon-13-backtest.json \
+python tools/select_policy.py reports/horizon-13-validation.json \
+  reports/horizon-13-validation.jsonl reports/horizon-13-policy.json \
   AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --spread-bps 1 --slippage-bps 1 --fee-bps 0
+  --model transformer --safety-bps 0 3 6 10 \
+  --initial-cash 100 --spread-bps 1 --slippage-bps 1 --fee-bps 0
 ```
 
-The frozen policy is long when predicted log return is positive and otherwise
-cash. Each entry invests all available equity in fractional shares without
-leverage, enters at the next bar's open, exits at the target bar's close, and
-ignores signals made before that exit.
+The selector verifies every selected candidate, series, fold, seed, timestamp
+boundary, and input hash. It averages the configured seeds, maximizes mean log
+terminal growth across validation accounts, deterministically breaks ties by
+lower turnover and higher threshold, and selects cash when no trading rule wins.
+
+Only after the policy exists, rerun the deterministic experiment to emit test
+predictions, then apply the policy without overrides:
+
+```sh
+python tools/experiment.py experiments/horizons.example.json \
+  reports/horizon-13-test.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 93 \
+  --predictions reports/horizon-13-test.jsonl \
+  --policy reports/horizon-13-policy.json
+
+python tools/backtest.py reports/horizon-13-test.jsonl \
+  reports/horizon-13-backtest.json \
+  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
+  --policy reports/horizon-13-policy.json \
+  --experiment-report reports/horizon-13-test.json
+```
+
+Test mode rejects direct model, cost, seed, and threshold overrides. The frozen
+policy must authorize the full experiment before it can evaluate its model.
+Repeat `--policy` to authorize several already-frozen models; no other model is
+evaluated on the holdout. The test report records each authorized policy hash.
+The frozen
+validation fingerprint must also match the test experiment's candidate
+configuration, selection, folds, series, and validation results. The frozen
+policy is long only when predicted log return exceeds exact
+round-trip break-even friction plus the validation-chosen safety margin; it is
+otherwise cash. Each entry invests all available equity in fractional shares
+without leverage, enters at the next bar's open, exits at the target bar's
+close, and ignores signals made before that exit.
+The policy file is the trust root: archive it with the final report, which
+records the exact policy SHA-256 used for the backtest.
+Local files cannot make historical holdout access one-shot. For confirmatory
+claims, pre-register the complete policy-hash set and test boundary in an
+append-only external log; classify every later policy or rerun as exploratory.
 Spread is the full quoted spread; slippage and proportional fees apply per side.
 The report compares the forecast rule with cash, buy-and-hold, and an always-up
 rule over identical bars. Equity is marked to cost-adjusted liquidation value at
 each close and summarized by UTC day, ISO week, and month, with final return,
-maximum drawdown, win rate, and gross notional turnover.
+maximum drawdown, win rate, and gross notional turnover. Signal coverage counts
+all forecasts above threshold, execution coverage counts completed trades over
+all forecasts, and eligible-entry hit rate excludes forecasts blocked by an
+open position.
 
-The model target measures close-to-close return, while the tradable return starts
-at the next open. Opening gaps can therefore change the sign and economics of a
-forecast. Cash earns no yield, dividends are not credited separately, period
-endpoints may be partial, and drawdown is sampled from bar-close equity rather
-than intrabar lows.
+With `close-to-close-v1`, opening gaps can still change a forecast's sign and
+economics. `executable-return-v1` removes that target/execution mismatch. Cash
+earns no yield, dividends are not credited separately, period endpoints may be
+partial, and drawdown is sampled from bar-close equity rather than intrabar
+lows.
 
 These results are hypothetical. Because the current holdout has already informed
 model and horizon discussion, label its P&L exploratory and freeze the complete

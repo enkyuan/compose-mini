@@ -10,6 +10,13 @@ import math
 
 CSV_HEADER = "timestamp,open,high,low,close,volume"
 FEATURE_COUNT = 5
+CLOSE_RETURN_TARGET = "close-to-close-v1"
+EXECUTABLE_RETURN_TARGET = "executable-return-v1"
+TARGET_KINDS = (CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET)
+TARGET_FORMULAS = {
+    CLOSE_RETURN_TARGET: "log(close[t + horizon] / close[t])",
+    EXECUTABLE_RETURN_TARGET: "log(close[t + horizon] / open[t + 1])",
+}
 LINE_CAP = 512
 # Delegate numeric syntax and range flags to the same libc primitive as C.
 _STRTOF = ctypes.CDLL(None, use_errno=True).strtof

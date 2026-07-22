@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify walk-forward selection, aligned targets, baselines, and JSON reports."""
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -18,10 +19,13 @@ except ModuleNotFoundError as error:
     raise SystemExit("experiment tests require PyTorch") from error
 
 from tools.experiment import (
-    Candidate, ConstantReturn, RollingMean, Sweep, expected_runs, holdout_split,
-    linear_model, purged_split, run_experiment, select_candidates,
+    Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
+    expected_runs, holdout_split, linear_model, purged_split, run_experiment,
+    select_candidates,
     walk_forward_splits, write_predictions, write_report,
 )
+from tools.backtest import experiment_fingerprint
+from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
 from tools.train import (
     TrainingData, Windows, data_loaders, evaluate, feature_lookback,
     feature_values, prepare_data,
@@ -48,6 +52,10 @@ def candidate(name: str, seq_len: int,
               feature_set: str = "ohlcv") -> Candidate:
     return Candidate(name, seq_len, 4, 2, 6, 1, 1e-3, 1e-4,
                      6, min(2, seq_len - 1), 1e-3, feature_set)
+
+
+def authorize(*models: str) -> Callable[[object], tuple[str, ...]]:
+    return lambda _: models
 
 
 def outcomes(dataset: Windows) -> torch.Tensor:
@@ -114,7 +122,7 @@ def verify_ridge() -> None:
     windows = features.unfold(0, 2, 1).transpose(1, 2).reshape(-1, 10)
     weight = torch.linspace(-0.5, 0.5, 10)
     targets = windows @ weight + 0.25
-    dataset = Windows(features, targets, closes, 2, 0, 30)
+    dataset = Windows(features, targets, closes, closes, 2, 0, 30)
     data = TrainingData(dataset, dataset, dataset, torch.zeros(5),
                         torch.ones(5), torch.tensor(0.0), torch.tensor(1.0))
     torch.testing.assert_close(linear_model(data, 1e-8)(windows[:30]), targets[:30],
@@ -160,6 +168,28 @@ def verify_horizon_targets(csv: Path) -> TrainingData:
     torch.testing.assert_close(actual, torch.tensor(close_value(5)))
     torch.testing.assert_close(latest * (target * three.target_scale +
                                          three.target_mean).exp(), actual)
+    executable = prepare_data(
+        csv, config, 0.7, 0.15, (20, 10, 10), horizon_bars=3,
+        split_gap=2, target_kind=EXECUTABLE_RETURN_TARGET,
+    )
+    _, target, reference, actual = executable.train[0]
+    expected_open = close_value(3) - 0.1 - 0.01 * (3 % 2)
+    torch.testing.assert_close(reference, torch.tensor(expected_open))
+    torch.testing.assert_close(actual, torch.tensor(close_value(5)))
+    torch.testing.assert_close(
+        reference * (target * executable.target_scale +
+                     executable.target_mean).exp(), actual,
+    )
+    assert executable.target_kind == EXECUTABLE_RETURN_TARGET
+    stationary = prepare_data(
+        csv, config, 0.7, 0.15, (20, 10, 10), feature_set="stationary-v1",
+        horizon_bars=3, split_gap=2,
+        target_kind=EXECUTABLE_RETURN_TARGET,
+    )
+    _, _, reference, actual = stationary.train[0]
+    expected_open = close_value(4) - 0.1 - 0.01 * (4 % 2)
+    torch.testing.assert_close(reference, torch.tensor(expected_open))
+    torch.testing.assert_close(actual, torch.tensor(close_value(6)))
     for left, right in zip((one.train, one.validation, one.test),
                            (three.train, three.validation, three.test), strict=True):
         torch.testing.assert_close(
@@ -173,18 +203,42 @@ def verify_horizon_targets(csv: Path) -> TrainingData:
         pass
     else:
         raise AssertionError("nonpositive horizon was accepted")
+    try:
+        prepare_data(csv, config, 0.7, 0.15, target_kind="unknown")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported target kind was accepted")
+    bad_open = csv.with_name("bad-open.csv")
+    lines = csv.read_text(encoding="ascii").splitlines()
+    fields = lines[4].split(",")
+    fields[1] = "0"
+    lines[4] = ",".join(fields)
+    bad_open.write_text("\n".join(lines), encoding="ascii")
+    try:
+        prepare_data(
+            bad_open, config, 0.7, 0.15, target_kind=EXECUTABLE_RETURN_TARGET,
+        )
+    except ValueError as error:
+        assert "reference prices" in str(error)
+    else:
+        raise AssertionError("nonpositive executable reference was accepted")
     return three
 
 
 def verify_horizon_reports(csv: Path) -> None:
     ledgers: list[list[dict[str, object]]] = [[], []]
+    validation_ledgers: list[list[dict[str, object]]] = [[], []]
     reports = tuple(
         run_experiment(
             Sweep((candidate("raw-3", 3),), ("last_close",), (3,), 1, 0.2,
                   1, 1, 8, horizon, 3),
             (("SYNTH", csv),), torch.device("cpu"), 2, ledger,
+            validation_ledger, test_authorizer=authorize("last_close"),
         )
-        for horizon, ledger in zip((1, 3), ledgers, strict=True)
+        for horizon, ledger, validation_ledger in zip(
+            (1, 3), ledgers, validation_ledgers, strict=True,
+        )
     )
     for section in ("validation", "test"):
         assert [record["targets"] for record in reports[0][section]] == \
@@ -193,10 +247,19 @@ def verify_horizon_reports(csv: Path) -> None:
             [record["samples"] for record in reports[1][section]]
     assert [report["protocol"]["target_horizon_bars"] for report in reports] == [1, 3]
     assert all(report["protocol"]["embargo_bars"] == 2 for report in reports)
-    for report, ledger in zip(reports, ledgers, strict=True):
+    for report, ledger, validation_ledger in zip(
+        reports, ledgers, validation_ledgers, strict=True,
+    ):
+        assert report["schema"] == 5
+        assert report["protocol"]["target_kind"] == CLOSE_RETURN_TARGET
         assert len(ledger) == report["test"][0]["samples"]
-        assert all(record["schema"] == 1 and record["split"] == "test"
+        assert len(validation_ledger) == report["validation"][0]["samples"]
+        assert all(record["schema"] == 2 and record["split"] == "test" and
+                   record["fold"] is None and
+                   record["target_kind"] == CLOSE_RETURN_TARGET
                    for record in ledger)
+        assert all(record["schema"] == 2 and record["split"] == "validation" and
+                   record["fold"] == 0 for record in validation_ledger)
         assert all(record["predicted_log_return"] == 0.0 for record in ledger)
         assert all(record["csv_sha256"] == report["series"][0]["sha256"]
                    for record in ledger)
@@ -223,6 +286,49 @@ def verify_horizon_reports(csv: Path) -> None:
         pass
     else:
         raise AssertionError("horizon greater than alignment was accepted")
+    executable = run_experiment(
+        Sweep((candidate("executable", 3),), ("last_close",), (3,),
+              1, 0.2, 1, 1, 8, 3, 3, EXECUTABLE_RETURN_TARGET),
+        (("SYNTH", csv),), torch.device("cpu"), 2,
+        test_authorizer=authorize("last_close"),
+    )
+    assert executable["protocol"]["target_kind"] == EXECUTABLE_RETURN_TARGET
+    assert executable["protocol"]["zero_return_reference"] == "open[t + 1]"
+    validation_only = run_experiment(
+        Sweep((candidate("executable", 3),), ("last_close",), (3,),
+              1, 0.2, 1, 1, 8, 3, 3, EXECUTABLE_RETURN_TARGET),
+        (("SYNTH", csv),), torch.device("cpu"), 1,
+        evaluate_test=False,
+    )
+    assert validation_only["protocol"]["phase"] == "validation"
+    assert validation_only["test"] == []
+    assert validation_only["test_contract"][0]["samples"] > 0
+    policy = {
+        "validation_fingerprint": experiment_fingerprint(validation_only),
+        "model": "last_close", "candidate": "executable",
+        "feature_set": "ohlcv", "target_kind": EXECUTABLE_RETURN_TARGET,
+        "horizon_bars": 3, "seeds": [], "series": ["SYNTH"],
+        "test_grid": validation_only["test_contract"],
+    }
+    assert _authorize_test(validation_only, (policy,)) == ("last_close",)
+    reordered = validation_only | {
+        "sweep": validation_only["sweep"] | {
+            "models": ["transformer"], "seeds": [7, 3],
+        },
+        "selection": {"transformer": {"candidate": "executable"}},
+    }
+    seeded_policy = policy | {
+        "validation_fingerprint": experiment_fingerprint(reordered),
+        "model": "transformer", "seeds": [3, 7],
+    }
+    assert _authorize_test(reordered, (seeded_policy,)) == ("transformer",)
+    for policies in ((), (policy | {"validation_fingerprint": "0" * 64},)):
+        try:
+            _authorize_test(validation_only, policies)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid test authorization was accepted")
 
 
 def main() -> None:
@@ -239,6 +345,7 @@ def main() -> None:
         (3,), 2, 0.2, 2, 2, 8,
     )
     assert expected_runs(sweep, 1) == 25
+    assert expected_runs(sweep, 1, False) == 20
     with tempfile.TemporaryDirectory(prefix="compose-mini-experiment-") as directory:
         verify_caps(Path(directory))
         csv = Path(directory) / "series.csv"
@@ -247,6 +354,8 @@ def main() -> None:
         repeated_output = Path(directory) / "report-again.json"
         predictions_output = Path(directory) / "predictions.jsonl"
         repeated_predictions_output = Path(directory) / "predictions-again.jsonl"
+        validation_predictions_output = Path(directory) / "validation.jsonl"
+        repeated_validation_output = Path(directory) / "validation-again.jsonl"
         write_csv(csv)
         three_horizon = verify_horizon_targets(csv)
         verify_horizon_reports(csv)
@@ -346,27 +455,36 @@ def main() -> None:
             stationary_expected,
         )
         try:
-            run_experiment(sweep, (("SYNTH", csv),), torch.device("cpu"), 24)
+            run_experiment(
+                sweep, (("SYNTH", csv),), torch.device("cpu"), 24,
+                test_authorizer=authorize(*sweep.models),
+            )
         except ValueError as error:
             assert "requires 25 runs" in str(error)
         else:
             raise AssertionError("run limit was not enforced")
         predictions: list[dict[str, object]] = []
         repeated_predictions: list[dict[str, object]] = []
+        validation_predictions: list[dict[str, object]] = []
+        repeated_validation_predictions: list[dict[str, object]] = []
         report = run_experiment(
             sweep, (("SYNTH", csv),), torch.device("cpu"), 25, predictions,
+            validation_predictions, test_authorizer=authorize(*sweep.models),
         )
         repeated = run_experiment(
             sweep, (("SYNTH", csv),), torch.device("cpu"), 25,
-            repeated_predictions,
+            repeated_predictions, repeated_validation_predictions,
+            test_authorizer=authorize(*sweep.models),
         )
         assert repeated == report
         assert repeated_predictions == predictions
-        assert report["schema"] == 4
+        assert repeated_validation_predictions == validation_predictions
+        assert report["schema"] == 5
         assert report["protocol"]["aligned_history_bars"] == 6
         assert report["protocol"]["target_horizon_bars"] == 1
         assert report["protocol"]["alignment_horizon_bars"] == 1
         assert report["protocol"]["embargo_bars"] == 0
+        assert report["protocol"]["target_kind"] == CLOSE_RETURN_TARGET
         assert set(report["protocol"]["feature_sets"]) == {"ohlcv", "stationary-v1"}
         paired = report["validation_summary"]["transformer"]["paired_deltas"]
         assert paired["stationary-minus-short"]["return_mae"]["count"] == 2
@@ -391,9 +509,19 @@ def main() -> None:
         write_report(repeated_output, repeated)
         write_predictions(predictions_output, predictions)
         write_predictions(repeated_predictions_output, repeated_predictions)
+        write_predictions(validation_predictions_output, validation_predictions)
+        write_predictions(repeated_validation_output,
+                          repeated_validation_predictions)
         assert output.read_bytes() == repeated_output.read_bytes()
         assert predictions_output.read_bytes() == \
             repeated_predictions_output.read_bytes()
+        assert validation_predictions_output.read_bytes() == \
+            repeated_validation_output.read_bytes()
+        assert len(validation_predictions) == sum(
+            record["samples"] for record in report["validation"]
+        )
+        assert all(record["split"] == "validation" and
+                   type(record["fold"]) is int for record in validation_predictions)
         assert json.loads(output.read_text(encoding="utf-8")) == report
         assert "NaN" not in output.read_text(encoding="utf-8")
         integrity_sweep = Sweep(
@@ -405,7 +533,8 @@ def main() -> None:
         ):
             try:
                 run_experiment(integrity_sweep, (("SYNTH", csv),),
-                               torch.device("cpu"), 2)
+                               torch.device("cpu"), 2,
+                               test_authorizer=authorize("last_close"))
             except ValueError as error:
                 assert "CSV changed" in str(error)
             else:

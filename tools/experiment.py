@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from statistics import fmean, pstdev
@@ -24,7 +24,10 @@ except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
 
 from tools.artifact_v1 import Config
-from tools.data_v1 import FEATURE_COUNT, read_bars
+from tools.data_v1 import (
+    CLOSE_RETURN_TARGET, FEATURE_COUNT, TARGET_FORMULAS, TARGET_KINDS, read_bars,
+)
+from tools.backtest import experiment_fingerprint, read_policy
 from tools.files import (
     atomic_text, file_sha256 as _sha256, require_disjoint, series_arg, write_json,
 )
@@ -36,7 +39,7 @@ from tools.train import (
 MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
 NEURAL = frozenset(("transformer", "mlp"))
 RETURN_METRICS = ("return_mse", "return_mae", "direction_accuracy")
-EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "last_close_baseline_mae")
+EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "zero_return_baseline_mae")
 SERIES_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_FLAT_FEATURES = 2_048
 MAX_MLP_PARAMETERS = 8_388_608
@@ -128,12 +131,15 @@ class Sweep:
     batch_size: int
     target_horizon_bars: int = 1
     alignment_horizon_bars: int = 1
+    target_kind: str = CLOSE_RETURN_TARGET
 
     def __post_init__(self) -> None:
         _integer(self.target_horizon_bars, "target_horizon_bars")
         _integer(self.alignment_horizon_bars, "alignment_horizon_bars")
         if self.target_horizon_bars > self.alignment_horizon_bars:
             raise ValueError("target_horizon_bars cannot exceed alignment_horizon_bars")
+        if self.target_kind not in TARGET_KINDS:
+            raise ValueError("target_kind is unsupported")
 
     @classmethod
     def read(cls, path: Path) -> Sweep:
@@ -145,7 +151,7 @@ class Sweep:
             raise ValueError("sweep must be an object")
         allowed = {"candidates", "models", "seeds", "folds", "fold_fraction",
                    "epochs", "patience", "batch_size", "target_horizon_bars",
-                   "alignment_horizon_bars"}
+                   "alignment_horizon_bars", "target_kind"}
         extra = set(value) - allowed
         if extra:
             raise ValueError(f"unknown sweep field: {sorted(extra)[0]}")
@@ -187,6 +193,7 @@ class Sweep:
             _integer(value.get("batch_size", 64), "batch_size"),
             horizon, _integer(value.get("alignment_horizon_bars", horizon),
                               "alignment_horizon_bars"),
+            value.get("target_kind", CLOSE_RETURN_TARGET),
         )
 
 
@@ -312,28 +319,33 @@ def _candidate_data(path: Path, candidate: Candidate, split: tuple[int, int, int
         feature_set=candidate.feature_set,
         horizon_bars=sweep.target_horizon_bars,
         split_gap=sweep.alignment_horizon_bars - 1,
+        target_kind=sweep.target_kind,
     )
 
 
 def _prediction_records(model: str, candidate: Candidate, series: str,
                         seed: int | None, data: TrainingData,
                         timestamps: Sequence[str], csv_sha256: str,
-                        predictions: Sequence[float]
+                        predictions: Sequence[float], dataset: Windows,
+                        split: str, fold: int | None,
                         ) -> Iterator[dict[str, object]]:
-    if len(predictions) != len(data.test):
-        raise ValueError("prediction count does not match the test split")
-    start = feature_lookback(candidate.feature_set) + data.test.start + \
+    if split not in ("validation", "test") or \
+       (split == "validation") != (fold is not None) or \
+       len(predictions) != len(dataset):
+        raise ValueError("prediction metadata does not match its split")
+    start = feature_lookback(candidate.feature_set) + dataset.start + \
         candidate.seq_len - 1
     for offset, prediction in enumerate(predictions):
         as_of = start + offset
         target = as_of + data.horizon_bars
         yield {
-            "schema": 1, "split": "test", "series": series,
+            "schema": 2, "split": split, "fold": fold, "series": series,
             "model": model, "candidate": candidate.name,
             "feature_set": candidate.feature_set, "seed": seed,
             "csv_sha256": csv_sha256,
             "as_of": timestamps[as_of], "target_time": timestamps[target],
             "horizon_bars": data.horizon_bars,
+            "target_kind": data.target_kind,
             "predicted_log_return": prediction,
         }
 
@@ -498,7 +510,7 @@ def summarize(records: Sequence[Mapping[str, object]],
                 selected = [record for record in series_records
                             if record["seed"] == seed]
                 values = _means(selected, metrics)
-                baseline = values["last_close_baseline_mae"]
+                baseline = values["zero_return_baseline_mae"]
                 values["close_mae_delta"] = values["close_mae"] - baseline
                 values["close_mae_relative"] = (
                     values["close_mae"] / baseline - 1.0 if baseline else
@@ -523,22 +535,90 @@ def summarize(records: Sequence[Mapping[str, object]],
     return summary
 
 
-def expected_runs(sweep: Sweep, series_count: int) -> int:
-    learned = sum(model in NEURAL for model in sweep.models) * len(sweep.seeds)
-    deterministic = len(sweep.models) - sum(model in NEURAL for model in sweep.models)
-    per_fold = learned + deterministic
-    return series_count * per_fold * (sweep.folds * len(sweep.candidates) + 1)
+def _model_runs(sweep: Sweep, models: Sequence[str]) -> int:
+    return sum(len(sweep.seeds) if model in NEURAL else 1 for model in models)
+
+
+def expected_runs(sweep: Sweep, series_count: int,
+                  evaluate_test: bool = True,
+                  test_models: Sequence[str] | None = None) -> int:
+    validation = _model_runs(sweep, sweep.models) * sweep.folds * \
+        len(sweep.candidates)
+    selected = sweep.models if test_models is None else test_models
+    test = _model_runs(sweep, selected) if evaluate_test else 0
+    return series_count * (validation + test)
+
+
+def _validation_contract(sweep: Sweep, series: Sequence[Mapping[str, object]],
+                         test_contract: Sequence[Mapping[str, object]],
+                         selection: Mapping[str, object],
+                         validation: Sequence[Mapping[str, object]],
+                         ) -> dict[str, object]:
+    return {
+        "series": list(series), "test_contract": list(test_contract),
+        "sweep": {
+            "candidates": [asdict(candidate) for candidate in sweep.candidates],
+            "models": list(sweep.models), "seeds": list(sweep.seeds),
+            "folds": sweep.folds, "fold_fraction": sweep.fold_fraction,
+            "epochs": sweep.epochs, "patience": sweep.patience,
+            "batch_size": sweep.batch_size,
+            "target_horizon_bars": sweep.target_horizon_bars,
+            "alignment_horizon_bars": sweep.alignment_horizon_bars,
+            "target_kind": sweep.target_kind,
+        },
+        "selection": dict(selection), "validation": list(validation),
+    }
+
+
+def _authorize_test(contract: Mapping[str, object],
+                    policies: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
+    if not policies:
+        raise ValueError("test evaluation requires a frozen policy")
+    fingerprint = experiment_fingerprint(contract)
+    sweep = contract["sweep"]
+    configurations = {item["name"]: item for item in sweep["candidates"]}
+    names = sorted(item["name"] for item in contract["series"])
+    models = tuple(policy["model"] for policy in policies)
+    if len(models) != len(set(models)):
+        raise ValueError("test policies must name unique models")
+    for policy in policies:
+        model = policy["model"]
+        try:
+            candidate = contract["selection"][model]["candidate"]
+            configuration = configurations[candidate]
+        except (KeyError, TypeError) as error:
+            raise ValueError("test policy model is not in the experiment") from error
+        expected_seeds = sorted(sweep["seeds"]) if model in NEURAL else []
+        if policy["validation_fingerprint"] != fingerprint or \
+           policy["candidate"] != candidate or \
+           policy["feature_set"] != configuration["feature_set"] or \
+           policy["target_kind"] != sweep["target_kind"] or \
+           policy["horizon_bars"] != sweep["target_horizon_bars"] or \
+           policy["seeds"] != expected_seeds or policy["series"] != names or \
+           policy["test_grid"] != contract["test_contract"]:
+            raise ValueError("test policy does not match the validation contract")
+    return models
 
 
 def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                    device: torch.device, max_runs: int,
-                   prediction_records: list[dict[str, object]] | None = None
+                   prediction_records: list[dict[str, object]] | None = None,
+                   validation_prediction_records: list[dict[str, object]] | None = None,
+                   evaluate_test: bool = True,
+                   test_authorizer: Callable[
+                       [Mapping[str, object]], Sequence[str]
+                   ] | None = None,
                    ) -> dict[str, object]:
     if not series or len({name for name, _ in series}) != len(series):
         raise ValueError("series names must be nonempty and unique")
-    runs = expected_runs(sweep, len(series))
+    if not evaluate_test and prediction_records is not None:
+        raise ValueError("validation-only experiments cannot collect test predictions")
+    if evaluate_test and test_authorizer is None:
+        raise ValueError("test evaluation requires explicit authorization")
+    runs = expected_runs(sweep, len(series), False)
     if runs > max_runs:
-        raise ValueError(f"experiment requires {runs} runs; --max-runs is {max_runs}")
+        raise ValueError(f"experiment requires at least {runs} runs; "
+                         f"--max-runs is {max_runs}")
     torch.use_deterministic_algorithms(True)
     max_history = max(candidate.seq_len + feature_lookback(candidate.feature_set)
                       for candidate in sweep.candidates)
@@ -546,7 +626,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     alignment = sweep.alignment_horizon_bars
     target_offset = max_history + alignment - 1
     gap = alignment - 1
-    metadata, folds_by_series = [], {}
+    metadata, test_contract, folds_by_series = [], [], {}
     for name, path in series:
         checksum = _sha256(path)
         timestamps, rows = read_bars(path)
@@ -563,6 +643,14 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
         )
         holdout = purged_split(holdout_split(samples, sweep.fold_fraction), gap)
         folds_by_series[name] = (path, timestamps, checksum, splits, holdout)
+        test_boundary = _boundary(
+            timestamps, target_offset, holdout, gap,
+        )["test"]
+        test_contract.append({
+            "series": name, "samples": holdout[2],
+            "first_target_time": test_boundary[0],
+            "last_target_time": test_boundary[1],
+        })
         metadata.append({"name": name, "csv": str(path), "rows": row_count,
                          "sha256": checksum,
                          "first_timestamp": timestamps[0],
@@ -570,7 +658,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
 
     validation: list[dict[str, object]] = []
     for candidate in sweep.candidates:
-        for name, (path, timestamps, _, splits, _) in folds_by_series.items():
+        for name, (path, timestamps, checksum, splits, _) in folds_by_series.items():
             for fold, (train_count, validation_count) in enumerate(splits):
                 data = _candidate_data(
                     path, candidate, (train_count, validation_count, 1),
@@ -580,78 +668,120 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                     timestamps, target_offset, (train_count, validation_count), gap,
                 )
                 for model_name in sweep.models:
-                    if model_name in NEURAL:
-                        for seed in sweep.seeds:
+                    seeds = sweep.seeds if model_name in NEURAL else (None,)
+                    for seed in seeds:
+                        if seed is None:
+                            model = _deterministic(
+                                model_name, candidate, data,
+                            ).to(device)
+                            fit = None
+                            loader = data_loaders(data, sweep.batch_size, 0)[1]
+                        else:
                             model, fit, loaders = _fit_neural(
                                 model_name, candidate, data, sweep, seed, device,
                             )
-                            validation.append(_validation_record(
-                                model_name, candidate, name, fold, boundary, seed,
-                                len(data.validation),
-                                mean_loss(model, loaders[1], device),
-                                evaluate(model, loaders[1], data.target_mean,
-                                         data.target_scale, device), fit,
-                            ))
-                    else:
-                        model = _deterministic(model_name, candidate, data).to(device)
-                        loader = data_loaders(data, sweep.batch_size, 0)[1]
+                            loader = loaders[1]
+                        predictions = [] if validation_prediction_records is not None \
+                            else None
+                        metrics = evaluate(
+                            model, loader, data.target_mean, data.target_scale,
+                            device, predictions,
+                        )
                         validation.append(_validation_record(
-                            model_name, candidate, name, fold, boundary, None,
+                            model_name, candidate, name, fold, boundary, seed,
                             len(data.validation), mean_loss(model, loader, device),
-                            evaluate(model, loader, data.target_mean,
-                                     data.target_scale, device), None,
+                            metrics, fit,
                         ))
+                        if validation_prediction_records is not None and \
+                           predictions is not None:
+                            validation_prediction_records.extend(
+                                _prediction_records(
+                                    model_name, candidate, name, seed, data,
+                                    timestamps, checksum, predictions,
+                                    data.validation, "validation", fold,
+                                )
+                            )
 
     selection = select_candidates(validation, sweep.models, sweep.candidates)
+    contract = _validation_contract(
+        sweep, metadata, test_contract, selection, validation,
+    )
+    test_models: Sequence[str] = ()
+    if evaluate_test and test_authorizer is not None:
+        test_models = tuple(test_authorizer(contract))
+        if not test_models or len(test_models) != len(set(test_models)) or \
+           any(model not in sweep.models for model in test_models):
+            raise ValueError("test authorization returned invalid models")
+        runs = expected_runs(sweep, len(series), True, test_models)
+        if runs > max_runs:
+            raise ValueError(f"experiment requires {runs} runs; "
+                             f"--max-runs is {max_runs}")
     candidates = {candidate.name: candidate for candidate in sweep.candidates}
     test: list[dict[str, object]] = []
-    for model_name in sweep.models:
-        candidate = candidates[str(selection[model_name]["candidate"])]
-        for name, (path, timestamps, checksum, _, split) in folds_by_series.items():
-            data = _candidate_data(path, candidate, split, max_history, sweep)
-            boundary = _boundary(timestamps, target_offset, split, gap)
-            seeds = sweep.seeds if model_name in NEURAL else (None,)
-            for seed in seeds:
-                if seed is None:
-                    model = _deterministic(model_name, candidate, data).to(device)
-                    fit, loader = None, data_loaders(data, sweep.batch_size, 0)[2]
-                else:
-                    model, fit, loaders = _fit_neural(
-                        model_name, candidate, data, sweep, seed, device,
-                    )
-                    loader = loaders[2]
-                predictions = [] if prediction_records is not None else None
-                record = {
-                    "model": model_name, "candidate": candidate.name,
-                    "feature_set": candidate.feature_set, "series": name,
-                    "fold": "holdout", "seed": seed, "targets": boundary,
-                    "samples": len(data.test),
-                    "metrics": evaluate(model, loader, data.target_mean,
-                                        data.target_scale, device, predictions),
-                }
-                if fit:
-                    record.update(asdict(fit))
-                test.append(record)
-                if prediction_records is not None and predictions is not None:
-                    prediction_records.extend(_prediction_records(
-                        model_name, candidate, name, seed, data, timestamps, checksum,
-                        predictions,
-                    ))
+    if evaluate_test:
+        for model_name in test_models:
+            candidate = candidates[str(selection[model_name]["candidate"])]
+            for name, (path, timestamps, checksum, _, split) in \
+                    folds_by_series.items():
+                data = _candidate_data(path, candidate, split, max_history, sweep)
+                boundary = _boundary(timestamps, target_offset, split, gap)
+                seeds = sweep.seeds if model_name in NEURAL else (None,)
+                for seed in seeds:
+                    if seed is None:
+                        model = _deterministic(
+                            model_name, candidate, data,
+                        ).to(device)
+                        fit = None
+                        loader = data_loaders(data, sweep.batch_size, 0)[2]
+                    else:
+                        model, fit, loaders = _fit_neural(
+                            model_name, candidate, data, sweep, seed, device,
+                        )
+                        loader = loaders[2]
+                    predictions = [] if prediction_records is not None else None
+                    record = {
+                        "model": model_name, "candidate": candidate.name,
+                        "feature_set": candidate.feature_set, "series": name,
+                        "fold": "holdout", "seed": seed, "targets": boundary,
+                        "samples": len(data.test),
+                        "metrics": evaluate(
+                            model, loader, data.target_mean, data.target_scale,
+                            device, predictions,
+                        ),
+                    }
+                    if fit:
+                        record.update(asdict(fit))
+                    test.append(record)
+                    if prediction_records is not None and predictions is not None:
+                        prediction_records.extend(_prediction_records(
+                            model_name, candidate, name, seed, data, timestamps,
+                            checksum, predictions, data.test, "test", None,
+                        ))
 
     for metadata_record, (_, path) in zip(metadata, series, strict=True):
         if _sha256(path) != metadata_record["sha256"]:
             raise ValueError("CSV changed during the experiment")
 
     return {
-        "schema": 4,
+        "schema": 5,
         "protocol": {
             "split": "embargoed expanding walk-forward by target time",
             "selection": "minimum mean validation scaled-return MSE",
             "selection_aggregation": "macro mean over series, folds, and seeds",
             "holdout_aggregation": "macro mean over series and seeds",
-            "test_policy": "evaluate selected candidates on one final holdout",
+            "phase": "validation-and-test" if evaluate_test else "validation",
+            "test_policy": (
+                "evaluate selected candidates on one final holdout" if evaluate_test
+                else "deferred until policy selection"
+            ),
             "aligned_history_bars": max_history,
             "target_horizon_bars": horizon,
+            "target_kind": sweep.target_kind,
+            "target_formula": TARGET_FORMULAS[sweep.target_kind],
+            "zero_return_reference": (
+                "close[t]" if sweep.target_kind == CLOSE_RETURN_TARGET else
+                "open[t + 1]"
+            ),
             "alignment_horizon_bars": alignment,
             "embargo_bars": gap,
             "feature_contract": "experiment-only; artifact V1 remains OHLCV",
@@ -669,18 +799,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
         },
         "runtime": {"device": str(device), "python": sys.version.split()[0],
                     "torch": torch.__version__},
-        "series": metadata,
-        "sweep": {
-            "candidates": [asdict(candidate) for candidate in sweep.candidates],
-            "models": list(sweep.models), "seeds": list(sweep.seeds),
-            "folds": sweep.folds, "fold_fraction": sweep.fold_fraction,
-            "epochs": sweep.epochs, "patience": sweep.patience,
-            "batch_size": sweep.batch_size,
-            "target_horizon_bars": horizon,
-            "alignment_horizon_bars": alignment,
-        },
-        "selection": selection,
-        "validation": validation,
+        **contract,
         "validation_summary": summarize_validation(
             validation, sweep.models, sweep.candidates,
         ),
@@ -707,6 +826,21 @@ def _series(value: str) -> tuple[str, Path]:
     return series_arg(value, SERIES_NAME)
 
 
+def _policy_input(path: Path) -> tuple[Path, str, dict[str, object]]:
+    checksum = _sha256(path)
+    policy = read_policy(path)
+    if _sha256(path) != checksum:
+        raise ValueError("test policy changed while it was being read")
+    return path, checksum, policy
+
+
+def _verify_policy_inputs(
+    inputs: Sequence[tuple[Path, str, Mapping[str, object]]],
+) -> None:
+    if any(_sha256(path) != checksum for path, checksum, _ in inputs):
+        raise ValueError("test policy changed during the experiment")
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sweep", type=Path)
@@ -714,39 +848,79 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("series", nargs="+", type=_series, metavar="NAME=CSV")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--horizon-bars", type=int)
+    parser.add_argument("--target-kind", choices=TARGET_KINDS)
     parser.add_argument("--max-runs", type=int, default=256)
     parser.add_argument("--predictions", type=Path)
+    parser.add_argument("--validation-predictions", type=Path)
+    parser.add_argument("--validation-only", action="store_true")
+    parser.add_argument("--policy", dest="policies", action="append", type=Path)
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     try:
-        outputs = [args.report] + ([args.predictions] if args.predictions else [])
-        require_disjoint([args.sweep, *(path for _, path in args.series)], outputs)
+        policy_paths = tuple(args.policies or ())
+        outputs = [path for path in (
+            args.report, args.predictions, args.validation_predictions,
+        ) if path]
+        require_disjoint(
+            [args.sweep, *policy_paths, *(path for _, path in args.series)], outputs,
+        )
         device = torch.device(args.device)
         if device.type == "meta" or args.max_runs <= 0:
             raise ValueError("device must execute tensors and max-runs must be positive")
+        if args.validation_only and args.predictions:
+            raise ValueError("validation-only mode cannot export test predictions")
+        if (args.validation_only and policy_paths) or \
+           (not args.validation_only and not policy_paths) or \
+           len(policy_paths) != len(set(policy_paths)):
+            raise ValueError("full experiments require unique frozen policies")
         torch.empty(0, device=device)
         sweep = Sweep.read(args.sweep)
         if args.horizon_bars is not None:
             sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
+        if args.target_kind is not None:
+            sweep = replace(sweep, target_kind=args.target_kind)
+        policy_inputs = tuple(_policy_input(path) for path in policy_paths)
         predictions = [] if args.predictions else None
+        validation_predictions = [] if args.validation_predictions else None
         report = run_experiment(
             sweep, args.series, device, args.max_runs, predictions,
+            validation_predictions, not args.validation_only,
+            (lambda contract: _authorize_test(
+                contract, tuple(item[2] for item in policy_inputs),
+            )) if policy_inputs else None,
         )
+        _verify_policy_inputs(policy_inputs)
+        if policy_inputs:
+            report["policies"] = [
+                {"path": str(path), "sha256": checksum,
+                 "model": policy["model"]}
+                for path, checksum, policy in policy_inputs
+            ]
         if args.predictions and predictions is not None:
             write_predictions(args.predictions, predictions)
             report["prediction_ledger"] = {
-                "schema": 1, "path": str(args.predictions),
+                "schema": 2, "path": str(args.predictions),
                 "records": len(predictions), "sha256": _sha256(args.predictions),
             }
+        if args.validation_predictions and validation_predictions is not None:
+            write_predictions(args.validation_predictions, validation_predictions)
+            report["validation_prediction_ledger"] = {
+                "schema": 2, "path": str(args.validation_predictions),
+                "records": len(validation_predictions),
+                "sha256": _sha256(args.validation_predictions),
+            }
+        _verify_policy_inputs(policy_inputs)
         write_report(args.report, report)
     except (FloatingPointError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     result = {"report": str(args.report), "selection": report["selection"]}
     if args.predictions:
         result["predictions"] = str(args.predictions)
+    if args.validation_predictions:
+        result["validation_predictions"] = str(args.validation_predictions)
     print(json.dumps(result, allow_nan=False, sort_keys=True))
 
 

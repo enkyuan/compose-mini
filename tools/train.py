@@ -26,7 +26,9 @@ except ModuleNotFoundError as error:
 from tools.artifact_v1 import (
     Artifact, Config, WEIGHT_CHUNK, WEIGHT_FIELDS, validate_identifiers, write_artifact,
 )
-from tools.data_v1 import FEATURE_COUNT, read_csv
+from tools.data_v1 import (
+    CLOSE_RETURN_TARGET, FEATURE_COUNT, TARGET_KINDS, read_csv,
+)
 from tools.float32 import f32
 
 FEATURE_NAMES = {
@@ -145,21 +147,20 @@ class ForecastTransformer(nn.Module):
 
 class Windows(Dataset):
     def __init__(self, features: torch.Tensor, targets: torch.Tensor,
-                 closes: torch.Tensor, seq_len: int, start: int, count: int,
-                 horizon_bars: int = 1) -> None:
-        self.features, self.targets, self.closes = features, targets, closes
+                 references: torch.Tensor, outcomes: torch.Tensor,
+                 seq_len: int, start: int, count: int) -> None:
+        self.features, self.targets = features, targets
+        self.references, self.outcomes = references, outcomes
         self.seq_len, self.start, self.count = seq_len, start, count
-        self.horizon_bars = horizon_bars
 
     def __len__(self) -> int:
         return self.count
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
         sample = self.start + index
-        final_row = sample + self.seq_len - 1
         return (
             self.features[sample:sample + self.seq_len], self.targets[sample],
-            self.closes[final_row], self.closes[final_row + self.horizon_bars],
+            self.references[sample], self.outcomes[sample],
         )
 
 
@@ -176,6 +177,7 @@ class TrainingData:
     target_scale: torch.Tensor
     feature_set: str = "ohlcv"
     horizon_bars: int = 1
+    target_kind: str = CLOSE_RETURN_TARGET
 
 
 @dataclass(frozen=True)
@@ -219,17 +221,17 @@ def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
               "direction_correct": 0.0}
     model.eval()
     with torch.no_grad():
-        for features, targets, latest, actual in loader:
+        for features, targets, reference, actual in loader:
             predicted_return = model(features.to(device)).cpu() * target_scale + target_mean
             actual_return = targets * target_scale + target_mean
             if predictions is not None:
                 predictions.extend(predicted_return.tolist())
             difference = predicted_return - actual_return
-            predicted_close = latest * predicted_return.exp()
+            predicted_close = reference * predicted_return.exp()
             totals["return_squared"] += difference.square().sum().item()
             totals["return_absolute"] += difference.abs().sum().item()
             totals["close_absolute"] += (predicted_close - actual).abs().sum().item()
-            totals["baseline_close_absolute"] += (latest - actual).abs().sum().item()
+            totals["baseline_close_absolute"] += (reference - actual).abs().sum().item()
             totals["direction_correct"] += (
                 predicted_return.sign() == actual_return.sign()
             ).sum().item()
@@ -238,7 +240,7 @@ def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
         "return_mse": totals["return_squared"] / count,
         "return_mae": totals["return_absolute"] / count,
         "close_mae": totals["close_absolute"] / count,
-        "last_close_baseline_mae": totals["baseline_close_absolute"] / count,
+        "zero_return_baseline_mae": totals["baseline_close_absolute"] / count,
         "direction_accuracy": totals["direction_correct"] / count,
     }
 
@@ -278,10 +280,11 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
                  split: tuple[int, int, int] | None = None,
                  sample_start: int = 0,
                  feature_set: str = "ohlcv", horizon_bars: int = 1,
-                 split_gap: int = 0) -> TrainingData:
+                 split_gap: int = 0,
+                 target_kind: str = CLOSE_RETURN_TARGET) -> TrainingData:
     """Scale purged target-time splits using only their retained training rows."""
-    if horizon_bars < 1 or split_gap < 0:
-        raise ValueError("horizon must be positive and split gap nonnegative")
+    if horizon_bars < 1 or split_gap < 0 or target_kind not in TARGET_KINDS:
+        raise ValueError("horizon, split gap, or target kind is invalid")
     rows = read_csv(path)
     row_count = len(rows) // FEATURE_COUNT
     lookback = feature_lookback(feature_set)
@@ -294,13 +297,19 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
     del rows
     if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
         raise ValueError("CSV values must remain finite binary32 with positive closes")
-    closes = raw[lookback:, 3].clone()
+    # Preserve price anchors before raw OHLCV features are normalized in place.
+    opens, closes = raw[lookback:, 0].clone(), raw[lookback:, 3].clone()
     values = feature_values(raw, feature_set)
-    raw_targets = torch.log(
-        closes[horizon_bars:] / closes[:-horizon_bars]
-    )[config.seq_len - 1:]
+    outcomes = closes[horizon_bars:]
+    references = (closes[:-horizon_bars] if target_kind == CLOSE_RETURN_TARGET else
+                  opens[1:1 + len(outcomes)])
+    offset = config.seq_len - 1
+    references, outcomes = references[offset:], outcomes[offset:]
+    if not torch.all(references > 0):
+        raise ValueError("target reference prices must be positive")
+    raw_targets = torch.log(outcomes / references)
     if not torch.isfinite(raw_targets).all():
-        raise ValueError("close ratios must produce finite log returns")
+        raise ValueError("target price ratios must produce finite log returns")
 
     available = len(raw_targets) - sample_start
     usable = available - split_gap * 2
@@ -327,14 +336,14 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
     validation_start = sample_start + train_count + split_gap
     test_start = validation_start + validation_count + split_gap
     return TrainingData(
-        Windows(features, targets, closes, config.seq_len,
-                sample_start, train_count, horizon_bars),
-        Windows(features, targets, closes, config.seq_len,
-                validation_start, validation_count, horizon_bars),
-        Windows(features, targets, closes, config.seq_len,
-                test_start, test_count, horizon_bars),
+        Windows(features, targets, references, outcomes, config.seq_len,
+                sample_start, train_count),
+        Windows(features, targets, references, outcomes, config.seq_len,
+                validation_start, validation_count),
+        Windows(features, targets, references, outcomes, config.seq_len,
+                test_start, test_count),
         feature_mean, feature_scale, target_mean, target_scale, feature_set,
-        horizon_bars,
+        horizon_bars, target_kind,
     )
 
 
@@ -443,6 +452,9 @@ def train(args: argparse.Namespace) -> tuple[ForecastTransformer, Artifact, dict
         raise SystemExit("test evaluation produced non-finite metrics")
     if any(not torch.isfinite(parameter).all() for parameter in model.parameters()):
         raise SystemExit("selected checkpoint contains non-finite parameters")
+    # Preserve the standalone trainer's legacy JSON key; experiments use the
+    # target-neutral name because their reference price can be the next open.
+    metrics["last_close_baseline_mae"] = metrics["zero_return_baseline_mae"]
     model.cpu()
     artifact = Artifact(
         config=config,
