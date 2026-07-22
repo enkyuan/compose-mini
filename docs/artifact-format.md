@@ -8,6 +8,12 @@ weights in one checksummed little-endian file. V1 fixes features to
 `open, high, low, close, volume`, values to IEEE-754 binary32, and the target to
 horizon log return.
 
+Schema 1 also fixes the operator graph: bias-free input and attention
+projections, float32 sinusoidal positions, full attention, pre-norm residual
+blocks, LayerNorm epsilon `1e-5`, exact-erf GELU, no dropout, and no terminal
+normalization. See [training.md](training.md) for the equations. Any operator
+change requires a new schema version.
+
 ## Header
 
 The 32-byte header is decoded byte by byte; it is never read into a C struct.
@@ -18,10 +24,9 @@ The 32-byte header is decoded byte by byte; it is never read into a C struct.
 | 8 | 4 | Schema version `1` |
 | 12 | 4 | Header size `32` |
 | 16 | 8 | Body size |
-| 24 | 8 | FNV-1a-64 of the complete body |
+| 24 | 8 | CRC-32 of the complete body, zero-extended to 64 bits |
 
-FNV-1a uses offset basis `14695981039346656037` and prime
-`1099511628211`, with unsigned 64-bit wraparound.
+CRC-32 uses zlib's `crc32(0, body, body_size)` ISO-HDLC semantics.
 
 ## Body
 
@@ -47,6 +52,10 @@ P = in_dim * D
 ```
 
 `D` is `model_dim`, `F` is `ff_dim`, and `L` is `num_layers`.
+
+All six dimensions are positive signed 32-bit values. V1 requires five input
+features and `model_dim % num_heads == 0`. Model version and interval are
+nonempty visible ASCII tokens with maxima of 63 and 15 bytes, respectively.
 
 ## Weight order
 

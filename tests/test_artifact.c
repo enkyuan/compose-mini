@@ -73,7 +73,7 @@ static void test_invalid(const char* path) {
 int main(void) {
     const char* path = "bin/tests/model-v1.fixture";
     assert(artifact_fixture_checksum((const uint8_t*)"foobar", 6) ==
-           UINT64_C(0x85944171f73967e8));
+           UINT64_C(0x9ef61f95));
     test_valid(path);
     test_invalid(path);
     assert(remove(path) == 0);

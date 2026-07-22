@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <zlib.h>
 #include "artifact.h"
 #include "artifact_fixture.h"
 
@@ -26,10 +27,8 @@ static void put_f32(uint8_t* out, float value) {
 }
 
 uint64_t artifact_fixture_checksum(const uint8_t* bytes, size_t n) {
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (size_t i = 0; i < n; i++)
-        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-    return hash;
+    assert(n <= UINT_MAX);
+    return (uint64_t)crc32(0, bytes, (uInt)n);
 }
 
 static int zero_weights(ArtifactFixtureKind kind) {
@@ -80,9 +79,9 @@ void artifact_fixture_write(const char* path, ArtifactFixtureKind kind) {
     put_u32(header + 8, 1);
     put_u32(header + 12, HEADER_SIZE);
     put_u64(header + 16, BODY_SIZE);
-    uint64_t hash = artifact_fixture_checksum(body, sizeof body);
-    if (kind == ARTIFACT_FIXTURE_BAD_CHECKSUM) hash ^= 1;
-    put_u64(header + 24, hash);
+    uint64_t checksum = artifact_fixture_checksum(body, sizeof body);
+    if (kind == ARTIFACT_FIXTURE_BAD_CHECKSUM) checksum ^= 1;
+    put_u64(header + 24, checksum);
 
     FILE* file = fopen(path, "wb");
     assert(file);

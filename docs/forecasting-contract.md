@@ -16,8 +16,9 @@ feed-forward math, LayerNorm, pre-norm encoder orchestration, and scalar head
 are implemented and behaviorally tested. The versioned artifact loader and
 training-fitted scalers are also implemented, as is chronological CSV loading
 with zero-copy windows. The CLI now runs artifact-backed inference and streams
-validated JSONL forecasts. External training, export, and framework parity are
-the remaining delivery work.
+validated JSONL forecasts. The PyTorch training/export entry point and an
+independent executable parity test are also implemented; model quality still
+depends on data and chronological evaluation.
 
 ## Runtime input
 
@@ -96,12 +97,13 @@ buy or sell decisions.
 
 ## Model artifact
 
-An offline training pipeline produces the artifact. It contains:
+An offline training pipeline produces the artifact. Schema 1 defines the fixed
+feature order, target, and scaling formulas; each file stores:
 
 - Artifact schema version and model version.
-- Feature order, interval, horizon, and target definition.
+- Interval and one-bar forecast horizon.
 - `seq_len`, `in_dim`, `model_dim`, `num_heads`, `ff_dim`, and `num_layers`.
-- Feature and target scaling formulas with their training-fitted parameters.
+- Training-fitted feature and target scaler values.
 - Input projection, distinct per-layer encoder weights, and prediction-head
   weights and bias.
 - Numeric format and integrity metadata used to reject incompatible files.
@@ -110,7 +112,8 @@ Inference always uses the artifact's training-fitted statistics. It never fits
 normalization from an inference file or window.
 
 See [artifact-format.md](artifact-format.md) for the exact V1 byte layout and
-weight order.
+weight order, and [training.md](training.md) for the fixed operator graph and
+training procedure.
 
 ## Internal boundary
 

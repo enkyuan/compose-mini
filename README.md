@@ -8,9 +8,12 @@ The core encoder, scalar head, versioned artifact loader, chronological CSV
 windowing, and JSONL inference CLI are implemented and tested. External model
 training and trading decisions remain outside this runtime. See
 [docs/forecasting-contract.md](docs/forecasting-contract.md) for the system
-boundary and delivery stages.
+boundary and [docs/training.md](docs/training.md) for the architecture, math,
+training, evaluation, and export path.
 
 ```sh
 make check
 bin/transformer MODEL CSV INSTRUMENT INTERVAL FINAL_TARGET_TIME
 ```
+
+Building requires a C11 compiler, libm, and zlib.

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <zlib.h>
 #include "artifact.h"
 
 _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24 &&
@@ -20,13 +21,10 @@ enum {
 };
 
 static const uint8_t MAGIC[8] = {'C', 'M', 'P', 'M', 'I', 'N', 'I', 0};
-static const uint64_t FNV_OFFSET = UINT64_C(14695981039346656037);
-static const uint64_t FNV_PRIME = UINT64_C(1099511628211);
-
 typedef struct {
     FILE* file;
     uint64_t remaining;
-    uint64_t hash;
+    uint32_t checksum;
 } BodyReader;
 
 static uint32_t decode_u32(const uint8_t* bytes) {
@@ -48,8 +46,9 @@ static float decode_f32(const uint8_t* bytes) {
     return value;
 }
 
-static void hash_bytes(uint64_t* hash, const uint8_t* bytes, size_t n) {
-    for (size_t i = 0; i < n; i++) *hash = (*hash ^ bytes[i]) * FNV_PRIME;
+static void checksum_bytes(uint32_t* checksum, const uint8_t* bytes, size_t n) {
+    assert(n <= UINT_MAX);
+    *checksum = (uint32_t)crc32(*checksum, bytes, (uInt)n);
 }
 
 static ArtifactStatus read_file(FILE* file, void* out, size_t n) {
@@ -61,7 +60,7 @@ static ArtifactStatus read_body(BodyReader* reader, void* out, size_t n) {
     if ((uint64_t)n > reader->remaining) return ARTIFACT_TRUNCATED;
     const ArtifactStatus status = read_file(reader->file, out, n);
     if (status != ARTIFACT_OK) return status;
-    hash_bytes(&reader->hash, out, n);
+    checksum_bytes(&reader->checksum, out, n);
     reader->remaining -= (uint64_t)n;
     return ARTIFACT_OK;
 }
@@ -172,14 +171,14 @@ ArtifactStatus artifact_load(ModelArtifact* artifact, const char* path) {
     }
 
     const uint64_t body_size = decode_u64(header + 16);
-    const uint64_t expected_hash = decode_u64(header + 24);
+    const uint64_t expected_checksum = decode_u64(header + 24);
     if (body_size < BODY_PREFIX_SIZE) {
         status = ARTIFACT_FORMAT;
         goto done;
     }
     status = validate_file_size(file, body_size);
     if (status != ARTIFACT_OK) goto done;
-    BodyReader reader = {file, body_size, FNV_OFFSET};
+    BodyReader reader = {file, body_size, 0};
     status = read_body(&reader, body, sizeof body);
     if (status != ARTIFACT_OK) goto done;
 
@@ -224,7 +223,7 @@ ArtifactStatus artifact_load(ModelArtifact* artifact, const char* path) {
         status = ferror(file) ? ARTIFACT_IO : ARTIFACT_FORMAT;
         goto done;
     }
-    if (reader.hash != expected_hash) {
+    if ((uint64_t)reader.checksum != expected_checksum) {
         status = ARTIFACT_INTEGRITY;
         goto done;
     }

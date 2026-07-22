@@ -1,7 +1,8 @@
 CC      = gcc
+PYTHON  ?= python3
 CFLAGS  = -std=c11 -Wall -Wextra -Werror -Iinclude
 DEPFLAGS = -MMD -MP
-LDLIBS  = -lm
+LDLIBS  = -lm -lz
 SRC     = $(shell find src -name '*.c')
 OBJ     = $(patsubst src/%.c, build/%.o, $(SRC))
 DEP     = $(OBJ:.o=.d) build/main.d build/tests/artifact_fixture.d
@@ -18,12 +19,16 @@ BEHAVIOR_TEST_SRC = tests/test_artifact.c tests/test_attention.c tests/test_cli.
 BEHAVIOR_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(BEHAVIOR_TEST_SRC))
 STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst tests/%.c, bin/tests/%, $(STUB_TEST_SRC))
+PYTHON_TEST = tests/test_artifact_v1.py tests/test_data_v1.py tests/test_e2e.py
 
-.PHONY: all check test compile-stubs clean run
+.PHONY: all check check-training test compile-stubs clean run
 
 all: $(BIN)
 
 check: all test compile-stubs
+
+check-training: all
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tests/test_training.py $(BIN)
 
 $(BIN): $(OBJ) build/main.o | bin
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
@@ -42,8 +47,10 @@ $(TEST_SUPPORT_OBJ): $(TEST_SUPPORT_SRC) $(TEST_SUPPORT_HEADERS) $(HEADERS) | bu
 bin/tests/%: tests/%.c $(TEST_SUPPORT_OBJ) $(OBJ) $(HEADERS) | bin/tests
 	$(CC) $(CFLAGS) $< $(TEST_SUPPORT_OBJ) $(OBJ) -o $@ $(LDLIBS)
 
-test: $(BEHAVIOR_TEST_BIN)
+test: $(BIN) $(BEHAVIOR_TEST_BIN)
 	@set -e; for t in $(BEHAVIOR_TEST_BIN); do echo "Running $$t..."; $$t; done
+	@set -e; for t in $(PYTHON_TEST); do echo "Running $$t..."; \
+		PYTHONDONTWRITEBYTECODE=1 $(PYTHON) $$t; done
 
 compile-stubs: $(STUB_TEST_BIN)
 

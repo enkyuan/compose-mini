@@ -57,3 +57,7 @@ dkms.conf
 # Project build output
 /build/
 /bin/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
