@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,19 +283,30 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
                  feature_set: str = "ohlcv", horizon_bars: int = 1,
                  split_gap: int = 0,
                  target_kind: str = CLOSE_RETURN_TARGET) -> TrainingData:
+    return prepare_rows(
+        read_csv(path), config, train_fraction, validation_fraction, split,
+        sample_start, feature_set, horizon_bars, split_gap, target_kind,
+    )
+
+
+def prepare_rows(rows: array, config: Config, train_fraction: float,
+                 validation_fraction: float,
+                 split: tuple[int, int, int] | None = None,
+                 sample_start: int = 0,
+                 feature_set: str = "ohlcv", horizon_bars: int = 1,
+                 split_gap: int = 0,
+                 target_kind: str = CLOSE_RETURN_TARGET) -> TrainingData:
     """Scale purged target-time splits using only their retained training rows."""
     if horizon_bars < 1 or split_gap < 0 or target_kind not in TARGET_KINDS:
         raise ValueError("horizon, split gap, or target kind is invalid")
-    rows = read_csv(path)
     row_count = len(rows) // FEATURE_COUNT
     lookback = feature_lookback(feature_set)
     if row_count < config.seq_len + lookback + horizon_bars:
         raise ValueError("training requires lookback + seq_len + horizon rows")
-    # The clone gives PyTorch ownership before the compact parser buffer is released.
+    # The clone gives PyTorch ownership while callers retain one compact row buffer.
     raw = torch.frombuffer(rows, dtype=torch.float32).view(
         row_count, FEATURE_COUNT,
     ).clone()
-    del rows
     if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
         raise ValueError("CSV values must remain finite binary32 with positive closes")
     # Preserve price anchors before raw OHLCV features are normalized in place.

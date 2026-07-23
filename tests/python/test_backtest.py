@@ -7,13 +7,14 @@ import json
 import math
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.backtest import (
-    Costs, Forecast, experiment_fingerprint, load_bars, read_forecasts,
-    run_backtests, validate_test_experiment,
+    Costs, Forecast, experiment_fingerprint, load_bars, main as backtest_main,
+    read_forecasts, run_backtests, validate_test_experiment,
 )
 from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
 from tools.files import require_disjoint, write_json
@@ -315,6 +316,48 @@ def verify_io(directory: Path, predictions: object,
     assert json.loads(output.read_text(encoding="utf-8")) == report
 
 
+def verify_frozen_ledger(directory: Path, bars: object,
+                         predictions: object) -> None:
+    ledger, output = directory / "mutable.jsonl", directory / "rejected.json"
+    records = [
+        {
+            "schema": 3, "split": "calibration", "fold": None,
+            "series": item.series, "model": item.model,
+            "candidate": item.candidate, "feature_set": item.feature_set,
+            "seed": item.seed, "csv_sha256": item.csv_sha256,
+            "as_of": item.as_of, "target_time": item.target_time,
+            "horizon_bars": item.horizon_bars,
+            "target_kind": item.target_kind,
+            "predicted_log_return": item.predicted_log_return,
+        }
+        for item in predictions
+    ]
+    ledger.write_text(
+        "".join(json.dumps(item) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    original = ledger.read_bytes()
+
+    def mutate(*args: object, **kwargs: object) -> dict[str, object]:
+        ledger.write_bytes(original + b"\n")
+        return run_backtests(*args, **kwargs)
+
+    argv = [
+        "backtest.py", str(ledger), str(output),
+        f"TEST={bars.path}", "--spread-bps", "0",
+        "--slippage-bps", "0", "--fee-bps", "0",
+    ]
+    with patch("tools.backtest.run_backtests", side_effect=mutate), \
+         patch.object(sys, "argv", argv):
+        try:
+            backtest_main()
+        except SystemExit as error:
+            assert "input changed" in str(error)
+        else:
+            raise AssertionError("mid-run ledger replacement was accepted")
+    assert not output.exists()
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="compose-mini-backtest-") as directory:
         root = Path(directory)
@@ -324,6 +367,7 @@ def main() -> None:
         verify_ensemble(bars, predictions)
         verify_test_report(predictions[0])
         verify_io(root, predictions, report)
+        verify_frozen_ledger(root, bars, predictions)
         for inputs, outputs in (((root / "bars.csv",), (root / "bars.csv",)),
                                 ((), (root / "same", root / "same"))):
             try:

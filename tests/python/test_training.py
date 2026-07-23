@@ -161,6 +161,24 @@ def verify_restoration(csv: Path, directory: Path) -> None:
 def verify_fixed_epochs(csv: Path) -> None:
     config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
     data = prepare_data(csv, config, 0.6, 0.2)
+
+    class UnreadLoader:
+        def __iter__(self) -> object:
+            raise AssertionError("later split loader was read during fixed-epoch fit")
+
+    train_loader = object()
+    sentinel_loaders = (train_loader, UnreadLoader(), UnreadLoader())
+    with patch("tools.train.data_loaders", return_value=sentinel_loaders), \
+         patch("tools.train.train_epoch", return_value=0.0) as train_epoch:
+        returned = fit_epochs(
+            ForecastTransformer(config), data, 8, 3, 3e-4, 1e-4, 7,
+            torch.device("cpu"),
+        )
+    assert returned == sentinel_loaders
+    assert train_epoch.call_count == 3
+    assert all(call.args[1] is train_loader
+               for call in train_epoch.call_args_list)
+
     model = ForecastTransformer(config)
     loaders = fit_epochs(
         model, data, 8, 2, 3e-4, 1e-4, 7, torch.device("cpu"),

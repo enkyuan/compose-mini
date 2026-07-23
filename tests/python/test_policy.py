@@ -13,7 +13,9 @@ sys.path.insert(0, str(ROOT))
 
 from tools.backtest import Costs, Forecast, load_bars, validate_policy
 from tools.data_v1 import EXECUTABLE_RETURN_TARGET
-from tools.select_policy import _read_report, select_policy
+from tools.select_policy import (
+    _read_report, _validate_ledger_metadata, select_policy,
+)
 
 
 def write_csv(path: Path, exit_close: float) -> tuple[str, ...]:
@@ -164,6 +166,76 @@ def main() -> None:
         else:
             raise AssertionError("neural seed grid was treated as deterministic")
 
+        strict_reports = (
+            report | {"protocol": report["protocol"] | {
+                "target_horizon_bars": True,
+            }},
+            report | {"protocol": report["protocol"] | {
+                "target_horizon_bars": 1.0,
+            }},
+            report | {"protocol": report["protocol"] | {
+                "target_horizon_bars": 1.5,
+            }},
+            report | {"sweep": report["sweep"] | {"seeds": [True, 7]}},
+            report | {"sweep": report["sweep"] | {"seeds": [3.0, 7]}},
+            report | {"sweep": report["sweep"] | {"seeds": [3.9, 7.9]}},
+            report | {"selection": {"transformer": {"candidate": True}}},
+            report | {"sweep": report["sweep"] | {
+                "candidates": [{"name": "raw", "feature_set": True}],
+            }},
+            report | {"calibration": [
+                report["calibration"][0] | {"samples": True},
+                report["calibration"][1],
+            ]},
+            report | {"calibration": [
+                report["calibration"][0] | {"samples": 1.0},
+                report["calibration"][1],
+            ]},
+            report | {"calibration": [
+                report["calibration"][0] | {"samples": 1.5},
+                report["calibration"][1],
+            ]},
+            report | {"calibration": [
+                report["calibration"][0] | {
+                    "targets": {},
+                },
+                report["calibration"][1],
+            ]},
+            report | {"series": True},
+            report | {"test_contract": True},
+            report | {"model_fingerprints": True},
+        )
+        for invalid in strict_reports:
+            try:
+                select_policy(
+                    invalid, forecasts, {"TEST": bars}, Costs(0, 0, 0),
+                    (0.0,), 100.0, "transformer",
+                    Path("calibration.json"), "0" * 64,
+                    Path("calibration.jsonl"), "1" * 64, len(forecasts),
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("malformed experiment report was accepted")
+
+        ledger_metadata = {
+            "schema": 3, "path": "calibration.jsonl",
+            "records": 2, "sha256": "1" * 64,
+        }
+        _validate_ledger_metadata(ledger_metadata, "1" * 64, 2)
+        for field, value in (
+            ("schema", True), ("schema", 3.0),
+            ("records", True), ("records", 2.0),
+        ):
+            try:
+                _validate_ledger_metadata(
+                    ledger_metadata | {field: value}, "1" * 64, 2,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("malformed ledger metadata was accepted")
+
         try:
             validate_policy(profitable | {
                 "minimum_predicted_log_return": 1.0,
@@ -188,6 +260,7 @@ def main() -> None:
 
         fingerprints = profitable["model_fingerprints"]
         for mutation in (
+            {"model": "unsupported"},
             {"action": "cash", "safety_bps": None,
              "minimum_predicted_log_return": None},
             {"threshold_trials": [{"garbage": True}]},

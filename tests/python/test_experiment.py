@@ -21,12 +21,14 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
-    _model_fingerprint, _selected_epochs, _verify_test_state, expected_runs,
-    holdout_split, linear_model, purged_split, run_experiment,
+    _candidate_data, _model_fingerprint, _selected_epochs, _verify_test_state,
+    expected_runs, holdout_split, linear_model, purged_split, run_experiment,
     select_candidates, walk_forward_splits, write_predictions, write_report,
 )
-from tools.backtest import experiment_fingerprint
-from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
+from tools.backtest import experiment_fingerprint, validate_policy
+from tools.data_v1 import (
+    CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET, read_bars,
+)
 from tools.train import (
     ForecastTransformer, TrainingData, Windows, data_loaders, evaluate,
     feature_lookback, feature_values, fit_epochs, prepare_data,
@@ -72,6 +74,58 @@ def authorize(*models: str) -> Callable[
             for model in models
         }
     return selected
+
+
+def frozen_policy(contract: Mapping[str, object],
+                  model: str) -> dict[str, object]:
+    candidate_name = contract["selection"][model]["candidate"]
+    configuration = next(
+        item for item in contract["sweep"]["candidates"]
+        if item["name"] == candidate_name
+    )
+    fingerprints = [
+        item for item in contract["model_fingerprints"]
+        if item["model"] == model
+    ]
+    records = max(len(fingerprints), 1)
+    return validate_policy({
+        "schema": 2, "action": "cash", "model": model,
+        "candidate": candidate_name,
+        "feature_set": configuration["feature_set"],
+        "target_kind": contract["sweep"]["target_kind"],
+        "horizon_bars": contract["sweep"]["target_horizon_bars"],
+        "seeds": (
+            sorted(contract["sweep"]["seeds"])
+            if model in ("transformer", "mlp") else []
+        ),
+        "series": sorted(item["name"] for item in contract["series"]),
+        "initial_cash": 100.0,
+        "costs": {"spread_bps": 0.0, "slippage_bps": 0.0, "fee_bps": 0.0},
+        "safety_bps": None, "minimum_predicted_log_return": None,
+        "selection_objective": "macro_mean_terminal_log_growth",
+        "calibration_report": {"path": "calibration.json", "sha256": "1" * 64},
+        "calibration_prediction_ledger": {
+            "path": "calibration.jsonl", "sha256": "2" * 64,
+            "source_records": records, "selected_records": records,
+        },
+        "model_fingerprints": fingerprints,
+        "threshold_trials": [
+            {
+                "action": "long_above", "safety_bps": 0.0,
+                "objective": -0.1, "mean_final_equity": 90.0,
+                "mean_gross_turnover": 1.0, "signal_coverage": 1.0,
+                "execution_coverage": 1.0, "trade_count": 1,
+            },
+            {
+                "action": "cash", "safety_bps": None, "objective": 0.0,
+                "mean_final_equity": 100.0, "mean_gross_turnover": 0.0,
+                "signal_coverage": 0.0, "execution_coverage": 0.0,
+                "trade_count": 0,
+            },
+        ],
+        "test_grid": contract["test_contract"],
+        "calibration_fingerprint": experiment_fingerprint(contract),
+    })
 
 
 def outcomes(dataset: Windows) -> torch.Tensor:
@@ -296,6 +350,7 @@ def verify_horizon_reports(csv: Path) -> None:
                   1, 1, 8, horizon, 3),
             (("SYNTH", csv),), torch.device("cpu"), 2, ledger,
             calibration_ledger, test_authorizer=authorize("last_close"),
+            requested_models=frozenset(("last_close",)),
         )
         for horizon, ledger, calibration_ledger in zip(
             (1, 3), ledgers, calibration_ledgers, strict=True,
@@ -353,6 +408,7 @@ def verify_horizon_reports(csv: Path) -> None:
               1, 0.2, 1, 1, 8, 3, 3, EXECUTABLE_RETURN_TARGET),
         (("SYNTH", csv),), torch.device("cpu"), 2,
         test_authorizer=authorize("last_close"),
+        requested_models=frozenset(("last_close",)),
     )
     assert executable["protocol"]["target_kind"] == EXECUTABLE_RETURN_TARGET
     assert executable["protocol"]["zero_return_reference"] == "open[t + 1]"
@@ -361,6 +417,7 @@ def verify_horizon_reports(csv: Path) -> None:
               1, 0.2, 1, 1, 8, 3, 3, EXECUTABLE_RETURN_TARGET),
         (("SYNTH", csv),), torch.device("cpu"), 2,
         evaluate_test=False,
+        requested_models=frozenset(),
     )
     assert calibration_only["protocol"]["phase"] == "selection-and-calibration"
     assert calibration_only["test"] == []
@@ -436,6 +493,31 @@ def verify_horizon_reports(csv: Path) -> None:
             pass
         else:
             raise AssertionError("invalid test authorization was accepted")
+
+    multi_contract = run_experiment(
+        Sweep(
+            (candidate("multi", 3),),
+            ("last_close", "rolling_mean"), (3,), 1, 0.2, 1, 1, 8,
+            3, 3, EXECUTABLE_RETURN_TARGET,
+        ),
+        (("SYNTH", csv),), torch.device("cpu"), 4,
+        evaluate_test=False, requested_models=frozenset(),
+    )
+    policies = tuple(
+        frozen_policy(multi_contract, model)
+        for model in ("last_close", "rolling_mean")
+    )
+    assert _authorize_test(multi_contract, policies) == {
+        policy["model"]: policy for policy in policies
+    }
+    mismatched = validate_policy(policies[1] | {"candidate": "mismatch"})
+    for invalid in ((policies[0], policies[0]), (policies[0], mismatched)):
+        try:
+            _authorize_test(multi_contract, invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid multi-policy authorization was accepted")
 
 
 def verify_test_state(csv: Path) -> None:
@@ -624,6 +706,7 @@ def main() -> None:
             run_experiment(
                 sweep, (("SYNTH", csv),), torch.device("cpu"), 24,
                 test_authorizer=authorize(*sweep.models),
+                requested_models=frozenset(sweep.models),
             )
         except ValueError as error:
             assert "requires 25 runs" in str(error)
@@ -633,13 +716,20 @@ def main() -> None:
         repeated_predictions: list[dict[str, object]] = []
         calibration_predictions: list[dict[str, object]] = []
         repeated_calibration_predictions: list[dict[str, object]] = []
-        with patch("tools.experiment.fit_epochs", wraps=fit_epochs) as final_fit:
+        with patch("tools.experiment.fit_epochs", wraps=fit_epochs) as final_fit, \
+             patch("tools.experiment._candidate_data",
+                   wraps=_candidate_data) as prepared:
             report = run_experiment(
                 sweep, (("SYNTH", csv),), torch.device("cpu"), 25, predictions,
                 calibration_predictions,
                 test_authorizer=authorize(*sweep.models),
+                requested_models=frozenset(sweep.models),
             )
         assert final_fit.call_count == 2
+        assert prepared.call_count == sweep.folds * len(sweep.candidates) + len({
+            item["candidate"] for item in report["selection"].values()
+        })
+        assert len({id(call.args[0]) for call in prepared.call_args_list}) == 1
         assert sorted(call.args[3] for call in final_fit.call_args_list) == sorted(
             item["epochs"] for item in report["model_fingerprints"]
             if item["epochs"] is not None
@@ -648,6 +738,7 @@ def main() -> None:
             sweep, (("SYNTH", csv),), torch.device("cpu"), 25,
             repeated_predictions, repeated_calibration_predictions,
             test_authorizer=authorize(*sweep.models),
+            requested_models=frozenset(sweep.models),
         )
         assert repeated == report
         assert repeated_predictions == predictions
@@ -710,18 +801,25 @@ def main() -> None:
         integrity_sweep = Sweep(
             (candidate("integrity", 3),), ("last_close",), (3,), 1, 0.2, 1, 1, 8,
         )
-        with patch(
-            "tools.experiment._sha256",
-            side_effect=("before", "before", "after"),
-        ):
+        original = csv.read_bytes()
+
+        def mutate_source(snapshot: Path) -> tuple[tuple[str, ...], object]:
+            timestamps, rows = read_bars(snapshot)
+            assert snapshot.read_bytes() == original
+            csv.write_bytes(original + b"\n")
+            return timestamps, rows
+
+        with patch("tools.experiment.read_bars", side_effect=mutate_source):
             try:
                 run_experiment(integrity_sweep, (("SYNTH", csv),),
                                torch.device("cpu"), 2,
-                               test_authorizer=authorize("last_close"))
+                               test_authorizer=authorize("last_close"),
+                               requested_models=frozenset(("last_close",)))
             except ValueError as error:
-                assert "CSV changed" in str(error)
+                assert "input changed" in str(error)
             else:
                 raise AssertionError("mid-run CSV replacement was accepted")
+        csv.write_bytes(original)
     print("experiment tests passed")
 
 

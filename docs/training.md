@@ -165,7 +165,7 @@ python tools/experiment.py experiments/sweep.example.json \
   reports/market.json \
   AAPL=data/aapl-30m.csv \
   MSFT=data/msft-30m.csv \
-  --validation-only
+  --calibration-only
 ```
 
 The sweep compares the Transformer with ridge linear regression, a one-hidden-
@@ -196,7 +196,7 @@ for horizon in 1 4 13; do
   python tools/experiment.py experiments/horizons.example.json \
     "reports/horizon-${horizon}.json" \
     AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-    --horizon-bars "$horizon" --max-runs 78 --validation-only
+    --horizon-bars "$horizon" --max-runs 117 --calibration-only
 done
 ```
 
@@ -216,11 +216,11 @@ return from the next executable open instead:
 
 ```sh
 python tools/experiment.py experiments/horizons.example.json \
-  reports/executable-13-validation.json \
+  reports/executable-13-calibration.json \
   AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 78 \
-  --validation-predictions reports/executable-13-validation.jsonl \
-  --validation-only
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 117 \
+  --calibration-predictions reports/executable-13-calibration.jsonl \
+  --calibration-only
 ```
 
 `executable-return-v1` is
@@ -235,7 +235,7 @@ To isolate input representation from model size, run the paired feature sweep:
 python tools/experiment.py experiments/features.example.json \
   reports/features.json \
   AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --max-runs 300 --validation-only
+  --max-runs 300 --calibration-only
 ```
 
 The stationarity-oriented `stationary-v1` representation encodes each completed
@@ -326,13 +326,13 @@ done
 
 Test mode rejects direct model, cost, seed, and threshold overrides. The frozen
 policy must authorize the full experiment before it can evaluate its model.
-No other model is evaluated on the holdout. The test report records each
+No unauthorized model is evaluated on the holdout. The test report records each
 authorized policy hash.
 The frozen
-validation fingerprint must also match the test experiment's candidate
+calibration fingerprint must also match the test experiment's candidate
 configuration, selection, folds, series, and validation results. The frozen
 policy is long only when predicted log return exceeds exact
-round-trip break-even friction plus the validation-chosen safety margin; it is
+round-trip break-even friction plus the calibration-chosen safety margin; it is
 otherwise cash. Each entry invests all available equity in fractional shares
 without leverage, enters at the next bar's open, exits at the target bar's
 close, and ignores signals made before that exit.
@@ -373,7 +373,7 @@ make check-training
 
 They perform a tiny deterministic optimization, restore and export the chosen
 checkpoint, compare PyTorch forecasts with C, and verify fold alignment,
-validation-only selection, baselines, run limits, and strict experiment JSON.
+calibration-only selection, baselines, run limits, and strict experiment JSON.
 A separate fixture compares exported operators with the scalar reference.
 
 Run inference by supplying the next target timestamp for the newest window:

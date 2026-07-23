@@ -24,10 +24,13 @@ from tools.data_v1 import (
     TARGET_KINDS, read_bars,
 )
 from tools.files import (
-    file_sha256 as _sha256, require_disjoint, series_arg, write_json,
+    FrozenInput, freeze_inputs, require_disjoint, series_arg, verify_frozen,
+    write_json,
 )
 
 NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+SEEDED_MODELS = frozenset(("transformer", "mlp"))
+POLICY_MODELS = SEEDED_MODELS | {"linear", "rolling_mean", "last_close"}
 LEDGER_V1_FIELDS = frozenset((
     "schema", "split", "series", "model", "candidate", "feature_set",
     "seed", "csv_sha256", "as_of", "target_time", "horizon_bars",
@@ -239,7 +242,9 @@ def validate_policy(value: object) -> dict[str, object]:
         raise ValueError("policy action or target kind is invalid")
     for field in ("model", "candidate", "feature_set"):
         _name(value[field], field)
-    seeded = value["model"] in ("transformer", "mlp")
+    if value["model"] not in POLICY_MODELS:
+        raise ValueError("policy model is unsupported")
+    seeded = value["model"] in SEEDED_MODELS
     horizon = value["horizon_bars"]
     seeds, names = value["seeds"], value["series"]
     if type(horizon) is not int or horizon < 1 or not isinstance(seeds, list) or \
@@ -449,18 +454,24 @@ def read_forecasts(path: Path) -> tuple[Forecast, ...]:
     return tuple(forecasts)
 
 
-def load_bars(path: Path) -> Bars:
-    checksum = _sha256(path)
-    timestamps, values = read_bars(path)
-    if _sha256(path) != checksum:
-        raise ValueError("CSV changed while the backtest was reading it")
+def load_frozen_bars(frozen: FrozenInput) -> Bars:
+    timestamps, values = read_bars(frozen.snapshot)
     opens = tuple(values[0::FEATURE_COUNT])
     closes = tuple(values[3::FEATURE_COUNT])
     if len(timestamps) < 2 or any(
         value <= 0.0 for column in (opens, closes) for value in column
     ):
         raise ValueError("backtest bars require positive opens and closes")
-    return Bars(str(path), checksum, timestamps, opens, closes)
+    return Bars(
+        str(frozen.source), frozen.sha256, timestamps, opens, closes,
+    )
+
+
+def load_bars(path: Path) -> Bars:
+    with freeze_inputs((path,)) as frozen:
+        bars = load_frozen_bars(frozen[0])
+        verify_frozen(frozen)
+        return bars
 
 
 def _group_key(forecast: Forecast) -> tuple[object, ...]:
@@ -866,94 +877,126 @@ def main() -> None:
         paths = dict(args.series)
         if len(paths) != len(args.series):
             raise ValueError("series names must be unique")
-        bars = {name: load_bars(path) for name, path in paths.items()}
-        ledger_hash = _sha256(args.predictions)
-        source = read_forecasts(args.predictions)
-        forecasts = source
-        policy, policy_hash, experiment_hash = None, None, None
-        if args.policy:
-            if any(value is not None for value in (
-                args.initial_cash, args.spread_bps, args.slippage_bps,
-                args.fee_bps, args.safety_bps, args.model,
-            )) or args.ensemble_seeds:
-                raise ValueError("policy mode does not accept diagnostic overrides")
-            policy_hash = _sha256(args.policy)
-            policy = read_policy(args.policy)
-            if _sha256(args.policy) != policy_hash:
-                raise ValueError("policy changed while the backtest was reading it")
-            if {item.split for item in source} != {"test"} or \
-               set(paths) != set(policy["series"]) or not args.experiment_report:
-                raise ValueError("policy mode requires its exact test series")
-            experiment_hash = _sha256(args.experiment_report)
-            try:
-                experiment = json.loads(
-                    args.experiment_report.read_text(encoding="utf-8")
+        sources = [
+            args.predictions, *(path for _, path in args.series),
+            *(path for path in (args.policy, args.experiment_report) if path),
+        ]
+        with freeze_inputs(sources) as frozen:
+            prediction_input = frozen[0]
+            series_inputs = frozen[1:1 + len(args.series)]
+            remaining = frozen[1 + len(args.series):]
+            policy_input = remaining[0] if args.policy else None
+            experiment_input = remaining[-1] if args.experiment_report else None
+            bars = {
+                name: load_frozen_bars(item)
+                for (name, _), item in zip(
+                    args.series, series_inputs, strict=True,
                 )
-            except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                raise ValueError(f"cannot read experiment report: {error}") from error
-            experiment = validate_test_experiment(
-                experiment, ledger_hash, source, policy_hash, policy,
-            )
-            forecasts = tuple(item for item in source if
-                              item.model == policy["model"] and
-                              item.candidate == policy["candidate"])
-            if not forecasts or any(
-                item.feature_set != policy["feature_set"] or
-                item.target_kind != policy["target_kind"] or
-                item.horizon_bars != policy["horizon_bars"]
-                for item in forecasts
-            ):
-                raise ValueError("test forecasts do not match the policy")
-            _validate_test_grid(forecasts, policy)
-            costs = Costs(*(policy["costs"][field]
-                            for field in POLICY_COST_FIELDS))
-            initial_cash = float(policy["initial_cash"])
-            safety_bps = float(policy["safety_bps"] or 0.0)
-            ensemble_seeds, expected_seeds = True, policy["seeds"]
-            cash_only = policy["action"] == "cash"
-        else:
-            if args.experiment_report:
-                raise ValueError("experiment reports are only accepted with policies")
-            if len({item.split for item in source}) != 1 or \
-               not {item.split for item in source} <= {
-                   "calibration", "validation",
-               }:
-                raise ValueError("test backtests require a frozen policy")
-            if any(value is None for value in (
-                args.spread_bps, args.slippage_bps, args.fee_bps,
-            )):
-                raise ValueError("diagnostic costs are required")
-            costs = Costs(args.spread_bps, args.slippage_bps, args.fee_bps)
-            initial_cash = args.initial_cash if args.initial_cash is not None else 100.0
-            safety_bps = args.safety_bps if args.safety_bps is not None else 0.0
-            ensemble_seeds, expected_seeds, cash_only = \
-                args.ensemble_seeds, None, False
-        if args.model:
-            model = _name(args.model, "model")
-            forecasts = tuple(item for item in forecasts if item.model == model)
-            if not forecasts:
-                raise ValueError("forecast ledger has no records for model")
-        if _sha256(args.predictions) != ledger_hash:
-            raise ValueError("prediction ledger changed while it was being read")
-        report = run_backtests(
-            forecasts, bars, initial_cash, costs, safety_bps,
-            ensemble_seeds, expected_seeds, cash_only,
-        )
-        if any(_sha256(Path(item.path)) != item.sha256 for item in bars.values()):
-            raise ValueError("CSV changed during the backtest")
-        report["prediction_ledger"] = {
-            "path": str(args.predictions), "sha256": ledger_hash,
-            "source_records": len(source), "selected_records": len(forecasts),
-        }
-        if policy is not None and policy_hash is not None:
-            if _sha256(args.policy) != policy_hash or \
-               _sha256(args.experiment_report) != experiment_hash:
-                raise ValueError("policy inputs changed during the backtest")
-            report["policy"] = {"path": str(args.policy), "sha256": policy_hash}
-            report["experiment_report"] = {
-                "path": str(args.experiment_report), "sha256": experiment_hash,
             }
-        write_report(args.report, report)
+            ledger_hash = prediction_input.sha256
+            source = read_forecasts(prediction_input.snapshot)
+            forecasts = source
+            policy, policy_hash, experiment_hash = None, None, None
+            if args.policy:
+                if any(value is not None for value in (
+                    args.initial_cash, args.spread_bps, args.slippage_bps,
+                    args.fee_bps, args.safety_bps, args.model,
+                )) or args.ensemble_seeds:
+                    raise ValueError(
+                        "policy mode does not accept diagnostic overrides"
+                    )
+                if policy_input is None or experiment_input is None:
+                    raise ValueError("policy mode requires an experiment report")
+                policy_hash = policy_input.sha256
+                policy = read_policy(policy_input.snapshot)
+                if {item.split for item in source} != {"test"} or \
+                   set(paths) != set(policy["series"]):
+                    raise ValueError("policy mode requires its exact test series")
+                experiment_hash = experiment_input.sha256
+                try:
+                    experiment = json.loads(
+                        experiment_input.snapshot.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        f"cannot read experiment report: {error}"
+                    ) from error
+                experiment = validate_test_experiment(
+                    experiment, ledger_hash, source, policy_hash, policy,
+                )
+                forecasts = tuple(
+                    item for item in source
+                    if item.model == policy["model"] and
+                    item.candidate == policy["candidate"]
+                )
+                if not forecasts or any(
+                    item.feature_set != policy["feature_set"] or
+                    item.target_kind != policy["target_kind"] or
+                    item.horizon_bars != policy["horizon_bars"]
+                    for item in forecasts
+                ):
+                    raise ValueError("test forecasts do not match the policy")
+                _validate_test_grid(forecasts, policy)
+                costs = Costs(*(policy["costs"][field]
+                                for field in POLICY_COST_FIELDS))
+                initial_cash = float(policy["initial_cash"])
+                safety_bps = float(policy["safety_bps"] or 0.0)
+                ensemble_seeds, expected_seeds = True, policy["seeds"]
+                cash_only = policy["action"] == "cash"
+            else:
+                if args.experiment_report:
+                    raise ValueError(
+                        "experiment reports are only accepted with policies"
+                    )
+                if len({item.split for item in source}) != 1 or \
+                   not {item.split for item in source} <= {
+                       "calibration", "validation",
+                   }:
+                    raise ValueError("test backtests require a frozen policy")
+                if any(value is None for value in (
+                    args.spread_bps, args.slippage_bps, args.fee_bps,
+                )):
+                    raise ValueError("diagnostic costs are required")
+                costs = Costs(
+                    args.spread_bps, args.slippage_bps, args.fee_bps,
+                )
+                initial_cash = (
+                    args.initial_cash
+                    if args.initial_cash is not None else 100.0
+                )
+                safety_bps = (
+                    args.safety_bps if args.safety_bps is not None else 0.0
+                )
+                ensemble_seeds, expected_seeds, cash_only = \
+                    args.ensemble_seeds, None, False
+            if args.model:
+                model = _name(args.model, "model")
+                forecasts = tuple(
+                    item for item in forecasts if item.model == model
+                )
+                if not forecasts:
+                    raise ValueError("forecast ledger has no records for model")
+            report = run_backtests(
+                forecasts, bars, initial_cash, costs, safety_bps,
+                ensemble_seeds, expected_seeds, cash_only,
+            )
+            report["prediction_ledger"] = {
+                "path": str(prediction_input.source),
+                "sha256": ledger_hash,
+                "source_records": len(source),
+                "selected_records": len(forecasts),
+            }
+            if policy is not None and policy_input is not None and \
+               experiment_input is not None:
+                report["policy"] = {
+                    "path": str(policy_input.source), "sha256": policy_hash,
+                }
+                report["experiment_report"] = {
+                    "path": str(experiment_input.source),
+                    "sha256": experiment_hash,
+                }
+            verify_frozen(frozen)
+            write_report(args.report, report)
     except (OSError, UnicodeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps({"report": str(args.report),

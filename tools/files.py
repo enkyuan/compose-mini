@@ -1,13 +1,16 @@
-"""Shared atomic-output, hashing, and path-boundary helpers."""
+"""Shared atomic-output, frozen-input, hashing, and path-boundary helpers."""
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Iterator, TextIO
 import argparse
 import hashlib
 import json
 import os
 import re
+import tempfile
 
 
 def file_sha256(path: Path) -> str:
@@ -16,6 +19,34 @@ def file_sha256(path: Path) -> str:
         while chunk := file.read(1 << 20):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class FrozenInput:
+    source: Path
+    snapshot: Path
+    sha256: str
+
+
+@contextmanager
+def freeze_inputs(paths: Sequence[Path]) -> Iterator[tuple[FrozenInput, ...]]:
+    """Copy inputs once into a private directory and hash the copied bytes."""
+    with tempfile.TemporaryDirectory(prefix="compose-mini-inputs-") as directory:
+        frozen = []
+        for index, source in enumerate(paths):
+            snapshot = Path(directory) / str(index)
+            digest = hashlib.sha256()
+            with source.open("rb") as input_file, snapshot.open("xb") as output_file:
+                while chunk := input_file.read(1 << 20):
+                    output_file.write(chunk)
+                    digest.update(chunk)
+            frozen.append(FrozenInput(source, snapshot, digest.hexdigest()))
+        yield tuple(frozen)
+
+
+def verify_frozen(inputs: Sequence[FrozenInput]) -> None:
+    if any(file_sha256(item.source) != item.sha256 for item in inputs):
+        raise ValueError("an input changed during the command")
 
 
 def atomic_text(path: Path, write: Callable[[TextIO], None]) -> None:

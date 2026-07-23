@@ -16,16 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.backtest import (
-    NAME, Costs, Forecast, experiment_fingerprint, load_bars, read_forecasts,
-    run_backtests, select_trial, validate_policy,
+    NAME, POLICY_MODELS, SEEDED_MODELS, Costs, Forecast,
+    experiment_fingerprint, load_frozen_bars, read_forecasts, run_backtests,
+    select_trial, validate_policy,
 )
 from tools.data_v1 import EXECUTABLE_RETURN_TARGET
 from tools.files import (
-    file_sha256 as _sha256, require_disjoint, series_arg, write_json,
+    freeze_inputs, require_disjoint, series_arg, verify_frozen, write_json,
 )
-
-SEEDED_MODELS = frozenset(("transformer", "mlp"))
-POLICY_MODELS = SEEDED_MODELS | {"linear", "rolling_mean", "last_close"}
 
 
 def _read_report(path: Path) -> dict[str, object]:
@@ -42,39 +40,178 @@ def _read_report(path: Path) -> dict[str, object]:
     return value
 
 
+def _name(value: object, field: str) -> str:
+    if not isinstance(value, str) or not NAME.fullmatch(value):
+        raise ValueError(f"experiment {field} is invalid")
+    return value
+
+
+def _integer(value: object, field: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"experiment {field} is invalid")
+    return value
+
+
+def _boundary(value: object, field: str) -> list[str]:
+    if not isinstance(value, list) or len(value) != 2 or \
+       any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"experiment {field} boundary is invalid")
+    return value
+
+
+def _digest(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and \
+        all(byte in "0123456789abcdef" for byte in value)
+
+
+def _validate_ledger_metadata(value: object, checksum: str,
+                              records: int) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "path", "records", "sha256",
+    } or type(value["schema"]) is not int or value["schema"] != 3 or \
+       not isinstance(value["path"], str) or not value["path"] or \
+       type(value["records"]) is not int or value["records"] < 1 or \
+       not _digest(value["sha256"]) or value["sha256"] != checksum or \
+       value["records"] != records:
+        raise ValueError("calibration ledger does not match the report")
+
+
 def _contract(report: Mapping[str, object], model: str
               ) -> tuple[str, str, int, tuple[int, ...], tuple[str, ...],
                          list[Mapping[str, object]], list[dict[str, object]],
                          list[dict[str, object]]]:
-    try:
-        candidate = str(report["selection"][model]["candidate"])
-        candidates = report["sweep"]["candidates"]
-        configuration = next(item for item in candidates
-                             if item["name"] == candidate)
-        feature_set = str(configuration["feature_set"])
-        target_kind = str(report["protocol"]["target_kind"])
-        horizon = int(report["protocol"]["target_horizon_bars"])
-        records = [item for item in report["calibration"]
-                   if item["model"] == model and item["candidate"] == candidate]
-        fingerprints = [item for item in report["model_fingerprints"]
-                        if item["model"] == model]
-        names = tuple(sorted(item["name"] for item in report["series"]))
-        test_grid = list(report["test_contract"])
-    except (KeyError, StopIteration, TypeError) as error:
-        raise ValueError("experiment report is missing policy inputs") from error
-    if not records or not fingerprints or \
-       target_kind != EXECUTABLE_RETURN_TARGET or horizon < 1:
+    if model not in POLICY_MODELS:
+        raise ValueError("policy model is unsupported")
+    selection, sweep, protocol = (
+        report.get("selection"), report.get("sweep"), report.get("protocol"),
+    )
+    if not all(isinstance(item, dict)
+               for item in (selection, sweep, protocol)):
+        raise ValueError("experiment report is missing policy inputs")
+    selected = selection.get(model)
+    candidates = sweep.get("candidates")
+    if not isinstance(selected, dict) or not isinstance(candidates, list) or \
+       not candidates or any(not isinstance(item, dict) for item in candidates):
+        raise ValueError("experiment report is missing policy inputs")
+    candidate = _name(selected.get("candidate"), "candidate")
+    candidate_names = [
+        _name(item.get("name"), "candidate")
+        for item in candidates
+    ]
+    for item in candidates:
+        _name(item.get("feature_set"), "feature set")
+    if len(candidate_names) != len(set(candidate_names)):
+        raise ValueError("experiment candidate configuration is invalid")
+    configurations = [
+        item for item in candidates
+        if item["name"] == candidate
+    ]
+    if len(configurations) != 1:
+        raise ValueError("experiment candidate configuration is invalid")
+    feature_set = _name(
+        configurations[0].get("feature_set"), "feature set",
+    )
+    target_kind = protocol.get("target_kind")
+    if not isinstance(target_kind, str) or \
+       target_kind != EXECUTABLE_RETURN_TARGET:
         raise ValueError("policy requires selected executable-return calibration")
-    try:
-        configured = tuple(sorted(int(seed) for seed in report["sweep"]["seeds"]))
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("experiment seeds are invalid") from error
-    if model not in POLICY_MODELS or not configured or \
-       len(configured) != len(set(configured)):
-        raise ValueError("policy model or experiment seeds are invalid")
+    horizon = _integer(
+        protocol.get("target_horizon_bars"), "target horizon", 1,
+    )
+
+    seeds_value = sweep.get("seeds")
+    if not isinstance(seeds_value, list) or not seeds_value:
+        raise ValueError("experiment seeds are invalid")
+    configured = tuple(sorted(
+        _integer(seed, "seed") for seed in seeds_value
+    ))
+    if len(configured) != len(set(configured)):
+        raise ValueError("experiment seeds are invalid")
     seeds = configured if model in SEEDED_MODELS else ()
-    if {record["seed"] for record in records} != (set(seeds) or {None}):
+
+    series_value = report.get("series")
+    if not isinstance(series_value, list) or not series_value or any(
+        not isinstance(item, dict) for item in series_value
+    ):
+        raise ValueError("experiment series are invalid")
+    names = tuple(sorted(
+        _name(item.get("name"), "series") for item in series_value
+    ))
+    if len(names) != len(set(names)):
+        raise ValueError("experiment series are invalid")
+
+    calibration = report.get("calibration")
+    if not isinstance(calibration, list) or not calibration:
+        raise ValueError("experiment calibration records are invalid")
+    records = []
+    for item in calibration:
+        if not isinstance(item, dict):
+            raise ValueError("experiment calibration records are invalid")
+        record_model = _name(item.get("model"), "calibration model")
+        record_candidate = _name(
+            item.get("candidate"), "calibration candidate",
+        )
+        _name(item.get("feature_set"), "calibration feature set")
+        _name(item.get("series"), "calibration series")
+        seed = item.get("seed")
+        if seed is not None:
+            _integer(seed, "calibration seed")
+        _integer(item.get("samples"), "calibration samples", 1)
+        targets = item.get("targets")
+        if not isinstance(targets, dict):
+            raise ValueError("experiment calibration boundaries are invalid")
+        _boundary(targets.get("validation"), "calibration validation")
+        if item.get("fold") is not None:
+            raise ValueError("experiment calibration fold is invalid")
+        if record_model == model and record_candidate == candidate:
+            records.append(item)
+    if not records or \
+       {record["seed"] for record in records} != (set(seeds) or {None}):
         raise ValueError("calibration report has an incomplete seed set")
+
+    fingerprint_value = report.get("model_fingerprints")
+    if not isinstance(fingerprint_value, list) or not fingerprint_value:
+        raise ValueError("experiment model fingerprints are invalid")
+    fingerprints = []
+    for item in fingerprint_value:
+        if not isinstance(item, dict) or set(item) != {
+            "model", "series", "seed", "epochs", "sha256",
+        }:
+            raise ValueError("experiment model fingerprints are invalid")
+        fingerprint_model = _name(item["model"], "fingerprint model")
+        _name(item["series"], "fingerprint series")
+        seed, epochs = item["seed"], item["epochs"]
+        if seed is None:
+            if epochs is not None:
+                raise ValueError("experiment model fingerprints are invalid")
+        else:
+            _integer(seed, "fingerprint seed")
+            _integer(epochs, "fingerprint epochs", 1)
+        if not _digest(item["sha256"]):
+            raise ValueError("experiment model fingerprints are invalid")
+        if fingerprint_model == model:
+            fingerprints.append(item)
+    if not fingerprints:
+        raise ValueError("experiment model fingerprints are incomplete")
+
+    test_grid_value = report.get("test_contract")
+    if not isinstance(test_grid_value, list) or \
+       len(test_grid_value) != len(names):
+        raise ValueError("experiment test grid is invalid")
+    test_grid = []
+    for item in test_grid_value:
+        if not isinstance(item, dict) or set(item) != {
+            "series", "samples", "first_target_time", "last_target_time",
+        } or _name(item.get("series"), "test series") not in names:
+            raise ValueError("experiment test grid is invalid")
+        _integer(item.get("samples"), "test samples", 1)
+        _boundary(
+            [item.get("first_target_time"), item.get("last_target_time")],
+            "test",
+        )
+        test_grid.append(item)
+    if len({item["series"] for item in test_grid}) != len(test_grid):
+        raise ValueError("experiment test grid is invalid")
     return (
         candidate, feature_set, horizon, seeds, names, records, test_grid,
         fingerprints,
@@ -226,33 +363,41 @@ def main() -> None:
         ) or not math.isfinite(args.initial_cash) or args.initial_cash <= 0.0:
             raise ValueError("policy grid or initial cash is invalid")
         model = args.model
-        if not NAME.fullmatch(model):
+        if not NAME.fullmatch(model) or model not in POLICY_MODELS:
             raise ValueError("model is invalid")
         paths = dict(args.series)
         if len(paths) != len(args.series):
             raise ValueError("series names must be unique")
-        report_hash = _sha256(args.experiment_report)
-        ledger_hash = _sha256(args.calibration_predictions)
-        report = _read_report(args.experiment_report)
-        forecasts = read_forecasts(args.calibration_predictions)
-        metadata = report.get("calibration_prediction_ledger")
-        if not isinstance(metadata, dict) or metadata.get("schema") != 3 or \
-           metadata.get("sha256") != ledger_hash or \
-           metadata.get("records") != len(forecasts):
-            raise ValueError("calibration ledger does not match the report")
-        bars = {name: load_bars(path) for name, path in paths.items()}
-        policy = select_policy(
-            report, forecasts, bars,
-            Costs(args.spread_bps, args.slippage_bps, args.fee_bps),
-            values, args.initial_cash, model, args.experiment_report, report_hash,
-            args.calibration_predictions, ledger_hash, len(forecasts),
+        sources = (
+            args.experiment_report, args.calibration_predictions,
+            *(path for _, path in args.series),
         )
-        if _sha256(args.experiment_report) != report_hash or \
-           _sha256(args.calibration_predictions) != ledger_hash or any(
-               _sha256(Path(item.path)) != item.sha256 for item in bars.values()
-           ):
-            raise ValueError("policy inputs changed during selection")
-        write_json(args.policy, policy)
+        with freeze_inputs(sources) as frozen:
+            report_input, ledger_input = frozen[:2]
+            series_inputs = frozen[2:]
+            report = _read_report(report_input.snapshot)
+            forecasts = read_forecasts(ledger_input.snapshot)
+            _validate_ledger_metadata(
+                report.get("calibration_prediction_ledger"),
+                ledger_input.sha256, len(forecasts),
+            )
+            bars = {
+                name: load_frozen_bars(item)
+                for (name, _), item in zip(
+                    args.series, series_inputs, strict=True,
+                )
+            }
+            policy = select_policy(
+                report, forecasts, bars,
+                Costs(args.spread_bps, args.slippage_bps, args.fee_bps),
+                values, args.initial_cash, model,
+                report_input.source, report_input.sha256,
+                ledger_input.source, ledger_input.sha256, len(forecasts),
+            )
+            verify_frozen(frozen)
+            write_json(args.policy, policy)
+    except (IndexError, KeyError, OverflowError, TypeError) as error:
+        raise SystemExit("policy inputs have invalid nested fields") from error
     except (OSError, UnicodeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps({

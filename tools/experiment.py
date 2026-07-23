@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -31,12 +32,13 @@ from tools.data_v1 import (
 )
 from tools.backtest import experiment_fingerprint, read_policy
 from tools.files import (
-    atomic_text, file_sha256 as _sha256, require_disjoint, series_arg, write_json,
+    FrozenInput, atomic_text, file_sha256, freeze_inputs, require_disjoint,
+    series_arg, verify_frozen, write_json,
 )
 from tools.train import (
     FEATURE_NAMES, FEATURE_SETS, Fit, ForecastTransformer, TrainingData, Windows,
     data_loaders, evaluate, feature_lookback, fit_epochs, fit_model, mean_loss,
-    prepare_data,
+    prepare_rows,
 )
 
 MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
@@ -136,10 +138,12 @@ def _model_fingerprint(model: nn.Module, data: TrainingData,
         *sorted(model.state_dict().items()),
     )
     for name, tensor in tensors:
-        values = tensor.detach().cpu().float().reshape(-1)
+        values = tensor.detach().reshape(-1)
         digest.update(name.encode("ascii") + b"\0")
-        for chunk in values.split(16_384):
-            items = chunk.tolist()
+        for start in range(0, values.numel(), 16_384):
+            items = values[start:start + 16_384].to(
+                device="cpu", dtype=torch.float32,
+            ).tolist()
             digest.update(struct.pack(f"<{len(items)}f", *items))
     return digest.hexdigest()
 
@@ -335,11 +339,12 @@ def _boundary(timestamps: list[str], target_offset: int,
     }
 
 
-def _candidate_data(path: Path, candidate: Candidate, split: tuple[int, int, int],
+def _candidate_data(rows: array, candidate: Candidate,
+                    split: tuple[int, int, int],
                     max_history: int, sweep: Sweep) -> TrainingData:
     history = candidate.seq_len + feature_lookback(candidate.feature_set)
-    return prepare_data(
-        path, candidate.config(), 0.7, 0.15, split=split,
+    return prepare_rows(
+        rows, candidate.config(), 0.7, 0.15, split=split,
         sample_start=max_history - history + sweep.alignment_horizon_bars -
         sweep.target_horizon_bars,
         feature_set=candidate.feature_set,
@@ -683,19 +688,59 @@ class FinalModel:
     csv_sha256: str
 
 
-def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
-                   device: torch.device, max_runs: int,
-                   prediction_records: list[dict[str, object]] | None = None,
-                   calibration_prediction_records:
-                   list[dict[str, object]] | None = None,
-                   evaluate_test: bool = True,
-                   test_authorizer: Callable[
-                       [Mapping[str, object]],
-                       Mapping[str, Mapping[str, object]]
-                   ] | None = None,
-                   ) -> dict[str, object]:
+def run_experiment(
+    sweep: Sweep, series: Sequence[tuple[str, Path | FrozenInput]],
+    device: torch.device, max_runs: int,
+    prediction_records: list[dict[str, object]] | None = None,
+    calibration_prediction_records: list[dict[str, object]] | None = None,
+    evaluate_test: bool = True,
+    test_authorizer: Callable[
+        [Mapping[str, object]], Mapping[str, Mapping[str, object]]
+    ] | None = None,
+    *, requested_models: frozenset[str],
+) -> dict[str, object]:
+    inputs = tuple(item for _, item in series)
+    if all(isinstance(item, Path) for item in inputs):
+        with freeze_inputs(inputs) as frozen:
+            report = _run_experiment(
+                sweep, tuple(
+                    (name, item)
+                    for (name, _), item in zip(series, frozen, strict=True)
+                ),
+                device, max_runs, prediction_records,
+                calibration_prediction_records, evaluate_test,
+                test_authorizer, requested_models,
+            )
+            verify_frozen(frozen)
+            return report
+    if not all(isinstance(item, FrozenInput) for item in inputs):
+        raise TypeError("series inputs must be paths or frozen inputs")
+    report = _run_experiment(
+        sweep, series, device, max_runs, prediction_records,
+        calibration_prediction_records, evaluate_test, test_authorizer,
+        requested_models,
+    )
+    verify_frozen(inputs)
+    return report
+
+
+def _run_experiment(
+    sweep: Sweep, series: Sequence[tuple[str, FrozenInput]],
+    device: torch.device, max_runs: int,
+    prediction_records: list[dict[str, object]] | None,
+    calibration_prediction_records: list[dict[str, object]] | None,
+    evaluate_test: bool,
+    test_authorizer: Callable[
+        [Mapping[str, object]], Mapping[str, Mapping[str, object]]
+    ] | None,
+    requested_models: frozenset[str],
+) -> dict[str, object]:
     if not series or len({name for name, _ in series}) != len(series):
         raise ValueError("series names must be nonempty and unique")
+    if not isinstance(requested_models, frozenset) or \
+       any(model not in sweep.models for model in requested_models) or \
+       evaluate_test != bool(requested_models):
+        raise ValueError("requested models do not match the experiment mode")
     if not evaluate_test and prediction_records is not None:
         raise ValueError(
             "calibration-only experiments cannot collect test predictions"
@@ -714,13 +759,9 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     target_offset = max_history + alignment - 1
     gap = alignment - 1
     metadata, test_contract, folds_by_series = [], [], {}
-    for name, path in series:
-        checksum = _sha256(path)
-        timestamps, rows = read_bars(path)
-        if _sha256(path) != checksum:
-            raise ValueError("CSV changed while the experiment was reading it")
+    for name, frozen in series:
+        timestamps, rows = read_bars(frozen.snapshot)
         row_count = len(timestamps)
-        del rows
         samples = row_count - target_offset
         splits = tuple(
             purged_split(split, gap, preserve_last=False)
@@ -729,7 +770,9 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
             )
         )
         holdout = purged_split(holdout_split(samples, sweep.fold_fraction), gap)
-        folds_by_series[name] = (path, timestamps, checksum, splits, holdout)
+        folds_by_series[name] = (
+            frozen, timestamps, rows, splits, holdout,
+        )
         test_boundary = _boundary(
             timestamps, target_offset, holdout, gap,
         )["test"]
@@ -738,17 +781,17 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
             "first_target_time": test_boundary[0],
             "last_target_time": test_boundary[1],
         })
-        metadata.append({"name": name, "csv": str(path), "rows": row_count,
-                         "sha256": checksum,
+        metadata.append({"name": name, "csv": str(frozen.source),
+                         "rows": row_count, "sha256": frozen.sha256,
                          "first_timestamp": timestamps[0],
                          "last_timestamp": timestamps[-1]})
 
     validation: list[dict[str, object]] = []
     for candidate in sweep.candidates:
-        for name, (path, timestamps, checksum, splits, _) in folds_by_series.items():
+        for name, (_, timestamps, rows, splits, _) in folds_by_series.items():
             for fold, (train_count, validation_count) in enumerate(splits):
                 data = _candidate_data(
-                    path, candidate, (train_count, validation_count, 1),
+                    rows, candidate, (train_count, validation_count, 1),
                     max_history, sweep,
                 )
                 boundary = _boundary(
@@ -783,11 +826,18 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
     calibration: list[dict[str, object]] = []
     fingerprints: list[dict[str, object]] = []
     retained: dict[tuple[str, str, int | None], FinalModel] = {}
+    final_data: dict[tuple[str, str], TrainingData] = {}
     for model_name in sweep.models:
         candidate = candidates[str(selection[model_name]["candidate"])]
-        for name, (path, timestamps, checksum, _, split) in \
+        for name, (frozen, timestamps, rows, _, split) in \
                 folds_by_series.items():
-            data = _candidate_data(path, candidate, split, max_history, sweep)
+            data_key = (name, candidate.name)
+            data = final_data.get(data_key)
+            if data is None:
+                data = _candidate_data(
+                    rows, candidate, split, max_history, sweep,
+                )
+                final_data[data_key] = data
             boundary = _boundary(timestamps, target_offset, split, gap)
             seeds = sweep.seeds if model_name in NEURAL else (None,)
             for seed in seeds:
@@ -829,15 +879,16 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                 record["epochs"] = epochs
                 calibration.append(record)
                 fingerprints.append(fingerprint)
-                retained[(model_name, name, seed)] = FinalModel(
-                    candidate, data, model, loaders, fingerprint, epochs,
-                    boundary, timestamps, checksum,
-                )
+                if model_name in requested_models:
+                    retained[(model_name, name, seed)] = FinalModel(
+                        candidate, data, model, loaders, fingerprint, epochs,
+                        boundary, timestamps, frozen.sha256,
+                    )
                 if calibration_prediction_records is not None and \
                    predictions is not None:
                     calibration_prediction_records.extend(_prediction_records(
                         model_name, candidate, name, seed, data, timestamps,
-                        checksum, predictions, data.validation,
+                        frozen.sha256, predictions, data.validation,
                         "calibration", None,
                     ))
     fingerprints.sort(key=lambda item: (
@@ -854,7 +905,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
         if not isinstance(authorization, Mapping) or not authorization or \
            any(not isinstance(policy, Mapping)
                for policy in authorization.values()) or \
-           any(model not in sweep.models for model in authorization):
+           set(authorization) != requested_models:
             raise ValueError("test authorization returned invalid models")
         test_policies = authorization
     test: list[dict[str, object]] = []
@@ -890,10 +941,6 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
                             final.timestamps, final.csv_sha256, predictions,
                             final.data.test, "test", None,
                         ))
-
-    for metadata_record, (_, path) in zip(metadata, series, strict=True):
-        if _sha256(path) != metadata_record["sha256"]:
-            raise ValueError("CSV changed during the experiment")
 
     return {
         "schema": 6,
@@ -962,21 +1009,6 @@ def _series(value: str) -> tuple[str, Path]:
     return series_arg(value, SERIES_NAME)
 
 
-def _policy_input(path: Path) -> tuple[Path, str, dict[str, object]]:
-    checksum = _sha256(path)
-    policy = read_policy(path)
-    if _sha256(path) != checksum:
-        raise ValueError("test policy changed while it was being read")
-    return path, checksum, policy
-
-
-def _verify_policy_inputs(
-    inputs: Sequence[tuple[Path, str, Mapping[str, object]]],
-) -> None:
-    if any(_sha256(path) != checksum for path, checksum, _ in inputs):
-        raise ValueError("test policy changed during the experiment")
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sweep", type=Path)
@@ -1013,43 +1045,73 @@ def main() -> None:
            len(policy_paths) != len(set(policy_paths)):
             raise ValueError("full experiments require unique frozen policies")
         torch.empty(0, device=device)
-        sweep = Sweep.read(args.sweep)
-        if args.horizon_bars is not None:
-            sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
-        if args.target_kind is not None:
-            sweep = replace(sweep, target_kind=args.target_kind)
-        policy_inputs = tuple(_policy_input(path) for path in policy_paths)
-        predictions = [] if args.predictions else None
-        calibration_predictions = [] if args.calibration_predictions else None
-        report = run_experiment(
-            sweep, args.series, device, args.max_runs, predictions,
-            calibration_predictions, not args.calibration_only,
-            (lambda contract: _authorize_test(
-                contract, tuple(item[2] for item in policy_inputs),
-            )) if policy_inputs else None,
+        sources = (
+            args.sweep, *policy_paths, *(path for _, path in args.series),
         )
-        _verify_policy_inputs(policy_inputs)
-        if policy_inputs:
-            report["policies"] = [
-                {"path": str(path), "sha256": checksum,
-                 "model": policy["model"]}
-                for path, checksum, policy in policy_inputs
-            ]
-        if args.predictions and predictions is not None:
-            write_predictions(args.predictions, predictions)
-            report["prediction_ledger"] = {
-                "schema": 3, "path": str(args.predictions),
-                "records": len(predictions), "sha256": _sha256(args.predictions),
+        with freeze_inputs(sources) as frozen:
+            sweep_input = frozen[0]
+            policy_inputs = frozen[1:1 + len(policy_paths)]
+            series_inputs = frozen[1 + len(policy_paths):]
+            sweep = Sweep.read(sweep_input.snapshot)
+            if args.horizon_bars is not None:
+                sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
+            if args.target_kind is not None:
+                sweep = replace(sweep, target_kind=args.target_kind)
+            policies = tuple(read_policy(item.snapshot)
+                             for item in policy_inputs)
+            requested_models = frozenset(policy["model"] for policy in policies)
+            if len(requested_models) != len(policies):
+                raise ValueError("test policies must name unique models")
+            predictions = [] if args.predictions else None
+            calibration_predictions = [] if args.calibration_predictions else None
+            report = run_experiment(
+                sweep, tuple(
+                    (name, item)
+                    for (name, _), item in zip(
+                        args.series, series_inputs, strict=True,
+                    )
+                ),
+                device, args.max_runs, predictions, calibration_predictions,
+                not args.calibration_only,
+                (lambda contract: _authorize_test(contract, policies))
+                if policies else None,
+                requested_models=requested_models,
+            )
+            report["sweep_input"] = {
+                "path": str(sweep_input.source),
+                "sha256": sweep_input.sha256,
             }
-        if args.calibration_predictions and calibration_predictions is not None:
-            write_predictions(args.calibration_predictions, calibration_predictions)
-            report["calibration_prediction_ledger"] = {
-                "schema": 3, "path": str(args.calibration_predictions),
-                "records": len(calibration_predictions),
-                "sha256": _sha256(args.calibration_predictions),
-            }
-        _verify_policy_inputs(policy_inputs)
-        write_report(args.report, report)
+            if policies:
+                report["policies"] = [
+                    {
+                        "path": str(item.source), "sha256": item.sha256,
+                        "model": policy["model"],
+                    }
+                    for item, policy in zip(
+                        policy_inputs, policies, strict=True,
+                    )
+                ]
+            if args.predictions and predictions is not None:
+                verify_frozen(frozen)
+                write_predictions(args.predictions, predictions)
+                report["prediction_ledger"] = {
+                    "schema": 3, "path": str(args.predictions),
+                    "records": len(predictions),
+                    "sha256": file_sha256(args.predictions),
+                }
+            if args.calibration_predictions and \
+               calibration_predictions is not None:
+                verify_frozen(frozen)
+                write_predictions(
+                    args.calibration_predictions, calibration_predictions,
+                )
+                report["calibration_prediction_ledger"] = {
+                    "schema": 3, "path": str(args.calibration_predictions),
+                    "records": len(calibration_predictions),
+                    "sha256": file_sha256(args.calibration_predictions),
+                }
+            verify_frozen(frozen)
+            write_report(args.report, report)
     except (FloatingPointError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     result = {"report": str(args.report), "selection": report["selection"]}
