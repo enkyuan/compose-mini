@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.backtest import (
-    NAME, POLICY_MODELS, SEEDED_MODELS, Costs, Forecast,
+    DETERMINISTIC_DISAGREEMENT_GRID, NAME, POLICY_MODELS, POLICY_SAFETY_GRID,
+    SEEDED_DISAGREEMENT_GRID, SEEDED_MODELS, Costs, Forecast,
     experiment_fingerprint, load_frozen_bars, read_forecasts, run_backtests,
     select_trial, validate_policy,
 )
@@ -244,13 +245,14 @@ def _validate_grid(forecasts: Sequence[Forecast],
             raise ValueError("calibration ledger does not match report boundaries")
 
 
-def _trial(report: Mapping[str, object], safety_bps: float
+def _trial(report: Mapping[str, object], safety_bps: float,
+           disagreement_lambda: float | None = None
            ) -> dict[str, object]:
     strategies = [
         result["strategies"]["forecast_long_cash"]
         for result in report["results"]
     ]
-    return {
+    trial = {
         "action": "long_above", "safety_bps": safety_bps,
         "objective": fmean(math.log(item["final_equity"] /
                                     item["initial_equity"])
@@ -263,6 +265,17 @@ def _trial(report: Mapping[str, object], safety_bps: float
                                     for item in strategies),
         "trade_count": sum(item["trade_count"] for item in strategies),
     }
+    if disagreement_lambda is not None:
+        trial["disagreement_lambda"] = disagreement_lambda
+    return trial
+
+
+def _canonical_grid(values: Sequence[float],
+                    expected: Sequence[float]) -> bool:
+    return len(values) == len(expected) and all(
+        type(value) in (int, float) and value == item and math.isfinite(value)
+        for value, item in zip(values, expected, strict=True)
+    )
 
 
 def select_policy(report: Mapping[str, object], forecasts: Sequence[Forecast],
@@ -270,7 +283,9 @@ def select_policy(report: Mapping[str, object], forecasts: Sequence[Forecast],
                   safety_values: Sequence[float], initial_cash: float,
                   model: str, report_path: Path, report_hash: str,
                   ledger_path: Path, ledger_hash: str,
-                  source_records: int) -> dict[str, object]:
+                  source_records: int,
+                  disagreement_values: Sequence[float] | None = None
+                  ) -> dict[str, object]:
     candidate, feature_set, horizon, seeds, names, records, test_grid, \
         fingerprints = _contract(report, model)
     selected = tuple(item for item in forecasts if
@@ -283,23 +298,48 @@ def select_policy(report: Mapping[str, object], forecasts: Sequence[Forecast],
     ):
         raise ValueError("calibration inputs do not match the selected contract")
     _validate_grid(selected, records, names, seeds)
-    trials = [
-        _trial(run_backtests(
-            selected, series, initial_cash, costs, safety,
-            ensemble_seeds=True, expected_seeds=seeds,
-        ), safety)
-        for safety in safety_values
-    ]
-    trials.append({
+    schema = 2 if disagreement_values is None else 3
+    if disagreement_values is None:
+        trials = [
+            _trial(run_backtests(
+                selected, series, initial_cash, costs, safety,
+                ensemble_seeds=True, expected_seeds=seeds,
+            ), safety)
+            for safety in safety_values
+        ]
+    else:
+        expected = (
+            SEEDED_DISAGREEMENT_GRID
+            if model in SEEDED_MODELS else DETERMINISTIC_DISAGREEMENT_GRID
+        )
+        if not _canonical_grid(safety_values, POLICY_SAFETY_GRID) or \
+           not _canonical_grid(disagreement_values, expected):
+            raise ValueError("explicit policy grid is invalid")
+        trials = [
+            _trial(
+                run_backtests(
+                    selected, series, initial_cash, costs, safety,
+                    ensemble_seeds=True, expected_seeds=seeds,
+                    disagreement_lambda=disagreement,
+                ),
+                safety, disagreement,
+            )
+            for disagreement in disagreement_values
+            for safety in safety_values
+        ]
+    cash = {
         "action": "cash", "safety_bps": None, "objective": 0.0,
         "mean_final_equity": initial_cash, "mean_gross_turnover": 0.0,
         "signal_coverage": 0.0, "execution_coverage": 0.0,
         "trade_count": 0,
+    }
+    trials.append(cash if schema == 2 else cash | {
+        "disagreement_lambda": None,
     })
     selected_trial = select_trial(trials)
     safety = selected_trial["safety_bps"]
     policy = {
-        "schema": 2, "action": selected_trial["action"], "model": model,
+        "schema": schema, "action": selected_trial["action"], "model": model,
         "candidate": candidate, "feature_set": feature_set,
         "target_kind": EXECUTABLE_RETURN_TARGET, "horizon_bars": horizon,
         "seeds": list(seeds), "series": list(names),
@@ -327,6 +367,8 @@ def select_policy(report: Mapping[str, object], forecasts: Sequence[Forecast],
         "test_grid": test_grid,
         "calibration_fingerprint": experiment_fingerprint(report),
     }
+    if schema == 3:
+        policy["disagreement_lambda"] = selected_trial["disagreement_lambda"]
     return validate_policy(policy)
 
 
@@ -342,6 +384,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("series", nargs="+", type=_series, metavar="NAME=CSV")
     parser.add_argument("--model", required=True)
     parser.add_argument("--safety-bps", nargs="+", type=float, required=True)
+    parser.add_argument("--disagreement-lambda", nargs="+", type=float)
     parser.add_argument("--initial-cash", type=float, default=100.0)
     parser.add_argument("--spread-bps", type=float, required=True)
     parser.add_argument("--slippage-bps", type=float, required=True)
@@ -356,10 +399,21 @@ def main() -> None:
             [args.experiment_report, args.calibration_predictions,
              *(path for _, path in args.series)], [args.policy],
         )
-        values = tuple(sorted(set(args.safety_bps)))
-        if len(values) != len(args.safety_bps) or any(
-            not math.isfinite(value) or not 0.0 <= value < 10_000.0
-            for value in values
+        disagreement_values = (
+            None if args.disagreement_lambda is None
+            else tuple(args.disagreement_lambda)
+        )
+        values = (
+            tuple(sorted(set(args.safety_bps)))
+            if disagreement_values is None else tuple(args.safety_bps)
+        )
+        if (
+            disagreement_values is None and (
+                len(values) != len(args.safety_bps) or any(
+                    not math.isfinite(value) or not 0.0 <= value < 10_000.0
+                    for value in values
+                )
+            )
         ) or not math.isfinite(args.initial_cash) or args.initial_cash <= 0.0:
             raise ValueError("policy grid or initial cash is invalid")
         model = args.model
@@ -393,6 +447,7 @@ def main() -> None:
                 values, args.initial_cash, model,
                 report_input.source, report_input.sha256,
                 ledger_input.source, ledger_input.sha256, len(forecasts),
+                disagreement_values,
             )
             verify_frozen(frozen)
             write_json(args.policy, policy)
@@ -400,10 +455,13 @@ def main() -> None:
         raise SystemExit("policy inputs have invalid nested fields") from error
     except (OSError, UnicodeError, ValueError) as error:
         raise SystemExit(str(error)) from error
-    print(json.dumps({
+    summary = {
         "policy": str(args.policy), "action": policy["action"],
         "model": policy["model"], "safety_bps": policy["safety_bps"],
-    }, sort_keys=True))
+    }
+    if policy["schema"] == 3:
+        summary["disagreement_lambda"] = policy["disagreement_lambda"]
+    print(json.dumps(summary, sort_keys=True))
 
 
 if __name__ == "__main__":
