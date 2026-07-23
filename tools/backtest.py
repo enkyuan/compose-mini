@@ -34,12 +34,14 @@ LEDGER_V1_FIELDS = frozenset((
     "predicted_log_return",
 ))
 LEDGER_V2_FIELDS = LEDGER_V1_FIELDS | {"fold", "target_kind"}
+LEDGER_V3_FIELDS = LEDGER_V2_FIELDS
 POLICY_FIELDS = frozenset((
     "schema", "action", "model", "candidate", "feature_set", "target_kind",
     "horizon_bars", "seeds", "series", "initial_cash", "costs", "safety_bps",
     "minimum_predicted_log_return", "selection_objective",
-    "validation_report", "validation_prediction_ledger", "threshold_trials",
-    "test_grid", "validation_fingerprint",
+    "calibration_report", "calibration_prediction_ledger",
+    "model_fingerprints", "threshold_trials", "test_grid",
+    "calibration_fingerprint",
 ))
 POLICY_COST_FIELDS = ("spread_bps", "slippage_bps", "fee_bps")
 TRIAL_FIELDS = frozenset((
@@ -74,10 +76,11 @@ def _digest(value: object) -> bool:
 
 
 def experiment_fingerprint(report: Mapping[str, object]) -> str:
-    """Hash the validation contract shared by validation and test phases."""
+    """Hash the complete calibration contract shared with the test phase."""
     try:
         payload = {field: report[field] for field in (
-            "series", "sweep", "selection", "validation", "test_contract",
+            "series", "sweep", "selection", "validation", "calibration",
+            "model_fingerprints", "test_contract",
         )}
         encoded = json.dumps(
             payload, allow_nan=False, separators=(",", ":"), sort_keys=True,
@@ -109,16 +112,23 @@ class Forecast:
         if not isinstance(value, dict):
             raise ValueError("forecast record has an invalid schema")
         schema = value.get("schema")
-        fields = LEDGER_V1_FIELDS if schema == 1 else \
-            LEDGER_V2_FIELDS if schema == 2 else None
-        if type(schema) is not int or fields is None or set(value) != fields:
+        if type(schema) is not int:
+            raise ValueError("forecast record has an invalid schema")
+        fields = {
+            1: LEDGER_V1_FIELDS,
+            2: LEDGER_V2_FIELDS,
+            3: LEDGER_V3_FIELDS,
+        }.get(schema)
+        if fields is None or set(value) != fields:
             raise ValueError("forecast record has an invalid schema")
         split = value["split"]
         fold = None if schema == 1 else value["fold"]
         target_kind = CLOSE_RETURN_TARGET if schema == 1 else value["target_kind"]
-        if split not in ("validation", "test") or schema == 1 and split != "test" or \
+        if split not in ("calibration", "validation", "test") or \
+           schema == 1 and split != "test" or \
            split == "validation" and (type(fold) is not int or fold < 0) or \
-           split == "test" and fold is not None or target_kind not in TARGET_KINDS:
+           split != "validation" and fold is not None or \
+           target_kind not in TARGET_KINDS:
             raise ValueError("forecast split, fold, or target kind is invalid")
         seed, horizon = value["seed"], value["horizon_bars"]
         if seed is not None and (type(seed) is not int or seed < 0):
@@ -221,7 +231,7 @@ def _validate_trial(value: object, initial_cash: float) -> Mapping[str, object]:
 def validate_policy(value: object) -> dict[str, object]:
     """Validate and return one frozen executable-return policy."""
     if not isinstance(value, dict) or set(value) != POLICY_FIELDS or \
-       type(value.get("schema")) is not int or value["schema"] != 1:
+       type(value.get("schema")) is not int or value["schema"] != 2:
         raise ValueError("policy has an invalid schema")
     action = value["action"]
     if action not in ("cash", "long_above") or \
@@ -229,11 +239,13 @@ def validate_policy(value: object) -> dict[str, object]:
         raise ValueError("policy action or target kind is invalid")
     for field in ("model", "candidate", "feature_set"):
         _name(value[field], field)
+    seeded = value["model"] in ("transformer", "mlp")
     horizon = value["horizon_bars"]
     seeds, names = value["seeds"], value["series"]
     if type(horizon) is not int or horizon < 1 or not isinstance(seeds, list) or \
        any(type(seed) is not int or seed < 0 for seed in seeds) or \
-       seeds != sorted(set(seeds)) or not isinstance(names, list) or not names or \
+       seeds != sorted(set(seeds)) or bool(seeds) != seeded or \
+       not isinstance(names, list) or not names or \
        any(not isinstance(name, str) or not NAME.fullmatch(name) for name in names) or \
        len(names) != len(set(names)):
         raise ValueError("policy horizon, seeds, or series are invalid")
@@ -267,22 +279,55 @@ def validate_policy(value: object) -> dict[str, object]:
     if len(cash) != 1 or not safeties or len(safeties) != len(set(safeties)) or \
        action != winner["action"] or safety != winner["safety_bps"]:
         raise ValueError("policy selection is inconsistent with its trials")
-    if not _digest(value["validation_fingerprint"]):
-        raise ValueError("policy validation fingerprint is invalid")
-    report = value["validation_report"]
-    ledger = value["validation_prediction_ledger"]
+    if not _digest(value["calibration_fingerprint"]):
+        raise ValueError("policy calibration fingerprint is invalid")
+    fingerprints = value["model_fingerprints"]
+    expected_keys = {
+        (name, seed) for name in names for seed in (seeds or [None])
+    }
+    if not isinstance(fingerprints, list) or not fingerprints or any(
+        not isinstance(item, dict) or set(item) != {
+            "model", "series", "seed", "epochs", "sha256",
+        } or item["model"] != value["model"] or item["series"] not in names or
+        not _digest(item["sha256"]) or
+        (item["seed"] is None and item["epochs"] is not None) or
+        (item["seed"] is not None and (
+            type(item["seed"]) is not int or item["seed"] < 0 or
+            type(item["epochs"]) is not int or item["epochs"] < 1
+        ))
+        for item in fingerprints
+    ):
+        raise ValueError("policy model fingerprints are invalid")
+    fingerprint_keys = [(item["series"], item["seed"])
+                        for item in fingerprints]
+    fingerprint_order = sorted(
+        fingerprints,
+        key=lambda item: (
+            item["model"], item["series"],
+            -1 if item["seed"] is None else item["seed"],
+        ),
+    )
+    if set(fingerprint_keys) != expected_keys or \
+       len(fingerprint_keys) != len(set(fingerprint_keys)) or \
+       fingerprints != fingerprint_order:
+        raise ValueError("policy model fingerprints are incomplete or unsorted")
+    report = value["calibration_report"]
+    ledger = value["calibration_prediction_ledger"]
     if not isinstance(report, dict) or set(report) != {"path", "sha256"} or \
        not isinstance(report["path"], str) or not report["path"] or \
        not _digest(report["sha256"]):
-        raise ValueError("policy validation_report provenance is invalid")
+        raise ValueError("policy calibration_report provenance is invalid")
     if not isinstance(ledger, dict) or set(ledger) != {
         "path", "sha256", "source_records", "selected_records",
     } or not isinstance(ledger["path"], str) or not ledger["path"] or \
        not _digest(ledger["sha256"]) or \
        type(ledger["source_records"]) is not int or \
        type(ledger["selected_records"]) is not int or \
-       not 0 < ledger["selected_records"] <= ledger["source_records"]:
-        raise ValueError("policy validation_prediction_ledger provenance is invalid")
+       not len(fingerprints) <= ledger["selected_records"] <= \
+       ledger["source_records"]:
+        raise ValueError(
+            "policy calibration_prediction_ledger provenance is invalid"
+        )
     grid = value["test_grid"]
     if not isinstance(grid, list) or len(grid) != len(names) or any(
         not isinstance(item, dict) or set(item) != {
@@ -327,10 +372,18 @@ def validate_test_experiment(value: object, ledger_hash: str,
                              policy: Mapping[str, object]) -> Mapping[str, object]:
     """Require one strict report that authorizes every model in its test ledger."""
     if not isinstance(value, dict) or type(value.get("schema")) is not int or \
-       value["schema"] != 5 or not isinstance(value.get("protocol"), dict) or \
-       value["protocol"].get("phase") != "validation-and-test" or \
-       experiment_fingerprint(value) != policy["validation_fingerprint"]:
+       value["schema"] != 6 or not isinstance(value.get("protocol"), dict) or \
+       value["protocol"].get("phase") != "selection-calibration-and-test":
         raise ValueError("test experiment does not match the policy")
+    if experiment_fingerprint(value) != policy["calibration_fingerprint"]:
+        raise ValueError("test experiment does not match the policy")
+    model_fingerprints = value.get("model_fingerprints")
+    fingerprints = [
+        item for item in model_fingerprints
+        if isinstance(item, dict) and item.get("model") == policy["model"]
+    ] if isinstance(model_fingerprints, list) else []
+    if policy["model_fingerprints"] != fingerprints:
+        raise ValueError("test experiment model state does not match the policy")
     entries = value.get("policies")
     if not isinstance(entries, list) or not entries:
         raise ValueError("test experiment policy authorizations are invalid")
@@ -350,7 +403,7 @@ def validate_test_experiment(value: object, ledger_hash: str,
     tests = value.get("test")
     if not isinstance(metadata, dict) or set(metadata) != {
         "schema", "path", "records", "sha256",
-    } or type(metadata["schema"]) is not int or metadata["schema"] != 2 or \
+    } or type(metadata["schema"]) is not int or metadata["schema"] != 3 or \
        not isinstance(metadata["path"], str) or not metadata["path"] or \
        type(metadata["records"]) is not int or metadata["records"] < 1 or \
        not _digest(metadata["sha256"]) or metadata["sha256"] != ledger_hash or \
@@ -621,7 +674,8 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
         raise ValueError("initial_cash or safety_bps is invalid")
     splits, target_kinds = ({forecast.split for forecast in forecasts},
                             {forecast.target_kind for forecast in forecasts})
-    if len(splits) != 1 or not splits <= {"validation", "test"} or \
+    if len(splits) != 1 or \
+       not splits <= {"calibration", "validation", "test"} or \
        len(target_kinds) != 1 or not target_kinds <= set(TARGET_KINDS) or \
        expected_seeds is not None and not ensemble_seeds:
         raise ValueError("forecast ledger must use one split and target kind")
@@ -738,7 +792,7 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
             "period_timezone": "UTC",
             "period_scope": "first and last periods may be partial",
             "allocation": (
-                "each series and validation fold independently starts with "
+                "each series and evaluation fold independently starts with "
                 "initial_cash"
             ),
             "seed_aggregation": (
@@ -860,7 +914,10 @@ def main() -> None:
         else:
             if args.experiment_report:
                 raise ValueError("experiment reports are only accepted with policies")
-            if {item.split for item in source} != {"validation"}:
+            if len({item.split for item in source}) != 1 or \
+               not {item.split for item in source} <= {
+                   "calibration", "validation",
+               }:
                 raise ValueError("test backtests require a frozen policy")
             if any(value is None for value in (
                 args.spread_bps, args.slippage_bps, args.fee_bps,

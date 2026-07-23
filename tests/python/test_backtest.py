@@ -185,22 +185,29 @@ def verify_ensemble(bars: object, predictions: object) -> None:
 
 def verify_test_report(prediction: Forecast) -> None:
     ledger_hash, policy_hash = "2" * 64, "3" * 64
+    fingerprints = [{
+        "model": "transformer", "series": "TEST", "seed": 7,
+        "epochs": 4, "sha256": "4" * 64,
+    }]
     contract = {
         "series": [{"name": "TEST"}], "sweep": {}, "selection": {},
-        "validation": [], "test_contract": [],
+        "validation": [], "calibration": [],
+        "model_fingerprints": fingerprints, "test_contract": [],
     }
     policy = {
         "model": "transformer",
-        "validation_fingerprint": experiment_fingerprint(contract),
+        "calibration_fingerprint": experiment_fingerprint(contract),
+        "model_fingerprints": fingerprints,
     }
     report = contract | {
-        "schema": 5, "protocol": {"phase": "validation-and-test"},
+        "schema": 6,
+        "protocol": {"phase": "selection-calibration-and-test"},
         "policies": [{
             "path": "policy.json", "sha256": policy_hash,
             "model": "transformer",
         }],
         "prediction_ledger": {
-            "schema": 2, "path": "predictions.jsonl", "records": 1,
+            "schema": 3, "path": "predictions.jsonl", "records": 1,
             "sha256": ledger_hash,
         },
         "test": [{"model": "transformer"}],
@@ -215,6 +222,13 @@ def verify_test_report(prediction: Forecast) -> None:
             "schema": 2.0,
         }}, (prediction,)),
         (report, (prediction, replace(prediction, model="mlp"))),
+        (report | {"schema": 5}, (prediction,)),
+        (report | {"protocol": {
+            "phase": "selection-and-calibration",
+        }}, (prediction,)),
+        (report | {"model_fingerprints": [
+            fingerprints[0] | {"sha256": "5" * 64},
+        ]}, (prediction,)),
     )
     for value, forecasts in invalid:
         try:
@@ -254,6 +268,21 @@ def verify_io(directory: Path, predictions: object,
     )
     validation = versioned | {"split": "validation", "fold": 0}
     assert Forecast.parse(validation).split == "validation"
+    calibration = versioned | {
+        "schema": 3, "split": "calibration", "fold": None,
+        "target_kind": EXECUTABLE_RETURN_TARGET,
+    }
+    assert Forecast.parse(calibration).split == "calibration"
+    for invalid in (
+        calibration | {"fold": 0},
+        validation | {"schema": 3, "fold": None},
+    ):
+        try:
+            Forecast.parse(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid forecast split and fold were accepted")
     for field, value in (
         ("split", "validation"), ("predicted_log_return", math.nan),
         ("predicted_log_return", 10 ** 400), ("as_of", 1),
@@ -265,6 +294,21 @@ def verify_io(directory: Path, predictions: object,
             pass
         else:
             raise AssertionError(f"invalid {field} was accepted")
+    for schema in ([], {}):
+        invalid = records[0] | {"schema": schema}
+        try:
+            Forecast.parse(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid forecast schema was accepted")
+        ledger.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+        try:
+            read_forecasts(ledger)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid ledger schema was accepted")
     write_json(output, report)
     write_json(repeated, report)
     assert output.read_bytes() == repeated.read_bytes()

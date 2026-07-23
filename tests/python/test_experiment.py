@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify walk-forward selection, aligned targets, baselines, and JSON reports."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,9 +21,9 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
-    _model_fingerprint, _selected_epochs, expected_runs, holdout_split,
-    linear_model, purged_split, run_experiment, select_candidates,
-    walk_forward_splits, write_predictions, write_report,
+    _model_fingerprint, _selected_epochs, _verify_test_state, expected_runs,
+    holdout_split, linear_model, purged_split, run_experiment,
+    select_candidates, walk_forward_splits, write_predictions, write_report,
 )
 from tools.backtest import experiment_fingerprint
 from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
@@ -55,8 +55,23 @@ def candidate(name: str, seq_len: int,
                      6, min(2, seq_len - 1), 1e-3, feature_set)
 
 
-def authorize(*models: str) -> Callable[[object], tuple[str, ...]]:
-    return lambda _: models
+def authorize(*models: str) -> Callable[
+    [object], Mapping[str, Mapping[str, object]]
+]:
+    def selected(contract: object) -> Mapping[str, Mapping[str, object]]:
+        assert isinstance(contract, dict)
+        assert contract["calibration"] and contract["model_fingerprints"]
+        assert "test" not in contract
+        return {
+            model: {
+                "model_fingerprints": [
+                    item for item in contract["model_fingerprints"]
+                    if item["model"] == model
+                ],
+            }
+            for model in models
+        }
+    return selected
 
 
 def outcomes(dataset: Windows) -> torch.Tensor:
@@ -185,7 +200,8 @@ def verify_caps(directory: Path) -> None:
 
 
 def verify_horizon_targets(csv: Path) -> TrainingData:
-    config = candidate("horizon", 3).config()
+    selected = candidate("horizon", 3)
+    config = selected.config()
     implicit = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10))
     explicit = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10),
                             horizon_bars=1)
@@ -195,6 +211,14 @@ def verify_horizon_targets(csv: Path) -> TrainingData:
                              horizon_bars=3, split_gap=2)
     assert sum(map(len, (automatic.train, automatic.validation,
                         automatic.test))) + 4 == 51
+    def as_of(dataset: Windows, offset: int) -> int:
+        return feature_lookback(selected.feature_set) + dataset.start + \
+            selected.seq_len - 1 + offset
+
+    assert as_of(automatic.train, len(automatic.train) - 1) + \
+        automatic.horizon_bars <= as_of(automatic.validation, 0)
+    assert as_of(automatic.validation, len(automatic.validation) - 1) + \
+        automatic.horizon_bars <= as_of(automatic.test, 0)
 
     one = prepare_data(csv, config, 0.7, 0.15, (20, 10, 10), 2,
                        horizon_bars=1, split_gap=2)
@@ -265,38 +289,39 @@ def verify_horizon_targets(csv: Path) -> TrainingData:
 
 def verify_horizon_reports(csv: Path) -> None:
     ledgers: list[list[dict[str, object]]] = [[], []]
-    validation_ledgers: list[list[dict[str, object]]] = [[], []]
+    calibration_ledgers: list[list[dict[str, object]]] = [[], []]
     reports = tuple(
         run_experiment(
             Sweep((candidate("raw-3", 3),), ("last_close",), (3,), 1, 0.2,
                   1, 1, 8, horizon, 3),
             (("SYNTH", csv),), torch.device("cpu"), 2, ledger,
-            validation_ledger, test_authorizer=authorize("last_close"),
+            calibration_ledger, test_authorizer=authorize("last_close"),
         )
-        for horizon, ledger, validation_ledger in zip(
-            (1, 3), ledgers, validation_ledgers, strict=True,
+        for horizon, ledger, calibration_ledger in zip(
+            (1, 3), ledgers, calibration_ledgers, strict=True,
         )
     )
-    for section in ("validation", "test"):
+    for section in ("validation", "calibration", "test"):
         assert [record["targets"] for record in reports[0][section]] == \
             [record["targets"] for record in reports[1][section]]
         assert [record["samples"] for record in reports[0][section]] == \
             [record["samples"] for record in reports[1][section]]
     assert [report["protocol"]["target_horizon_bars"] for report in reports] == [1, 3]
     assert all(report["protocol"]["embargo_bars"] == 2 for report in reports)
-    for report, ledger, validation_ledger in zip(
-        reports, ledgers, validation_ledgers, strict=True,
+    for report, ledger, calibration_ledger in zip(
+        reports, ledgers, calibration_ledgers, strict=True,
     ):
-        assert report["schema"] == 5
+        assert report["schema"] == 6
         assert report["protocol"]["target_kind"] == CLOSE_RETURN_TARGET
         assert len(ledger) == report["test"][0]["samples"]
-        assert len(validation_ledger) == report["validation"][0]["samples"]
-        assert all(record["schema"] == 2 and record["split"] == "test" and
+        assert len(calibration_ledger) == report["calibration"][0]["samples"]
+        assert all(record["schema"] == 3 and record["split"] == "test" and
                    record["fold"] is None and
                    record["target_kind"] == CLOSE_RETURN_TARGET
                    for record in ledger)
-        assert all(record["schema"] == 2 and record["split"] == "validation" and
-                   record["fold"] == 0 for record in validation_ledger)
+        assert all(record["schema"] == 3 and
+                   record["split"] == "calibration" and
+                   record["fold"] is None for record in calibration_ledger)
         assert all(record["predicted_log_return"] == 0.0 for record in ledger)
         assert all(record["csv_sha256"] == report["series"][0]["sha256"]
                    for record in ledger)
@@ -331,41 +356,139 @@ def verify_horizon_reports(csv: Path) -> None:
     )
     assert executable["protocol"]["target_kind"] == EXECUTABLE_RETURN_TARGET
     assert executable["protocol"]["zero_return_reference"] == "open[t + 1]"
-    validation_only = run_experiment(
+    calibration_only = run_experiment(
         Sweep((candidate("executable", 3),), ("last_close",), (3,),
               1, 0.2, 1, 1, 8, 3, 3, EXECUTABLE_RETURN_TARGET),
-        (("SYNTH", csv),), torch.device("cpu"), 1,
+        (("SYNTH", csv),), torch.device("cpu"), 2,
         evaluate_test=False,
     )
-    assert validation_only["protocol"]["phase"] == "validation"
-    assert validation_only["test"] == []
-    assert validation_only["test_contract"][0]["samples"] > 0
+    assert calibration_only["protocol"]["phase"] == "selection-and-calibration"
+    assert calibration_only["test"] == []
+    assert calibration_only["test_contract"][0]["samples"] > 0
     policy = {
-        "validation_fingerprint": experiment_fingerprint(validation_only),
+        "calibration_fingerprint": experiment_fingerprint(calibration_only),
         "model": "last_close", "candidate": "executable",
         "feature_set": "ohlcv", "target_kind": EXECUTABLE_RETURN_TARGET,
         "horizon_bars": 3, "seeds": [], "series": ["SYNTH"],
-        "test_grid": validation_only["test_contract"],
+        "test_grid": calibration_only["test_contract"],
+        "model_fingerprints": calibration_only["model_fingerprints"],
     }
-    assert _authorize_test(validation_only, (policy,)) == ("last_close",)
-    reordered = validation_only | {
-        "sweep": validation_only["sweep"] | {
+    first_reconstruction = json.loads(json.dumps(calibration_only))
+    reconstructed = json.loads(json.dumps(calibration_only))
+    assert first_reconstruction["model_fingerprints"] == \
+        reconstructed["model_fingerprints"]
+    reconstructed_policy = json.loads(json.dumps(policy))
+    assert _authorize_test(reconstructed, (reconstructed_policy,)) == {
+        "last_close": reconstructed_policy,
+    }
+    reordered = calibration_only | {
+        "sweep": calibration_only["sweep"] | {
             "models": ["transformer"], "seeds": [7, 3],
         },
         "selection": {"transformer": {"candidate": "executable"}},
+        "model_fingerprints": [
+            {
+                "model": "transformer", "series": "SYNTH",
+                "seed": seed, "epochs": 1, "sha256": str(seed) * 64,
+            }
+            for seed in (3, 7)
+        ],
     }
     seeded_policy = policy | {
-        "validation_fingerprint": experiment_fingerprint(reordered),
+        "calibration_fingerprint": experiment_fingerprint(reordered),
         "model": "transformer", "seeds": [3, 7],
+        "model_fingerprints": reordered["model_fingerprints"],
     }
-    assert _authorize_test(reordered, (seeded_policy,)) == ("transformer",)
-    for policies in ((), (policy | {"validation_fingerprint": "0" * 64},)):
+    assert _authorize_test(reordered, (seeded_policy,)) == {
+        "transformer": seeded_policy,
+    }
+    changed_digest = seeded_policy | {
+        "model_fingerprints": [
+            seeded_policy["model_fingerprints"][0] | {"sha256": "0" * 64},
+            seeded_policy["model_fingerprints"][1],
+        ],
+    }
+    missing_seed = seeded_policy | {
+        "model_fingerprints": seeded_policy["model_fingerprints"][:1],
+    }
+    extra_model = seeded_policy | {
+        "model_fingerprints": [
+            *seeded_policy["model_fingerprints"],
+            seeded_policy["model_fingerprints"][0] | {"model": "mlp"},
+        ],
+    }
+    reversed_entries = seeded_policy | {
+        "model_fingerprints": list(
+            reversed(seeded_policy["model_fingerprints"])
+        ),
+    }
+    for policies in (
+        (), (policy | {"calibration_fingerprint": "0" * 64},),
+        (changed_digest,), (missing_seed,), (extra_model,), (reversed_entries,),
+    ):
         try:
-            _authorize_test(validation_only, policies)
+            _authorize_test(
+                reordered if policies and policies[0].get("model") ==
+                "transformer" else calibration_only,
+                policies,
+            )
         except ValueError:
             pass
         else:
             raise AssertionError("invalid test authorization was accepted")
+
+
+def verify_test_state(csv: Path) -> None:
+    selected = candidate("retained", 3)
+    data = prepare_data(
+        csv, selected.config(), 0.7, 0.15, (20, 10, 10),
+        feature_set=selected.feature_set,
+    )
+    torch.manual_seed(7)
+    model = ForecastTransformer(selected.config())
+    digest = _model_fingerprint(model, data, selected)
+    fingerprint = {
+        "model": "transformer", "series": "SYNTH", "seed": 7,
+        "epochs": 1, "sha256": digest,
+    }
+    policy = {"model_fingerprints": [fingerprint]}
+
+    class UnreadTestBatches:
+        def __iter__(self) -> object:
+            raise AssertionError("test batches were read before state verification")
+
+    for fingerprints in ([], [fingerprint, fingerprint]):
+        try:
+            _verify_test_state(
+                model, data, selected, fingerprint,
+                {"model_fingerprints": fingerprints}, "SYNTH", 7,
+            )
+            evaluate(
+                model, UnreadTestBatches(), data.target_mean, data.target_scale,
+                torch.device("cpu"),
+            )
+        except ValueError as error:
+            assert "frozen policy" in str(error)
+        else:
+            raise AssertionError("invalid frozen-policy state was accepted")
+
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+
+    with patch("tools.experiment.evaluate") as test_evaluate:
+        try:
+            _verify_test_state(
+                model, data, selected, fingerprint, policy, "SYNTH", 7,
+            )
+            test_evaluate(
+                model, UnreadTestBatches(), data.target_mean,
+                data.target_scale, torch.device("cpu"),
+            )
+        except ValueError as error:
+            assert "frozen policy" in str(error)
+        else:
+            raise AssertionError("mutated retained model state was accepted")
+        test_evaluate.assert_not_called()
 
 
 def main() -> None:
@@ -385,7 +508,8 @@ def main() -> None:
         (3,), 2, 0.2, 2, 2, 8,
     )
     assert expected_runs(sweep, 1) == 25
-    assert expected_runs(sweep, 1, False) == 20
+    horizon_sweep = Sweep.read(ROOT / "experiments/horizons.example.json")
+    assert expected_runs(horizon_sweep, 3) == 117
     with tempfile.TemporaryDirectory(prefix="compose-mini-experiment-") as directory:
         verify_caps(Path(directory))
         csv = Path(directory) / "series.csv"
@@ -394,9 +518,10 @@ def main() -> None:
         repeated_output = Path(directory) / "report-again.json"
         predictions_output = Path(directory) / "predictions.jsonl"
         repeated_predictions_output = Path(directory) / "predictions-again.jsonl"
-        validation_predictions_output = Path(directory) / "validation.jsonl"
-        repeated_validation_output = Path(directory) / "validation-again.jsonl"
+        calibration_predictions_output = Path(directory) / "calibration.jsonl"
+        repeated_calibration_output = Path(directory) / "calibration-again.jsonl"
         write_csv(csv)
+        verify_test_state(csv)
         three_horizon = verify_horizon_targets(csv)
         verify_horizon_reports(csv)
         lines = csv.read_text(encoding="ascii").splitlines()
@@ -506,21 +631,28 @@ def main() -> None:
             raise AssertionError("run limit was not enforced")
         predictions: list[dict[str, object]] = []
         repeated_predictions: list[dict[str, object]] = []
-        validation_predictions: list[dict[str, object]] = []
-        repeated_validation_predictions: list[dict[str, object]] = []
-        report = run_experiment(
-            sweep, (("SYNTH", csv),), torch.device("cpu"), 25, predictions,
-            validation_predictions, test_authorizer=authorize(*sweep.models),
+        calibration_predictions: list[dict[str, object]] = []
+        repeated_calibration_predictions: list[dict[str, object]] = []
+        with patch("tools.experiment.fit_epochs", wraps=fit_epochs) as final_fit:
+            report = run_experiment(
+                sweep, (("SYNTH", csv),), torch.device("cpu"), 25, predictions,
+                calibration_predictions,
+                test_authorizer=authorize(*sweep.models),
+            )
+        assert final_fit.call_count == 2
+        assert sorted(call.args[3] for call in final_fit.call_args_list) == sorted(
+            item["epochs"] for item in report["model_fingerprints"]
+            if item["epochs"] is not None
         )
         repeated = run_experiment(
             sweep, (("SYNTH", csv),), torch.device("cpu"), 25,
-            repeated_predictions, repeated_validation_predictions,
+            repeated_predictions, repeated_calibration_predictions,
             test_authorizer=authorize(*sweep.models),
         )
         assert repeated == report
         assert repeated_predictions == predictions
-        assert repeated_validation_predictions == validation_predictions
-        assert report["schema"] == 5
+        assert repeated_calibration_predictions == calibration_predictions
+        assert report["schema"] == 6
         assert report["protocol"]["aligned_history_bars"] == 6
         assert report["protocol"]["target_horizon_bars"] == 1
         assert report["protocol"]["alignment_horizon_bars"] == 1
@@ -550,19 +682,29 @@ def main() -> None:
         write_report(repeated_output, repeated)
         write_predictions(predictions_output, predictions)
         write_predictions(repeated_predictions_output, repeated_predictions)
-        write_predictions(validation_predictions_output, validation_predictions)
-        write_predictions(repeated_validation_output,
-                          repeated_validation_predictions)
+        write_predictions(calibration_predictions_output, calibration_predictions)
+        write_predictions(repeated_calibration_output,
+                          repeated_calibration_predictions)
         assert output.read_bytes() == repeated_output.read_bytes()
         assert predictions_output.read_bytes() == \
             repeated_predictions_output.read_bytes()
-        assert validation_predictions_output.read_bytes() == \
-            repeated_validation_output.read_bytes()
-        assert len(validation_predictions) == sum(
-            record["samples"] for record in report["validation"]
+        assert calibration_predictions_output.read_bytes() == \
+            repeated_calibration_output.read_bytes()
+        assert len(calibration_predictions) == sum(
+            record["samples"] for record in report["calibration"]
         )
-        assert all(record["split"] == "validation" and
-                   type(record["fold"]) is int for record in validation_predictions)
+        assert all(record["split"] == "calibration" and
+                   record["fold"] is None for record in calibration_predictions)
+        assert all(
+            item["epochs"] is not None
+            for item in report["model_fingerprints"]
+            if item["model"] in ("transformer", "mlp")
+        )
+        assert all(
+            item["seed"] is None and item["epochs"] is None
+            for item in report["model_fingerprints"]
+            if item["model"] in ("linear", "rolling_mean", "last_close")
+        )
         assert json.loads(output.read_text(encoding="utf-8")) == report
         assert "NaN" not in output.read_text(encoding="utf-8")
         integrity_sweep = Sweep(
