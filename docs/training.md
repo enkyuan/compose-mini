@@ -282,6 +282,46 @@ This ablation is calibration-only. Do not run a policy-authorized historical
 test or inspect labels through 2026-07-21. Confirmatory evaluation requires a
 pre-registered policy against later, previously unavailable labels.
 
+### Predeclare the common-stock universe
+
+The `liquid-common-11` universe was declared and checkpointed on 2026-07-23
+with 2024-07-22 as its eligibility and reference date. It fixes AAPL, JPM,
+XOM, JNJ, PG, AMZN, CAT, NEE, LIN, PLD, and GOOGL in that order, one manually
+selected U.S. common stock per sector stratum. This manual construction is
+selection-biased and survivorship-biased.
+
+After the manifest has produced the corresponding CSVs, the fixed 429-fit
+calibration-only shape is:
+
+```zsh
+series=(
+  AAPL=data/aapl-30m.csv JPM=data/jpm-30m.csv XOM=data/xom-30m.csv
+  JNJ=data/jnj-30m.csv PG=data/pg-30m.csv AMZN=data/amzn-30m.csv
+  CAT=data/cat-30m.csv NEE=data/nee-30m.csv LIN=data/lin-30m.csv
+  PLD=data/pld-30m.csv GOOGL=data/googl-30m.csv
+)
+
+python tools/experiment.py \
+  experiments/executable-h13-universe.example.json \
+  reports/h13-universe-calibration.json \
+  "${series[@]}" \
+  --max-runs 429 \
+  --calibration-predictions reports/h13-universe-calibration.jsonl \
+  --calibration-only
+```
+
+The only development gates are:
+
+1. Transformer macro return MAE is strictly below each of MLP, linear,
+   rolling mean, and last close.
+2. Transformer macro direction accuracy is strictly above
+   `macro_majority_direction`.
+3. Mean per-stock `relative_close_improvement` is strictly greater than zero.
+
+Policy results, bootstrap CI, and \(N_\text{eff}\) are descriptive only. No
+reserved test labels are opened. Any threshold change requires a new plan
+before rerunning analysis.
+
 #### Development result (2026-07-23)
 
 This calibration-only run selected `raw-17`. For AAPL, MSFT, and SPY, each

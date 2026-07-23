@@ -1,0 +1,24 @@
+{
+  "adjusted": true,
+  "declared_on": "2026-07-23",
+  "eligibility_date": "2024-07-22",
+  "end": "2026-07-21",
+  "interval_minutes": 30,
+  "purpose": "Benchmark the fixed horizon-13 raw-17 stack across one manually selected U.S. common stock per sector stratum.",
+  "schema": 1,
+  "series": [
+    {"stratum": "information-technology", "ticker": "AAPL"},
+    {"stratum": "financials", "ticker": "JPM"},
+    {"stratum": "energy", "ticker": "XOM"},
+    {"stratum": "health-care", "ticker": "JNJ"},
+    {"stratum": "consumer-staples", "ticker": "PG"},
+    {"stratum": "consumer-discretionary", "ticker": "AMZN"},
+    {"stratum": "industrials", "ticker": "CAT"},
+    {"stratum": "utilities", "ticker": "NEE"},
+    {"stratum": "materials", "ticker": "LIN"},
+    {"stratum": "real-estate", "ticker": "PLD"},
+    {"stratum": "communication-services", "ticker": "GOOGL"}
+  ],
+  "session": "regular",
+  "start": "2024-07-22"
+}

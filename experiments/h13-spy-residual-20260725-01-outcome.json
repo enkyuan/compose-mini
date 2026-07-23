@@ -1,0 +1,624 @@
+{
+  "decision": {
+    "output_role": "residual-only-not-executable-return"
+  },
+  "evidence_role": "development-calibration-not-forward-clean",
+  "inputs": {
+    "attempt": {
+      "path": "experiments/h13-spy-residual-20260725-01-attempt.json",
+      "sha256": "0fb90623c90b418dfff93d35dde1bb49024c25d3b2b27b799ce752b8deed9ea3"
+    },
+    "phases": [
+      {
+        "access": {
+          "path": "reports/h13-spy-residual-20260725-01/fold-1-truth-access.json",
+          "sha256": "842865de28539a94dc959c735aa767f2e6d957292f2d363eabdb54937c0ee510"
+        },
+        "evaluation": {
+          "path": "reports/h13-spy-residual-20260725-01/fold-1-evaluation.json",
+          "sha256": "3b531af3a2c486b0f89f0abad72540aac9ae1574bad5ab1f37fcfde3e95ef086"
+        },
+        "fits": {
+          "path": "reports/h13-spy-residual-20260725-01/fold-1-fits.jsonl",
+          "sha256": "d2d2375b2ce32f767aed543b1ffb7fe7f4549b20622782c8217ae361185cdb4f"
+        },
+        "phase": "fold-1",
+        "predictions": {
+          "path": "reports/h13-spy-residual-20260725-01/fold-1-predictions.jsonl",
+          "sha256": "8876fcef517d3d1414bc92818fa5c36b2aa3a7122861f8ae263a0a8258722442"
+        },
+        "receipt": {
+          "path": "reports/h13-spy-residual-20260725-01/fold-1-receipt.json",
+          "sha256": "ebfeb1736b5b089e1cb35e7d7505ba1f8c5e82fa1e3b4478d90fffdee6d7ece3"
+        }
+      },
+      {
+        "access": {
+          "path": "reports/h13-spy-residual-20260725-01/calibration-truth-access.json",
+          "sha256": "ba96c43c5f17462769ef506bcd3d860cf64f5004122dc30b3e5652617c3453ac"
+        },
+        "evaluation": {
+          "path": "reports/h13-spy-residual-20260725-01/calibration-evaluation.json",
+          "sha256": "0c37ae6c31a0f247071bea0309223f31c3cbed91f1354351c74be0f80d0dd105"
+        },
+        "fits": {
+          "path": "reports/h13-spy-residual-20260725-01/calibration-fits.jsonl",
+          "sha256": "93237f9962a64665950252094e9119d1e1a806d7288af0d5c331cd724954203e"
+        },
+        "phase": "calibration",
+        "predictions": {
+          "path": "reports/h13-spy-residual-20260725-01/calibration-predictions.jsonl",
+          "sha256": "a78b57ab56f92973e84d0b7452ac5079ca02e5850208409be412cee8b5da3372"
+        },
+        "receipt": {
+          "path": "reports/h13-spy-residual-20260725-01/calibration-receipt.json",
+          "sha256": "18cded28d0dafdd468701a5e16e653d861200a453713b5cf8d81a75f10dba51d"
+        }
+      }
+    ]
+  },
+  "integrity": {
+    "config_sha256": "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19",
+    "source_tree_sha256": "2c0823ea3cc8ba12cad3d7c39d602395d84b124a4b1fb07e5ddecc88aa00ec20"
+  },
+  "locks": {
+    "absolute_forecast_authorized": false,
+    "backtest_run": false,
+    "forward_clean": false,
+    "trading_authorized": false,
+    "universe_expansion_authorized": false
+  },
+  "phases": [
+    {
+      "evidence_role": "development-calibration-not-forward-clean",
+      "integrity": {
+        "config_sha256": "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19",
+        "evaluation_grid_sha256": "123e8f75df07357b48ece2e37928952bdd0e220730b7e7fef38dd7b86d603043",
+        "residual_phase_sha256": "5741cf378c22c152b8a2c2e3c4867602b2181a89faa06fb1f31966b93f09cb96",
+        "source_phase_sha256": "dcd7aa1182d32132d1dce9f0e78e6f41fe909e57377a8d9a59e4da806c07028d"
+      },
+      "locks": {
+        "absolute_forecast_authorized": false,
+        "backtest_run": false,
+        "forward_clean": false,
+        "trading_authorized": false,
+        "universe_expansion_authorized": false
+      },
+      "observation_count": 5848,
+      "phase": "fold-1",
+      "primary": {
+        "paired_absolute_error": [
+          {
+            "candidate": "global_ridge",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                -0.0004152878721991771,
+                6.77410814110918e-05
+              ],
+              "20": [
+                -0.0003369833063835113,
+                1.1131210493934283e-05
+              ],
+              "5": [
+                -0.00045399297730261634,
+                0.00013499068725357887
+              ]
+            },
+            "losses": 4,
+            "mean_gain": -0.00015802207516698474,
+            "per_stock_mean_gain": {
+              "AAON": 5.1135128337142804e-05,
+              "ACI": 1.9098203452966638e-05,
+              "BMRN": 0.0002051472787378462,
+              "GEV": -0.0008107244608087028,
+              "HUN": 0.000412633302992859,
+              "KRYS": -4.335738636166121e-05,
+              "NWL": 9.553602389017567e-05,
+              "SSNC": 0.00011675108693442786,
+              "STM": -0.0020044968528931165,
+              "SWKS": -4.689929051233671e-05,
+              "TGT": 0.00026693413939356676
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 7
+          },
+          {
+            "candidate": "global_mlp",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                -0.000270830628571277,
+                0.00015814820216528496
+              ],
+              "20": [
+                -0.000201833832361795,
+                0.00012034967650281837
+              ],
+              "5": [
+                -0.00029535941702761657,
+                0.00019927149261232872
+              ]
+            },
+            "losses": 4,
+            "mean_gain": -3.8042689095276296e-05,
+            "per_stock_mean_gain": {
+              "AAON": -5.6827908064787816e-05,
+              "ACI": 0.00013818305199646077,
+              "BMRN": 4.395073749526721e-05,
+              "GEV": -0.0002087276743492728,
+              "HUN": 0.00037870447552095556,
+              "KRYS": 0.000141519366614033,
+              "NWL": 0.0001903042227033317,
+              "SSNC": 8.325085853450087e-05,
+              "STM": -0.0013223786933375986,
+              "SWKS": -3.249773900763277e-05,
+              "TGT": 0.00022604972184670364
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 7
+          },
+          {
+            "candidate": "global_mlp",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                5.787555444822529e-05,
+                0.00019930846884623764
+              ],
+              "20": [
+                7.195122845457552e-05,
+                0.00017001567198244544
+              ],
+              "5": [
+                1.809246067616768e-05,
+                0.0002201276555761889
+              ]
+            },
+            "losses": 5,
+            "mean_gain": 0.00011997938607170845,
+            "per_stock_mean_gain": {
+              "AAON": -0.0001079630364019306,
+              "ACI": 0.00011908484854349414,
+              "BMRN": -0.00016119654124257897,
+              "GEV": 0.00060199678645943,
+              "HUN": -3.392882747190346e-05,
+              "KRYS": 0.00018487675297569422,
+              "NWL": 9.4768198813156e-05,
+              "SSNC": -3.350022839992699e-05,
+              "STM": 0.0006821181595555179,
+              "SWKS": 1.4401551504703938e-05,
+              "TGT": -4.08844175468631e-05
+            },
+            "reference": "global_ridge",
+            "ties": 0,
+            "wins": 6
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                -0.0002578597825668029,
+                0.00016339907960723893
+              ],
+              "20": [
+                -0.0002167011537098441,
+                0.00015560196102807123
+              ],
+              "5": [
+                -0.00025227590719622395,
+                0.00019296311579693887
+              ]
+            },
+            "losses": 6,
+            "mean_gain": -3.0655660980831175e-05,
+            "per_stock_mean_gain": {
+              "AAON": -9.252051746303072e-05,
+              "ACI": 7.575009003801816e-05,
+              "BMRN": -0.00014644547795743932,
+              "GEV": -4.565806706248869e-05,
+              "HUN": 0.0003427694942593358,
+              "KRYS": -0.00012264999451976443,
+              "NWL": 0.0001434052513968977,
+              "SSNC": 3.728383191490821e-05,
+              "STM": -0.0006310253136718342,
+              "SWKS": -7.557127392535954e-05,
+              "TGT": 0.00017744970620161407
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 5
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                -2.9905650603888844e-05,
+                0.00032479221809869797
+              ],
+              "20": [
+                2.2841893722072466e-06,
+                0.00025855353375476095
+              ],
+              "5": [
+                -0.00011876946947256629,
+                0.0003719786149765137
+              ]
+            },
+            "losses": 7,
+            "mean_gain": 0.00012736641418615357,
+            "per_stock_mean_gain": {
+              "AAON": -0.0001436556458001735,
+              "ACI": 5.665188658505152e-05,
+              "BMRN": -0.0003515927566952855,
+              "GEV": 0.000765066393746214,
+              "HUN": -6.986380873352316e-05,
+              "KRYS": -7.929260815810322e-05,
+              "NWL": 4.7869227506722024e-05,
+              "SSNC": -7.946725501951965e-05,
+              "STM": 0.0013734715392212822,
+              "SWKS": -2.8671983413022833e-05,
+              "TGT": -8.948443319195269e-05
+            },
+            "reference": "global_ridge",
+            "ties": 0,
+            "wins": 4
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 38,
+            "intervals": {
+              "10": [
+                -9.996934877107263e-05,
+                0.00013151105079582936
+              ],
+              "20": [
+                -7.612262485049081e-05,
+                9.123697972411815e-05
+              ],
+              "5": [
+                -0.00014836182724624222,
+                0.00016460576896494084
+              ]
+            },
+            "losses": 9,
+            "mean_gain": 7.38702811444512e-06,
+            "per_stock_mean_gain": {
+              "AAON": -3.56926093982429e-05,
+              "ACI": -6.243296195844262e-05,
+              "BMRN": -0.00019039621545270655,
+              "GEV": 0.0001630696072867841,
+              "HUN": -3.593498126161971e-05,
+              "KRYS": -0.0002641693611337975,
+              "NWL": -4.689897130643397e-05,
+              "SSNC": -4.5967026619592654e-05,
+              "STM": 0.0006913533796657645,
+              "SWKS": -4.307353491772677e-05,
+              "TGT": -4.860001564508958e-05
+            },
+            "reference": "global_mlp",
+            "ties": 0,
+            "wins": 2
+          }
+        ],
+        "pooled_raw_residual_r2_vs_zero": {
+          "global_mlp": -0.006258210276728571,
+          "global_ridge": -0.013811722976270868,
+          "panel_transformer": -0.011070427400386551
+        }
+      },
+      "schema": 1,
+      "secondary": {
+        "centered_cross_sectional_r2": {
+          "global_mlp": 0.007338321120592628,
+          "global_ridge": -0.00021030070530936307,
+          "panel_transformer": 0.0029068921708532702
+        },
+        "spearman_rank_ic": {
+          "global_mlp": {
+            "excluded_timestamp_count": 0,
+            "mean": 0.04716394716394716,
+            "valid_timestamp_count": 468
+          },
+          "global_ridge": {
+            "excluded_timestamp_count": 0,
+            "mean": 0.013325563325563325,
+            "valid_timestamp_count": 468
+          },
+          "panel_transformer": {
+            "excluded_timestamp_count": 0,
+            "mean": 0.06052836052836053,
+            "valid_timestamp_count": 468
+          }
+        }
+      },
+      "seed_dispersion": {
+        "global_mlp": 0.0009458542938752962,
+        "panel_transformer": 0.0017569125287063508
+      },
+      "stock_count": 11,
+      "target_kind": "spy-residual-executable-return-v1",
+      "timestamp_count": 468
+    },
+    {
+      "evidence_role": "development-calibration-not-forward-clean",
+      "integrity": {
+        "config_sha256": "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19",
+        "evaluation_grid_sha256": "17e825dcad2e8f30e8b64e1e7f6f0e6b41ba7f500cad2a4d2331bbd46a3fc33a",
+        "residual_phase_sha256": "d5d4074762a563474684f4990eed41428412a42dafe4f6c81d2f2668e6d69730",
+        "source_phase_sha256": "36c4cf8e8596d798971c139cc6811b398ecda3c88c6424c3a40ae935bebd96ba"
+      },
+      "locks": {
+        "absolute_forecast_authorized": false,
+        "backtest_run": false,
+        "forward_clean": false,
+        "trading_authorized": false,
+        "universe_expansion_authorized": false
+      },
+      "observation_count": 5827,
+      "phase": "calibration",
+      "primary": {
+        "paired_absolute_error": [
+          {
+            "candidate": "global_ridge",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                -0.0009258508839739832,
+                -0.00021562180157781128
+              ],
+              "20": [
+                -0.0008591639909557276,
+                -0.0002449656605601426
+              ],
+              "5": [
+                -0.0009662904577319285,
+                -0.00015262771419511677
+              ]
+            },
+            "losses": 8,
+            "mean_gain": -0.0005503742469836135,
+            "per_stock_mean_gain": {
+              "AAON": -0.0007971131823965018,
+              "ACI": -0.00014297846137648144,
+              "BMRN": -0.00013320464560686156,
+              "GEV": 0.0006079257238316123,
+              "HUN": -5.048444866297036e-06,
+              "KRYS": -0.00030318188092037237,
+              "NWL": 0.00010473288865873116,
+              "SSNC": -0.00019530096437321142,
+              "STM": -0.005054435419848361,
+              "SWKS": -0.0002027197966384892,
+              "TGT": 6.720746671648388e-05
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 3
+          },
+          {
+            "candidate": "global_mlp",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                -0.000837424208828685,
+                -0.00016054808623417876
+              ],
+              "20": [
+                -0.0007916478821383251,
+                -0.00017387120319205916
+              ],
+              "5": [
+                -0.0008615366084661643,
+                -0.00011891416634102676
+              ]
+            },
+            "losses": 8,
+            "mean_gain": -0.0004863408563308569,
+            "per_stock_mean_gain": {
+              "AAON": -0.0010070992971421445,
+              "ACI": -4.774485360888326e-05,
+              "BMRN": 1.713461933889281e-05,
+              "GEV": 0.0004786523459993395,
+              "HUN": -9.876250408831055e-05,
+              "KRYS": -9.940718469172074e-05,
+              "NWL": 0.0002856480283044875,
+              "SSNC": -0.0001888635812500179,
+              "STM": -0.004274897079182368,
+              "SWKS": -0.0004039077607199633,
+              "TGT": -1.0502152598737043e-05
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 3
+          },
+          {
+            "candidate": "global_mlp",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                6.136704714636852e-06,
+                0.0001238515321741175
+              ],
+              "20": [
+                1.9664301933639796e-05,
+                0.00011004084833914582
+              ],
+              "5": [
+                -1.158741275448844e-05,
+                0.00013508145651382165
+              ]
+            },
+            "losses": 5,
+            "mean_gain": 6.403339065275669e-05,
+            "per_stock_mean_gain": {
+              "AAON": -0.00020998611474564265,
+              "ACI": 9.523360776759817e-05,
+              "BMRN": 0.00015033926494575434,
+              "GEV": -0.0001292733778322727,
+              "HUN": -9.37140592220135e-05,
+              "KRYS": 0.00020377469622865163,
+              "NWL": 0.00018091513964575636,
+              "SSNC": 6.4373831231934965e-06,
+              "STM": 0.0007795383406659934,
+              "SWKS": -0.00020118796408147413,
+              "TGT": -7.770961931522093e-05
+            },
+            "reference": "global_ridge",
+            "ties": 0,
+            "wins": 6
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                -0.0002081833781211285,
+                2.012942940304357e-05
+              ],
+              "20": [
+                -0.00015966166540444938,
+                -2.1841321059395608e-05
+              ],
+              "5": [
+                -0.0002487142346701813,
+                8.066290753472503e-05
+              ]
+            },
+            "losses": 6,
+            "mean_gain": -9.001192596573138e-05,
+            "per_stock_mean_gain": {
+              "AAON": -0.0006030062461825499,
+              "ACI": 7.802824001907584e-05,
+              "BMRN": 0.0002743423217123005,
+              "GEV": -0.0006175603124450085,
+              "HUN": -5.1315454855026513e-05,
+              "KRYS": -7.01889087083533e-05,
+              "NWL": 0.0005218272905062958,
+              "SSNC": 8.037235536073754e-05,
+              "STM": 0.00018943362386741842,
+              "SWKS": -0.0007160524552004479,
+              "TGT": -7.601163969748713e-05
+            },
+            "reference": "zero",
+            "ties": 0,
+            "wins": 5
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                7.188046264505761e-05,
+                0.0008596231750660773
+              ],
+              "20": [
+                0.00012764656629761053,
+                0.0007808121377430932
+              ],
+              "5": [
+                1.6806555691711065e-05,
+                0.0009459222824992892
+              ]
+            },
+            "losses": 4,
+            "mean_gain": 0.00046036232101788217,
+            "per_stock_mean_gain": {
+              "AAON": 0.00019410693621395178,
+              "ACI": 0.0002210067013955573,
+              "BMRN": 0.00040754696731916195,
+              "GEV": -0.0012254860362766206,
+              "HUN": -4.626700998872947e-05,
+              "KRYS": 0.00023299297221201907,
+              "NWL": 0.0004170944018475646,
+              "SSNC": 0.00027567331973394894,
+              "STM": 0.00524386904371578,
+              "SWKS": -0.0005133326585619587,
+              "TGT": -0.00014321910641397102
+            },
+            "reference": "global_ridge",
+            "ties": 0,
+            "wins": 7
+          },
+          {
+            "candidate": "panel_transformer",
+            "date_count": 36,
+            "intervals": {
+              "10": [
+                1.704367565766211e-05,
+                0.0007628354508352243
+              ],
+              "20": [
+                6.697349087496677e-05,
+                0.0007147781603278103
+              ],
+              "5": [
+                -1.31169357676583e-05,
+                0.0008350860715007539
+              ]
+            },
+            "losses": 3,
+            "mean_gain": 0.0003963289303651255,
+            "per_stock_mean_gain": {
+              "AAON": 0.00040409305095959446,
+              "ACI": 0.0001257730936279591,
+              "BMRN": 0.0002572077023734076,
+              "GEV": -0.0010962126584443481,
+              "HUN": 4.7447049233284036e-05,
+              "KRYS": 2.9218275983367436e-05,
+              "NWL": 0.00023617926220180824,
+              "SSNC": 0.00026923593661075547,
+              "STM": 0.004464330703049787,
+              "SWKS": -0.00031214469448048455,
+              "TGT": -6.55094870987501e-05
+            },
+            "reference": "global_mlp",
+            "ties": 0,
+            "wins": 8
+          }
+        ],
+        "pooled_raw_residual_r2_vs_zero": {
+          "global_mlp": -0.041159276239703946,
+          "global_ridge": -0.04937194973582959,
+          "panel_transformer": -0.00576122876897478
+        }
+      },
+      "schema": 1,
+      "secondary": {
+        "centered_cross_sectional_r2": {
+          "global_mlp": -0.04113772032579455,
+          "global_ridge": -0.048675501996034765,
+          "panel_transformer": -0.0013472752951537714
+        },
+        "spearman_rank_ic": {
+          "global_mlp": {
+            "excluded_timestamp_count": 0,
+            "mean": -0.07545251169412243,
+            "valid_timestamp_count": 447
+          },
+          "global_ridge": {
+            "excluded_timestamp_count": 0,
+            "mean": -0.05171852755745373,
+            "valid_timestamp_count": 447
+          },
+          "panel_transformer": {
+            "excluded_timestamp_count": 0,
+            "mean": 0.0023591620907057135,
+            "valid_timestamp_count": 447
+          }
+        }
+      },
+      "seed_dispersion": {
+        "global_mlp": 0.001163902288092179,
+        "panel_transformer": 0.002767414636164981
+      },
+      "stock_count": 11,
+      "target_kind": "spy-residual-executable-return-v1",
+      "timestamp_count": 447
+    }
+  ],
+  "schema": 1
+}

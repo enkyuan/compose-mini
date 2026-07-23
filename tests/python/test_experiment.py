@@ -1338,6 +1338,82 @@ def verify_panel_orchestration() -> None:
         fitted.assert_not_called()
 
 
+def verify_universe_contract(root: Path) -> None:
+    manifest = json.loads(
+        (root / "universes/liquid-common-11.json").read_text(encoding="utf-8")
+    )
+    assert manifest == {
+        "adjusted": True,
+        "declared_on": "2026-07-23",
+        "eligibility_date": "2024-07-22",
+        "end": "2026-07-21",
+        "interval_minutes": 30,
+        "purpose": "Benchmark the fixed horizon-13 raw-17 stack across one manually selected U.S. common stock per sector stratum.",
+        "schema": 1,
+        "series": [
+            {"stratum": "information-technology", "ticker": "AAPL"},
+            {"stratum": "financials", "ticker": "JPM"},
+            {"stratum": "energy", "ticker": "XOM"},
+            {"stratum": "health-care", "ticker": "JNJ"},
+            {"stratum": "consumer-staples", "ticker": "PG"},
+            {"stratum": "consumer-discretionary", "ticker": "AMZN"},
+            {"stratum": "industrials", "ticker": "CAT"},
+            {"stratum": "utilities", "ticker": "NEE"},
+            {"stratum": "materials", "ticker": "LIN"},
+            {"stratum": "real-estate", "ticker": "PLD"},
+            {"stratum": "communication-services", "ticker": "GOOGL"},
+        ],
+        "session": "regular",
+        "start": "2024-07-22",
+    }
+    assert manifest["declared_on"] == "2026-07-23"
+    assert manifest["eligibility_date"] == manifest["start"] == "2024-07-22"
+    series = manifest["series"]
+    tickers = [item["ticker"] for item in series]
+    assert tickers == [
+        "AAPL", "JPM", "XOM", "JNJ", "PG", "AMZN", "CAT", "NEE", "LIN",
+        "PLD", "GOOGL",
+    ]
+    assert len(tickers) == len(set(tickers)) == 11
+    assert all(ticker.isascii() and ticker.isupper() and ticker.isalpha()
+               for ticker in tickers)
+    strata = [item["stratum"] for item in series]
+    assert len(strata) == len(set(strata)) == 11
+    assert all(isinstance(stratum, str) and stratum for stratum in strata)
+
+    sweep_path = root / "experiments/executable-h13-universe.example.json"
+    assert json.loads(sweep_path.read_text(encoding="utf-8")) == {
+        "alignment_horizon_bars": 13,
+        "batch_size": 128,
+        "candidates": [{
+            "feature_set": "ohlcv", "ff_dim": 32, "heads": 2, "layers": 1,
+            "learning_rate": 0.0003, "mlp_dim": 32, "model_dim": 16,
+            "name": "raw-17", "ridge": 0.001, "rolling_window": 8,
+            "seq_len": 17, "weight_decay": 0.0001,
+        }],
+        "epochs": 100,
+        "fold_fraction": 0.1,
+        "folds": 2,
+        "models": ["transformer", "linear", "mlp", "rolling_mean", "last_close"],
+        "patience": 10,
+        "seeds": [7, 19, 31, 43, 61],
+        "target_horizon_bars": 13,
+        "target_kind": "executable-return-v1",
+    }
+    sweep = Sweep.read(sweep_path)
+    assert len(sweep.candidates) == 1
+    assert (sweep.candidates[0].name, sweep.candidates[0].feature_set) == \
+        ("raw-17", "ohlcv")
+    assert (sweep.target_horizon_bars, sweep.alignment_horizon_bars) == (13, 13)
+    assert sweep.target_kind == EXECUTABLE_RETURN_TARGET
+    assert sweep.folds == 2
+    assert sweep.seeds == (7, 19, 31, 43, 61)
+    assert sweep.models == (
+        "transformer", "linear", "mlp", "rolling_mean", "last_close",
+    )
+    assert expected_runs(sweep, 11) == 429
+
+
 def main() -> None:
     assert walk_forward_splits(20, 2, 0.2) == ((8, 4), (12, 4))
     assert walk_forward_splits(100, 2, 0.1) == ((70, 10), (80, 10))
@@ -1347,6 +1423,7 @@ def main() -> None:
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
     verify_series_conditioning()
     verify_panel_orchestration()
+    verify_universe_contract(ROOT)
     verify_selection_is_validation_only()
     verify_selected_epochs()
     verify_ridge()
