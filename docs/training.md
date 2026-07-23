@@ -301,10 +301,34 @@ policy-authorized historical test was run.
   trading checks passed, but they do not rescue stationary.
 
 The generated report, ledger, policy, and calibration backtest remain ignored
-local evidence, not confirmation. Next, plan seed-disagreement abstention
-separately; do not add it to this ablation. Future confirmation requires
-pre-registration before evaluating previously unavailable labels strictly after
-2026-07-21.
+local evidence, not confirmation.
+
+The one-shot seed-disagreement gate exited `0` and returned
+`promote_seed_disagreement: true`. The selected schema-3 trial was
+`long_above` with `disagreement_lambda: 0.5`, `safety_bps: 0.0`, objective
+`0.0473046623458639`, mean final equity `105.03967733947705`, mean gross
+turnover `44.96456738553214`, signal coverage `0.3070036861506056`, execution
+coverage `0.03580832016850974`, and 68 trades. The best lambda-zero objective
+was `0.03636838431516431`.
+
+- AAPL executed 16 trades with coverage `0.02527646129541864`; MSFT and SPY
+  each executed 26 trades with coverage `0.04107424960505529`.
+- Every source and output binding passed: fresh paths, report and ledger
+  provenance, calibration protocol and selection, prediction ledger, backtest
+  protocol, exact unique series, and result contract.
+- Every promotion check passed: long policy, nonzero lambda, objective strictly
+  above lambda zero, at least 30 trades, matching trial and backtest counts,
+  and positive trades and execution coverage for every series.
+- The ignored policy SHA-256 is
+  `a77313d7cf6aa92f8b55baf540ca2158030f68585aa844bd6ee5836bec949c41`;
+  its diagnostic calibration backtest SHA-256 is
+  `7ad959e20c55782da393626e652b8fc0e2f70668919d59d1d337c16e69859d2a`.
+
+This is a calibration-selected member-disagreement heuristic, not calibrated
+uncertainty, confidence, deployment evidence, or a confirmed trading result.
+No retraining or historical test followed the gate. Before any evaluation,
+externally pre-register the complete schema-3 policy hash above and a boundary
+against previously unavailable labels strictly after `2026-07-21`.
 
 ## Backtest a frozen holdout
 
@@ -330,15 +354,29 @@ python tools/experiment.py experiments/horizons.example.json \
 ```
 
 Freeze one cost-aware policy per model from that same report and schema-3
-calibration ledger:
+calibration ledger. Policy schema 3 adds a member-disagreement heuristic:
+
+```text
+decision_signal =
+  mean(seed predicted_log_return)
+  - disagreement_lambda
+    * population_pstdev(seed predicted_log_return)
+```
+
+This signal is not calibrated uncertainty or confidence. Reports keep
+`predicted_log_return` as the arithmetic seed mean; schema 3 freezes the
+selected multiplier used only for scheduling.
 
 ```zsh
 for model in transformer mlp linear; do
+  disagreement=(0)
+  [[ "$model" == linear ]] || disagreement+=(0.5 1)
   python tools/select_policy.py reports/executable-h13-calibration.json \
     reports/executable-h13-calibration.jsonl \
-    "reports/executable-h13-${model}-policy-v2.json" \
+    "reports/executable-h13-${model}-policy-v3.json" \
     "${series[@]}" \
     --model "$model" --safety-bps 0 3 6 10 \
+    --disagreement-lambda "${disagreement[@]}" \
     --initial-cash 100 --spread-bps 1 --slippage-bps 1 --fee-bps 0
 done
 ```
@@ -348,9 +386,12 @@ boundary, and input hash. It averages the configured seeds, maximizes mean log
 terminal growth across calibration accounts, deterministically breaks ties by
 lower turnover and higher threshold, and selects cash when no trading rule wins.
 
-All three schema-2 policies must exist and pass validation before one combined
+All three schema-3 policies must exist and pass validation before one combined
 test command opens holdout labels. No model gets an earlier look at the test
 interval.
+Existing `*-policy-v2.json` files remain exact schema-2 inputs and replay
+unchanged with an implied disagreement multiplier of zero; they are not
+rewritten or upgraded in place.
 
 ```zsh
 python tools/experiment.py experiments/horizons.example.json \
@@ -358,15 +399,15 @@ python tools/experiment.py experiments/horizons.example.json \
   "${series[@]}" \
   --horizon-bars 13 --target-kind executable-return-v1 --max-runs 117 \
   --predictions reports/executable-h13-test-v2.jsonl \
-  --policy reports/executable-h13-transformer-policy-v2.json \
-  --policy reports/executable-h13-mlp-policy-v2.json \
-  --policy reports/executable-h13-linear-policy-v2.json
+  --policy reports/executable-h13-transformer-policy-v3.json \
+  --policy reports/executable-h13-mlp-policy-v3.json \
+  --policy reports/executable-h13-linear-policy-v3.json
 
 for model in transformer mlp linear; do
   python tools/backtest.py reports/executable-h13-test-v2.jsonl \
     "reports/executable-h13-${model}-final-v2.json" \
     "${series[@]}" \
-    --policy "reports/executable-h13-${model}-policy-v2.json" \
+    --policy "reports/executable-h13-${model}-policy-v3.json" \
     --experiment-report reports/executable-h13-test-v2.json
 done
 ```
@@ -378,11 +419,14 @@ authorized policy hash.
 The frozen
 calibration fingerprint must also match the test experiment's candidate
 configuration, selection, folds, series, and validation results. The frozen
-policy is long only when predicted log return exceeds exact
-round-trip break-even friction plus the calibration-chosen safety margin; it is
-otherwise cash. Each entry invests all available equity in fractional shares
-without leverage, enters at the next bar's open, exits at the target bar's
-close, and ignores signals made before that exit.
+schema-3 policy schedules long only when its disagreement-adjusted decision
+signal—the arithmetic seed mean minus `disagreement_lambda` times population
+seed disagreement—exceeds exact round-trip break-even friction plus its frozen
+safety margin. Trades and reports still record `predicted_log_return` as the
+arithmetic seed mean; otherwise the policy remains cash. Each entry invests all
+available equity in fractional shares without leverage, enters at the next
+bar's open, exits at the target bar's close, and ignores signals made before
+that exit.
 The policy file is the trust root: archive it with the final report, which
 records the exact policy SHA-256 used for the backtest.
 Local files cannot make historical holdout access one-shot. For confirmatory
