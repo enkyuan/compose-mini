@@ -282,6 +282,30 @@ This ablation is calibration-only. Do not run a policy-authorized historical
 test or inspect labels through 2026-07-21. Confirmatory evaluation requires a
 pre-registered policy against later, previously unavailable labels.
 
+#### Development result (2026-07-23)
+
+This calibration-only run selected `raw-17`. For AAPL, MSFT, and SPY, each
+selected final run used 633 targets from `2026-02-26T19:30:00Z` through
+`2026-05-07T16:00:00Z`. Data through 2026-07-21 remains development-only. No
+policy-authorized historical test was run.
+
+- Macro validation return MAE was `0.00960146184341728` for `raw-17` and
+  `0.009698446599541997` for `stationary-16`. Relative reduction was
+  `-0.01010104062343471`: stationary was 1.0101% worse.
+- Stationary won 1 of 6 series-fold seed-mean buckets. Promotion required at
+  least 5% reduction and wins in at least 5 of 6 buckets, so it failed.
+- The raw policy chose a 10 bps safety margin, objective
+  `0.03636838431516431`, mean final equity `103.75624468627991`, and 52 trades.
+  Execution coverage was `0.011058451816745656` for AAPL,
+  `0.037914691943127965` for MSFT, and `0.03317535545023697` for SPY. These
+  trading checks passed, but they do not rescue stationary.
+
+The generated report, ledger, policy, and calibration backtest remain ignored
+local evidence, not confirmation. Next, plan seed-disagreement abstention
+separately; do not add it to this ablation. Future confirmation requires
+pre-registration before evaluating previously unavailable labels strictly after
+2026-07-21.
+
 ## Backtest a frozen holdout
 
 Define the three independent series once:
