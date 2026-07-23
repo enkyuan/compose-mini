@@ -592,6 +592,58 @@ def main() -> None:
     assert expected_runs(sweep, 1) == 25
     horizon_sweep = Sweep.read(ROOT / "experiments/horizons.example.json")
     assert expected_runs(horizon_sweep, 3) == 117
+    feature_path = ROOT / "experiments/executable-h13-features.example.json"
+    candidate_defaults = {
+        "ff_dim": 32,
+        "heads": 2,
+        "layers": 1,
+        "learning_rate": 0.0003,
+        "mlp_dim": 32,
+        "model_dim": 16,
+        "ridge": 0.001,
+        "rolling_window": 8,
+        "weight_decay": 0.0001,
+    }
+    assert json.loads(feature_path.read_text(encoding="utf-8")) == {
+        "batch_size": 128,
+        "candidates": [
+            candidate_defaults | {
+                "feature_set": "ohlcv",
+                "name": "raw-17",
+                "seq_len": 17,
+            },
+            candidate_defaults | {
+                "feature_set": "stationary-v1",
+                "name": "stationary-16",
+                "seq_len": 16,
+            },
+        ],
+        "epochs": 100,
+        "fold_fraction": 0.1,
+        "folds": 2,
+        "models": ["transformer"],
+        "patience": 10,
+        "seeds": [7, 19, 31, 43, 61],
+        "target_horizon_bars": 13,
+        "alignment_horizon_bars": 13,
+        "target_kind": EXECUTABLE_RETURN_TARGET,
+    }
+    feature_sweep = Sweep.read(feature_path)
+    assert feature_sweep == Sweep(
+        (
+            Candidate(
+                "raw-17", 17, 16, 2, 32, 1, 3e-4, 1e-4,
+                32, 8, 1e-3, "ohlcv",
+            ),
+            Candidate(
+                "stationary-16", 16, 16, 2, 32, 1, 3e-4, 1e-4,
+                32, 8, 1e-3, "stationary-v1",
+            ),
+        ),
+        ("transformer",), (7, 19, 31, 43, 61),
+        2, 0.1, 100, 10, 128, 13, 13, EXECUTABLE_RETURN_TARGET,
+    )
+    assert expected_runs(feature_sweep, 3) == 75
     with tempfile.TemporaryDirectory(prefix="compose-mini-experiment-") as directory:
         verify_caps(Path(directory))
         csv = Path(directory) / "series.csv"

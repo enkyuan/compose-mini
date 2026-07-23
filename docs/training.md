@@ -259,6 +259,29 @@ shows consistent validation improvement across instruments, folds, and seeds.
 The report includes per-candidate validation distributions and paired
 candidate-minus-control deltas; negative error deltas favor the candidate.
 
+### Calibrate horizon-13 feature candidates
+
+```zsh
+series=(
+  AAPL=data/aapl-30m.csv
+  MSFT=data/msft-30m.csv
+  SPY=data/spy-30m.csv
+)
+
+python tools/experiment.py \
+  experiments/executable-h13-features.example.json \
+  reports/executable-h13-feature-calibration.json \
+  "${series[@]}" \
+  --max-runs 75 \
+  --calibration-predictions \
+    reports/executable-h13-feature-calibration.jsonl \
+  --calibration-only
+```
+
+This ablation is calibration-only. Do not run a policy-authorized historical
+test or inspect labels through 2026-07-21. Confirmatory evaluation requires a
+pre-registered policy against later, previously unavailable labels.
+
 ## Backtest a frozen holdout
 
 Define the three independent series once:
