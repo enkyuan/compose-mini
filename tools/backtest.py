@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, pstdev
 import argparse
 import hashlib
 import json
@@ -38,7 +38,7 @@ LEDGER_V1_FIELDS = frozenset((
 ))
 LEDGER_V2_FIELDS = LEDGER_V1_FIELDS | {"fold", "target_kind"}
 LEDGER_V3_FIELDS = LEDGER_V2_FIELDS
-POLICY_FIELDS = frozenset((
+POLICY_V2_FIELDS = frozenset((
     "schema", "action", "model", "candidate", "feature_set", "target_kind",
     "horizon_bars", "seeds", "series", "initial_cash", "costs", "safety_bps",
     "minimum_predicted_log_return", "selection_objective",
@@ -46,12 +46,17 @@ POLICY_FIELDS = frozenset((
     "model_fingerprints", "threshold_trials", "test_grid",
     "calibration_fingerprint",
 ))
+POLICY_V3_FIELDS = POLICY_V2_FIELDS | {"disagreement_lambda"}
 POLICY_COST_FIELDS = ("spread_bps", "slippage_bps", "fee_bps")
-TRIAL_FIELDS = frozenset((
+TRIAL_V2_FIELDS = frozenset((
     "action", "safety_bps", "objective", "mean_final_equity",
     "mean_gross_turnover", "signal_coverage", "execution_coverage",
     "trade_count",
 ))
+TRIAL_V3_FIELDS = TRIAL_V2_FIELDS | {"disagreement_lambda"}
+POLICY_SAFETY_GRID = (0.0, 3.0, 6.0, 10.0)
+SEEDED_DISAGREEMENT_GRID = (0.0, 0.5, 1.0)
+DETERMINISTIC_DISAGREEMENT_GRID = (0.0,)
 LINE_CAP = 4_096
 
 
@@ -109,6 +114,7 @@ class Forecast:
     split: str = "test"
     fold: int | None = None
     target_kind: str = CLOSE_RETURN_TARGET
+    decision_signal: float | None = None
 
     @classmethod
     def parse(cls, value: object) -> Forecast:
@@ -195,19 +201,27 @@ class Costs:
         )
 
 
+def policy_trial_disagreement_lambda(trial: Mapping[str, object]) -> float:
+    value = trial.get("disagreement_lambda", 0.0)
+    return 0.0 if value is None else float(value)
+
+
 def select_trial(trials: Sequence[Mapping[str, object]]) -> Mapping[str, object]:
-    """Choose maximum growth, then minimum turnover, then safest threshold."""
+    """Choose growth, turnover, safety, then the smallest disagreement penalty."""
     return max(
         trials,
         key=lambda item: (
             item["objective"], -item["mean_gross_turnover"],
             math.inf if item["safety_bps"] is None else item["safety_bps"],
+            -policy_trial_disagreement_lambda(item),
         ),
     )
 
 
-def _validate_trial(value: object, initial_cash: float) -> Mapping[str, object]:
-    if not isinstance(value, dict) or set(value) != TRIAL_FIELDS or \
+def _validate_trial(value: object, initial_cash: float,
+                    schema: int) -> Mapping[str, object]:
+    fields = TRIAL_V2_FIELDS if schema == 2 else TRIAL_V3_FIELDS
+    if not isinstance(value, dict) or set(value) != fields or \
        value["action"] not in ("cash", "long_above") or \
        type(value["trade_count"]) is not int or value["trade_count"] < 0:
         raise ValueError("policy threshold trial is invalid")
@@ -219,22 +233,37 @@ def _validate_trial(value: object, initial_cash: float) -> Mapping[str, object]:
     execution = _finite(value["execution_coverage"],
                         "trial execution_coverage")
     safety = value["safety_bps"]
+    disagreement = value.get("disagreement_lambda")
     if final <= 0.0 or turnover < 0.0 or not 0.0 <= execution <= signal <= 1.0:
         raise ValueError("policy threshold trial metrics are invalid")
     if value["action"] == "cash":
-        if safety is not None or objective != 0.0 or turnover != 0.0 or \
+        if safety is not None or schema == 3 and disagreement is not None or \
+           objective != 0.0 or turnover != 0.0 or \
            signal != 0.0 or execution != 0.0 or value["trade_count"] != 0 or \
            not math.isclose(final, initial_cash, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError("policy cash trial is invalid")
-    elif not 0.0 <= _finite(safety, "trial safety_bps") < 10_000.0:
-        raise ValueError("policy trial threshold is invalid")
+    else:
+        if not 0.0 <= _finite(safety, "trial safety_bps") < 10_000.0 or \
+           schema == 3 and \
+           _finite(disagreement, "trial disagreement_lambda") < 0.0:
+            raise ValueError("policy trial threshold is invalid")
     return value
+
+
+def policy_disagreement_lambda(policy: Mapping[str, object]) -> float:
+    value = (
+        0.0 if policy["schema"] == 2 else policy["disagreement_lambda"]
+    )
+    return 0.0 if value is None else float(value)
 
 
 def validate_policy(value: object) -> dict[str, object]:
     """Validate and return one frozen executable-return policy."""
-    if not isinstance(value, dict) or set(value) != POLICY_FIELDS or \
-       type(value.get("schema")) is not int or value["schema"] != 2:
+    if not isinstance(value, dict) or type(value.get("schema")) is not int:
+        raise ValueError("policy has an invalid schema")
+    schema = value["schema"]
+    fields = {2: POLICY_V2_FIELDS, 3: POLICY_V3_FIELDS}.get(schema)
+    if fields is None or set(value) != fields:
         raise ValueError("policy has an invalid schema")
     action = value["action"]
     if action not in ("cash", "long_above") or \
@@ -262,26 +291,56 @@ def validate_policy(value: object) -> dict[str, object]:
     initial_cash = _finite(value["initial_cash"], "initial_cash")
     safety = value["safety_bps"]
     minimum = value["minimum_predicted_log_return"]
+    selected_disagreement = value.get("disagreement_lambda")
     if initial_cash <= 0.0 or action == "cash" and \
-       (safety is not None or minimum is not None):
+       (safety is not None or minimum is not None or
+        schema == 3 and selected_disagreement is not None):
         raise ValueError("cash policy parameters are invalid")
     if action == "long_above":
         safety = _finite(safety, "safety_bps")
         minimum = _finite(minimum, "minimum_predicted_log_return")
+        if schema == 3:
+            selected_disagreement = _finite(
+                selected_disagreement, "disagreement_lambda",
+            )
         expected = costs.break_even_log_return + safety / 10_000.0
         if not 0.0 <= safety < 10_000.0 or \
+           schema == 3 and selected_disagreement < 0.0 or \
            not math.isclose(minimum, expected, rel_tol=0.0, abs_tol=1e-15):
             raise ValueError("policy threshold is inconsistent with its costs")
     trials_value = value["threshold_trials"]
     if value["selection_objective"] != "macro_mean_terminal_log_growth" or \
        not isinstance(trials_value, list) or not trials_value:
         raise ValueError("policy selection evidence is invalid")
-    trials = tuple(_validate_trial(item, initial_cash) for item in trials_value)
+    trials = tuple(
+        _validate_trial(item, initial_cash, schema) for item in trials_value
+    )
     cash = tuple(item for item in trials if item["action"] == "cash")
-    safeties = tuple(item["safety_bps"] for item in trials
-                     if item["action"] == "long_above")
+    long_trials = tuple(
+        item for item in trials if item["action"] == "long_above"
+    )
     winner = select_trial(trials)
-    if len(cash) != 1 or not safeties or len(safeties) != len(set(safeties)) or \
+    if schema == 2:
+        safeties = tuple(item["safety_bps"] for item in long_trials)
+        selection_valid = (
+            bool(safeties) and len(safeties) == len(set(safeties))
+        )
+    else:
+        disagreement_grid = (
+            SEEDED_DISAGREEMENT_GRID
+            if seeded else DETERMINISTIC_DISAGREEMENT_GRID
+        )
+        expected_trials = [
+            (disagreement, safety_bps)
+            for disagreement in disagreement_grid
+            for safety_bps in POLICY_SAFETY_GRID
+        ]
+        selection_valid = [
+            (item["disagreement_lambda"], item["safety_bps"])
+            for item in long_trials
+        ] == expected_trials and trials[-1]["action"] == "cash" and \
+            selected_disagreement == winner["disagreement_lambda"]
+    if len(cash) != 1 or not selection_valid or \
        action != winner["action"] or safety != winner["safety_bps"]:
         raise ValueError("policy selection is inconsistent with its trials")
     if not _digest(value["calibration_fingerprint"]):
@@ -491,8 +550,16 @@ def _ensemble_key(forecast: Forecast) -> tuple[object, ...]:
             forecast.horizon_bars, forecast.target_kind)
 
 
+def _decision_signal(forecast: Forecast) -> float:
+    return (
+        forecast.predicted_log_return
+        if forecast.decision_signal is None else forecast.decision_signal
+    )
+
+
 def _aggregate_seeds(forecasts: Sequence[Forecast],
                      expected_seeds: Sequence[int] | None = None,
+                     disagreement_lambda: float = 0.0,
                      ) -> tuple[tuple[Forecast, ...],
                                 dict[tuple[object, ...], tuple[int | None, ...]]]:
     """Average complete, grid-aligned seed streams into one signal path."""
@@ -519,12 +586,21 @@ def _aggregate_seeds(forecasts: Sequence[Forecast],
         if any(tuple((item.csv_sha256, item.as_of, item.target_time)
                      for item in stream) != grid for stream in rows[1:]):
             raise ValueError("ensemble seed streams must share one forecast grid")
-        averaged.extend(
-            replace(items[0], seed=None,
-                    predicted_log_return=fmean(item.predicted_log_return
-                                               for item in items))
-            for items in zip(*rows, strict=True)
-        )
+        for items in zip(*rows, strict=True):
+            mean = fmean(item.predicted_log_return for item in items)
+            decision = mean
+            if disagreement_lambda != 0.0:
+                if seeds == (None,):
+                    raise ValueError(
+                        "deterministic forecasts do not support seed disagreement"
+                    )
+                decision = mean - disagreement_lambda * pstdev(
+                    item.predicted_log_return for item in items
+                )
+            averaged.append(replace(
+                items[0], seed=None, predicted_log_return=mean,
+                decision_signal=decision,
+            ))
         seeds_by_group[key] = seeds
     return tuple(averaged), seeds_by_group
 
@@ -568,7 +644,7 @@ def _schedule(aligned: Sequence[tuple[Forecast, int, int]], bars: Bars,
             continue
         decisions += 1
         if not always_up and (minimum_return is None or
-                              forecast.predicted_log_return <= minimum_return):
+                              _decision_signal(forecast) <= minimum_return):
             continue
         signal = None if always_up else forecast.predicted_log_return
         trade = _execute(cash, as_of + 1, target, bars, costs, signal)
@@ -678,11 +754,18 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
                   initial_cash: float, costs: Costs, safety_bps: float = 0.0,
                   ensemble_seeds: bool = False,
                   expected_seeds: Sequence[int] | None = None,
-                  cash_only: bool = False) -> dict[str, object]:
+                  cash_only: bool = False,
+                  disagreement_lambda: float = 0.0) -> dict[str, object]:
     initial_cash = _finite(initial_cash, "initial_cash")
     safety_bps = _finite(safety_bps, "safety_bps")
-    if initial_cash <= 0.0 or not 0.0 <= safety_bps < 10_000.0:
-        raise ValueError("initial_cash or safety_bps is invalid")
+    disagreement_lambda = _finite(
+        disagreement_lambda, "disagreement_lambda",
+    )
+    if initial_cash <= 0.0 or not 0.0 <= safety_bps < 10_000.0 or \
+       disagreement_lambda < 0.0:
+        raise ValueError("initial_cash, safety_bps, or disagreement_lambda is invalid")
+    if disagreement_lambda != 0.0 and not ensemble_seeds:
+        raise ValueError("seed disagreement requires ensemble seeds")
     splits, target_kinds = ({forecast.split for forecast in forecasts},
                             {forecast.target_kind for forecast in forecasts})
     if len(splits) != 1 or \
@@ -692,7 +775,9 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
         raise ValueError("forecast ledger must use one split and target kind")
     seed_groups = {}
     if ensemble_seeds:
-        forecasts, seed_groups = _aggregate_seeds(forecasts, expected_seeds)
+        forecasts, seed_groups = _aggregate_seeds(
+            forecasts, expected_seeds, disagreement_lambda,
+        )
     groups: dict[tuple[object, ...], list[Forecast]] = defaultdict(list)
     for forecast in forecasts:
         groups[_group_key(forecast)].append(forecast)
@@ -726,7 +811,7 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
         bars, aligned = series[str(name)], aligned_groups[key]
         start, end = aligned[0][1] + 1, aligned[-1][2]
         signals = sum(
-            threshold is not None and item[0].predicted_log_return > threshold
+            threshold is not None and _decision_signal(item[0]) > threshold
             for item in aligned
         )
         model_trades, decisions = _schedule(
@@ -791,7 +876,13 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
             "sizing": "100% of available equity per entry",
             "signal": (
                 "cash" if cash_only else
-                "long when predicted_log_return exceeds the threshold"
+                (
+                    "long when arithmetic mean seed prediction minus "
+                    "disagreement_lambda times population seed disagreement "
+                    "exceeds the threshold"
+                    if ensemble_seeds else
+                    "long when predicted_log_return exceeds the threshold"
+                )
             ),
             "forecast_target": TARGET_FORMULAS[target_kind],
             "target_kind": target_kind,
@@ -817,6 +908,7 @@ def run_backtests(forecasts: Sequence[Forecast], series: Mapping[str, Bars],
                 "heuristic because the target excludes the next-open gap"
             ),
             "safety_bps": safety_bps,
+            "disagreement_lambda": disagreement_lambda,
             "minimum_predicted_log_return": threshold,
             "cash_yield": 0.0,
             "dividends": "not credited separately from supplied OHLCV prices",
@@ -856,6 +948,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--slippage-bps", type=float)
     parser.add_argument("--fee-bps", type=float)
     parser.add_argument("--safety-bps", type=float)
+    parser.add_argument("--disagreement-lambda", type=float)
     parser.add_argument("--ensemble-seeds", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--policy", type=Path)
@@ -900,7 +993,8 @@ def main() -> None:
             if args.policy:
                 if any(value is not None for value in (
                     args.initial_cash, args.spread_bps, args.slippage_bps,
-                    args.fee_bps, args.safety_bps, args.model,
+                    args.fee_bps, args.safety_bps, args.disagreement_lambda,
+                    args.model,
                 )) or args.ensemble_seeds:
                     raise ValueError(
                         "policy mode does not accept diagnostic overrides"
@@ -943,6 +1037,7 @@ def main() -> None:
                 safety_bps = float(policy["safety_bps"] or 0.0)
                 ensemble_seeds, expected_seeds = True, policy["seeds"]
                 cash_only = policy["action"] == "cash"
+                disagreement_lambda = policy_disagreement_lambda(policy)
             else:
                 if args.experiment_report:
                     raise ValueError(
@@ -967,6 +1062,10 @@ def main() -> None:
                 safety_bps = (
                     args.safety_bps if args.safety_bps is not None else 0.0
                 )
+                disagreement_lambda = (
+                    args.disagreement_lambda
+                    if args.disagreement_lambda is not None else 0.0
+                )
                 ensemble_seeds, expected_seeds, cash_only = \
                     args.ensemble_seeds, None, False
             if args.model:
@@ -979,6 +1078,7 @@ def main() -> None:
             report = run_backtests(
                 forecasts, bars, initial_cash, costs, safety_bps,
                 ensemble_seeds, expected_seeds, cash_only,
+                disagreement_lambda=disagreement_lambda,
             )
             report["prediction_ledger"] = {
                 "path": str(prediction_input.source),
