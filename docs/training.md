@@ -261,55 +261,73 @@ candidate-minus-control deltas; negative error deltas favor the candidate.
 
 ## Backtest a frozen holdout
 
-Run validation first; this phase cannot emit test predictions or metrics:
+Define the three independent series once:
 
-```sh
-python tools/experiment.py experiments/horizons.example.json \
-  reports/horizon-13-validation.json \
-  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 78 \
-  --validation-predictions reports/horizon-13-validation.jsonl \
-  --validation-only
+```zsh
+series=(
+  AAPL=data/aapl-30m.csv
+  MSFT=data/msft-30m.csv
+  SPY=data/spy-30m.csv
+)
 ```
 
-Select the model's MSE-chosen candidate and one predeclared log-return safety
-margin from validation only:
+Run selection and calibration without opening the test interval:
 
-```sh
-python tools/select_policy.py reports/horizon-13-validation.json \
-  reports/horizon-13-validation.jsonl reports/horizon-13-policy.json \
-  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --model transformer --safety-bps 0 3 6 10 \
-  --initial-cash 100 --spread-bps 1 --slippage-bps 1 --fee-bps 0
+```zsh
+python tools/experiment.py experiments/horizons.example.json \
+  reports/executable-h13-calibration.json \
+  "${series[@]}" \
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 117 \
+  --calibration-predictions reports/executable-h13-calibration.jsonl \
+  --calibration-only
+```
+
+Freeze one cost-aware policy per model from that same report and schema-3
+calibration ledger:
+
+```zsh
+for model in transformer mlp linear; do
+  python tools/select_policy.py reports/executable-h13-calibration.json \
+    reports/executable-h13-calibration.jsonl \
+    "reports/executable-h13-${model}-policy-v2.json" \
+    "${series[@]}" \
+    --model "$model" --safety-bps 0 3 6 10 \
+    --initial-cash 100 --spread-bps 1 --slippage-bps 1 --fee-bps 0
+done
 ```
 
 The selector verifies every selected candidate, series, fold, seed, timestamp
 boundary, and input hash. It averages the configured seeds, maximizes mean log
-terminal growth across validation accounts, deterministically breaks ties by
+terminal growth across calibration accounts, deterministically breaks ties by
 lower turnover and higher threshold, and selects cash when no trading rule wins.
 
-Only after the policy exists, rerun the deterministic experiment to emit test
-predictions, then apply the policy without overrides:
+All three schema-2 policies must exist and pass validation before one combined
+test command opens holdout labels. No model gets an earlier look at the test
+interval.
 
-```sh
+```zsh
 python tools/experiment.py experiments/horizons.example.json \
-  reports/horizon-13-test.json \
-  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 93 \
-  --predictions reports/horizon-13-test.jsonl \
-  --policy reports/horizon-13-policy.json
+  reports/executable-h13-test-v2.json \
+  "${series[@]}" \
+  --horizon-bars 13 --target-kind executable-return-v1 --max-runs 117 \
+  --predictions reports/executable-h13-test-v2.jsonl \
+  --policy reports/executable-h13-transformer-policy-v2.json \
+  --policy reports/executable-h13-mlp-policy-v2.json \
+  --policy reports/executable-h13-linear-policy-v2.json
 
-python tools/backtest.py reports/horizon-13-test.jsonl \
-  reports/horizon-13-backtest.json \
-  AAPL=data/aapl-30m.csv MSFT=data/msft-30m.csv SPY=data/spy-30m.csv \
-  --policy reports/horizon-13-policy.json \
-  --experiment-report reports/horizon-13-test.json
+for model in transformer mlp linear; do
+  python tools/backtest.py reports/executable-h13-test-v2.jsonl \
+    "reports/executable-h13-${model}-final-v2.json" \
+    "${series[@]}" \
+    --policy "reports/executable-h13-${model}-policy-v2.json" \
+    --experiment-report reports/executable-h13-test-v2.json
+done
 ```
 
 Test mode rejects direct model, cost, seed, and threshold overrides. The frozen
 policy must authorize the full experiment before it can evaluate its model.
-Repeat `--policy` to authorize several already-frozen models; no other model is
-evaluated on the holdout. The test report records each authorized policy hash.
+No other model is evaluated on the holdout. The test report records each
+authorized policy hash.
 The frozen
 validation fingerprint must also match the test experiment's candidate
 configuration, selection, folds, series, and validation results. The frozen
@@ -338,9 +356,10 @@ earns no yield, dividends are not credited separately, period endpoints may be
 partial, and drawdown is sampled from bar-close equity rather than intrabar
 lows.
 
-These results are hypothetical. Because the current holdout has already informed
-model and horizon discussion, label its P&L exploratory and freeze the complete
-policy before evaluating a later untouched period.
+These results are hypothetical. Earlier work already inspected the present
+historical test interval, so label its P&L exploratory. Confirmation requires
+later data whose labels were unavailable when the complete policy-hash set was
+registered.
 
 After choosing a Transformer candidate, pass its values to `tools/train.py` to
 fit and export the deployable V1 artifact. Diagnostic linear and MLP models are
