@@ -21,7 +21,10 @@ from tools.artifact_v1 import Artifact, Config, write_artifact
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.float32 import ulp_distance
 from tools.reference import predict_windows
-from tools.train import ForecastTransformer, export_weights, parse_args, train as train_model
+from tools.train import (
+    ForecastTransformer, export_weights, fit_epochs, parse_args,
+    prepare_data, train as train_model,
+)
 
 
 def write_csv(path: Path, rows: list[list[float]]) -> None:
@@ -155,12 +158,24 @@ def verify_restoration(csv: Path, directory: Path) -> None:
     assert all(torch.all(parameter == 1.0) for parameter in model.parameters())
 
 
+def verify_fixed_epochs(csv: Path) -> None:
+    config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
+    data = prepare_data(csv, config, 0.6, 0.2)
+    model = ForecastTransformer(config)
+    loaders = fit_epochs(
+        model, data, 8, 2, 3e-4, 1e-4, 7, torch.device("cpu"),
+    )
+    assert len(loaders) == 3
+    assert all(torch.isfinite(value).all() for value in model.state_dict().values())
+
+
 def main() -> None:
     binary = Path(sys.argv[1] if len(sys.argv) == 2 else ROOT / "bin/transformer").resolve()
     with tempfile.TemporaryDirectory(prefix="compose-mini-training-") as directory:
         distance = verify_export(binary, Path(directory))
         trained_distance = verify_training(binary, Path(directory))
         verify_restoration(Path(directory) / "training.csv", Path(directory))
+        verify_fixed_epochs(Path(directory) / "training.csv")
     print("training and export tests passed "
           f"(fixture {distance} ULP, trained maximum {trained_distance} ULP)")
 

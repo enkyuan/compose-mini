@@ -2,6 +2,7 @@
 """Verify walk-forward selection, aligned targets, baselines, and JSON reports."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -20,15 +21,15 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
-    expected_runs, holdout_split, linear_model, purged_split, run_experiment,
-    select_candidates,
+    _model_fingerprint, _selected_epochs, expected_runs, holdout_split,
+    linear_model, purged_split, run_experiment, select_candidates,
     walk_forward_splits, write_predictions, write_report,
 )
 from tools.backtest import experiment_fingerprint
 from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
 from tools.train import (
-    TrainingData, Windows, data_loaders, evaluate, feature_lookback,
-    feature_values, prepare_data,
+    ForecastTransformer, TrainingData, Windows, data_loaders, evaluate,
+    feature_lookback, feature_values, fit_epochs, prepare_data,
 )
 
 
@@ -116,6 +117,16 @@ def verify_selection_is_validation_only() -> None:
     assert select_candidates(records, ("transformer",), candidates) == selected
 
 
+def verify_selected_epochs() -> None:
+    records = [
+        {"model": "transformer", "candidate": "raw", "series": "TEST",
+         "seed": 7, "best_epoch": 3},
+        {"model": "transformer", "candidate": "raw", "series": "TEST",
+         "seed": 7, "best_epoch": 7},
+    ]
+    assert _selected_epochs(records, "transformer", "raw", "TEST", 7) == 3
+
+
 def verify_ridge() -> None:
     torch.manual_seed(13)
     features, closes = torch.randn(40, 5), torch.ones(40)
@@ -127,6 +138,32 @@ def verify_ridge() -> None:
                         torch.ones(5), torch.tensor(0.0), torch.tensor(1.0))
     torch.testing.assert_close(linear_model(data, 1e-8)(windows[:30]), targets[:30],
                                rtol=1e-5, atol=1e-5)
+
+
+def verify_model_fingerprint(data: TrainingData) -> None:
+    configuration = candidate("fingerprint", data.train.seq_len)
+
+    def fitted() -> ForecastTransformer:
+        torch.manual_seed(23)
+        model = ForecastTransformer(configuration.config())
+        fit_epochs(model, data, 8, 2, 1e-3, 1e-4, 31, torch.device("cpu"))
+        return model
+
+    model = fitted()
+    state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    first = _model_fingerprint(model, data, configuration)
+    assert first == _model_fingerprint(model, data, configuration)
+
+    with torch.no_grad():
+        next(model.parameters()).view(-1)[0].add_(1)
+    assert _model_fingerprint(model, data, configuration) != first
+
+    restored = ForecastTransformer(configuration.config())
+    restored.load_state_dict(state)
+    changed_scale = replace(data, target_scale=data.target_scale * 2)
+    assert _model_fingerprint(restored, changed_scale, configuration) != first
+    assert _model_fingerprint(fitted(), data, configuration) == \
+        _model_fingerprint(fitted(), data, configuration)
 
 
 def verify_caps(directory: Path) -> None:
@@ -333,10 +370,13 @@ def verify_horizon_reports(csv: Path) -> None:
 
 def main() -> None:
     assert walk_forward_splits(20, 2, 0.2) == ((8, 4), (12, 4))
+    assert walk_forward_splits(100, 2, 0.1) == ((70, 10), (80, 10))
+    assert walk_forward_splits(100, 2, 0.1, 2) == ((60, 10), (70, 10))
     assert holdout_split(20, 0.2) == (12, 4, 4)
     assert purged_split((12, 4, 4), 2) == (10, 2, 4)
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
     verify_selection_is_validation_only()
+    verify_selected_epochs()
     verify_ridge()
     verify_stationary_features()
     sweep = Sweep(
@@ -378,6 +418,7 @@ def main() -> None:
             assert torch.equal(left, right)
         base = prepare_data(csv, candidate("leak", 5).config(), 0.7, 0.15,
                             (20, 10, 10))
+        verify_model_fingerprint(base)
         perturbed = prepare_data(changed, candidate("leak", 5).config(), 0.7, 0.15,
                                  (20, 10, 10))
         for left, right in zip(

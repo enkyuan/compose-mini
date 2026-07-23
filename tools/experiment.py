@@ -6,12 +6,14 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from statistics import fmean, pstdev
+from statistics import fmean, median_low, pstdev
 from typing import TextIO
 import argparse
+import hashlib
 import json
 import math
 import re
+import struct
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,6 +119,28 @@ class Candidate:
     def config(self) -> Config:
         return Config(self.model_dim, self.heads, self.ff_dim,
                       self.layers, self.seq_len)
+
+
+def _model_fingerprint(model: nn.Module, data: TrainingData,
+                       candidate: Candidate) -> str:
+    digest = hashlib.sha256(json.dumps(
+        asdict(candidate), allow_nan=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode())
+    tensors = (
+        ("feature_mean", data.feature_mean),
+        ("feature_scale", data.feature_scale),
+        ("target_mean", data.target_mean),
+        ("target_scale", data.target_scale),
+        *sorted(model.state_dict().items()),
+    )
+    for name, tensor in tensors:
+        values = tensor.detach().cpu().float().reshape(-1)
+        digest.update(name.encode("ascii") + b"\0")
+        for chunk in values.split(16_384):
+            items = chunk.tolist()
+            digest.update(struct.pack(f"<{len(items)}f", *items))
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -250,10 +274,11 @@ class RollingMean(nn.Module):
         return (prediction - self.target_mean) / self.target_scale
 
 
-def walk_forward_splits(samples: int, folds: int,
-                        fraction: float) -> tuple[tuple[int, int], ...]:
+def walk_forward_splits(samples: int, folds: int, fraction: float,
+                        reserved_blocks: int = 1
+                        ) -> tuple[tuple[int, int], ...]:
     block = int(samples * fraction)
-    initial = samples - (folds + 1) * block
+    initial = samples - (folds + reserved_blocks) * block
     if min(block, initial) <= 0:
         raise ValueError("series is too short for the requested walk-forward folds")
     return tuple((initial + fold * block, block) for fold in range(folds))
@@ -405,6 +430,18 @@ def select_candidates(records: Sequence[Mapping[str, object]],
         selected[model] = {"candidate": name,
                            "mean_validation_scaled_mse": score}
     return selected
+
+
+def _selected_epochs(records: Sequence[Mapping[str, object]], model: str,
+                     candidate: str, series: str, seed: int) -> int:
+    values = [
+        int(record["best_epoch"]) for record in records
+        if record["model"] == model and record["candidate"] == candidate and
+        record["series"] == series and record["seed"] == seed
+    ]
+    if not values:
+        raise ValueError("neural model has no selected epoch evidence")
+    return median_low(values)
 
 
 def _means(records: Sequence[Mapping[str, object]],
@@ -638,7 +675,7 @@ def run_experiment(sweep: Sweep, series: Sequence[tuple[str, Path]],
         splits = tuple(
             purged_split(split, gap, preserve_last=False)
             for split in walk_forward_splits(
-                samples, sweep.folds, sweep.fold_fraction,
+                samples, sweep.folds, sweep.fold_fraction, reserved_blocks=2,
             )
         )
         holdout = purged_split(holdout_split(samples, sweep.fold_fraction), gap)

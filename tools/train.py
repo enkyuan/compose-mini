@@ -357,6 +357,21 @@ def data_loaders(data: TrainingData, batch_size: int,
     )
 
 
+def fit_epochs(model: nn.Module, data: TrainingData, batch_size: int,
+               epochs: int, learning_rate: float, weight_decay: float,
+               seed: int, device: torch.device
+               ) -> tuple[DataLoader, ...]:
+    """Fit a preselected epoch count without reading later split losses."""
+    loaders = data_loaders(data, batch_size, seed)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay,
+    )
+    for _ in range(epochs):
+        if not math.isfinite(train_epoch(model, loaders[0], optimizer, device)):
+            raise FloatingPointError("training produced a non-finite loss")
+    return loaders
+
+
 def fit_model(model: nn.Module, data: TrainingData, batch_size: int,
               epochs: int, patience: int, learning_rate: float,
               weight_decay: float, seed: int, device: torch.device,
