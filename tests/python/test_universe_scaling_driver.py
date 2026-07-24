@@ -16,8 +16,9 @@ sys.path.insert(0, str(ROOT))
 from tools.universe_scaling_contract import (
     CALENDAR_SHA256, CONFIG_SHA256, EXPECTED_BUDGETS, FETCH_SHA256,
     FINALIZER_SOURCE_PATHS, MANIFEST_SHA256, PHASES, SELECTION_FILES,
-    SELECTION_SHA256, SOURCE_PATHS, ScalingAttempt, expected_protocol,
-    expected_scaling_commands,
+    SELECTION_SHA256, SOURCE_PATHS, FitJob, ScalingAttempt,
+    expected_fit_jobs, expected_protocol, expected_scaling_commands,
+    question_uses,
 )
 from tools.universe_scaling_inputs import ScalingCoverage, fetch_series
 from tools.universe_scaling_inputs import (
@@ -464,9 +465,144 @@ def verify_input_derivation() -> None:
         raise AssertionError("phase-free coverage was accepted")
 
 
+def verify_fit_schedule() -> None:
+    names = tuple(f"S{index:02d}" for index in range(55))
+    coverage = {
+        phase: tuple(
+            name for index, name in enumerate(names)
+            if index not in range(11, 13 + phase_index)
+        )
+        for phase_index, phase in enumerate(PHASES)
+    }
+    jobs = expected_fit_jobs(names, coverage)
+    modes = ("fixed-update", "fixed-epoch")
+    cohorts = (11, 22, 33, 44, 55)
+    phases = ("fold-0", "fold-1", "calibration")
+    seeds = (7, 19, 31, 43, 61)
+    training = (11, 22, 33, 55)
+    expected = tuple(
+        FitJob("pooled", mode, cohort, phase, model, seed, names[:cohort])
+        for mode in modes
+        for cohort in cohorts
+        for phase in phases
+        for model in (
+            "global_mlp", "panel_transformer",
+            *(("conditioned_panel_transformer",)
+              if cohort in training else ()),
+        )
+        for seed in seeds
+    ) + tuple(
+        FitJob(
+            "ridge", None, cohort, phase, "global_ridge", None,
+            names[:cohort],
+        )
+        for cohort in cohorts for phase in phases
+    ) + tuple(
+        FitJob(
+            "local", None, None, phase, "local_transformer", seed, (name,),
+        )
+        for phase in phases for name in coverage[phase] for seed in seeds
+    )
+    assert jobs == expected
+    pooled = tuple(job for job in jobs if job.kind == "pooled")
+    ridge = tuple(job for job in jobs if job.kind == "ridge")
+    local = tuple(job for job in jobs if job.kind == "local")
+    assert len(pooled) == 420
+    assert len(ridge) == 15
+    assert len(local) == 5 * sum(map(len, coverage.values()))
+    assert len(jobs) == len(set(jobs)) == 1_215
+
+    shared = next(
+        job for job in pooled
+        if (job.mode, job.cohort, job.phase, job.model, job.seed) ==
+        ("fixed-update", 11, "fold-0", "panel_transformer", 7)
+    )
+    assert question_uses(shared, names) == (
+        ("cohort-scaling", 11), ("unseen-transfer", 11),
+    )
+    conditioned = next(
+        job for job in pooled
+        if job.model == "conditioned_panel_transformer"
+    )
+    assert question_uses(conditioned, names) == (
+        ("cohort-scaling", conditioned.cohort),
+    )
+    transfer = next(
+        job for job in pooled
+        if job.cohort == 44 and job.model == "panel_transformer"
+    )
+    assert transfer.members == names[:44]
+    assert not set(names[44:]) & set(transfer.members)
+    assert all(job.mode is None and job.seed is None for job in ridge)
+    assert all(
+        job.mode is None and job.cohort is None and len(job.members) == 1
+        for job in local
+    )
+    assert {
+        (job.phase, job.members[0], job.seed) for job in local
+    } == {
+        (phase, name, seed)
+        for phase, members in coverage.items()
+        for name in members
+        for seed in (7, 19, 31, 43, 61)
+    }
+    local_uses = {
+        11: (("cohort-scaling", 11), ("cohort-scaling", 22),
+             ("cohort-scaling", 33), ("cohort-scaling", 55)),
+        12: (("cohort-scaling", 22), ("cohort-scaling", 33),
+             ("cohort-scaling", 55)),
+        22: (("cohort-scaling", 22), ("cohort-scaling", 33),
+             ("cohort-scaling", 55)),
+        23: (("cohort-scaling", 33), ("cohort-scaling", 55)),
+        33: (("cohort-scaling", 33), ("cohort-scaling", 55)),
+        34: (("cohort-scaling", 55),),
+        44: (("cohort-scaling", 55),),
+        45: (("cohort-scaling", 55), ("unseen-transfer", 11),
+             ("unseen-transfer", 22), ("unseen-transfer", 33),
+             ("unseen-transfer", 44)),
+        55: (("cohort-scaling", 55), ("unseen-transfer", 11),
+             ("unseen-transfer", 22), ("unseen-transfer", 33),
+             ("unseen-transfer", 44)),
+    }
+    for rank, uses in local_uses.items():
+        job = FitJob(
+            "local", None, None, "fold-0", "local_transformer", 7,
+            (names[rank - 1],),
+        )
+        assert question_uses(job, names) == uses
+
+    invalid = []
+    duplicate = list(names)
+    duplicate[-1] = duplicate[0]
+    invalid.append((duplicate, coverage))
+    reordered = dict(coverage)
+    reordered["fold-0"] = tuple(reversed(reordered["fold-0"]))
+    invalid.append((names, reordered))
+    unknown = dict(coverage)
+    unknown["fold-1"] = (*unknown["fold-1"], "UNKNOWN")
+    invalid.append((names, unknown))
+    no_core = dict(coverage)
+    no_core["fold-0"] = tuple(
+        name for name in no_core["fold-0"] if name != names[0]
+    )
+    invalid.append((names, no_core))
+    no_unseen = dict(coverage)
+    no_unseen["calibration"] = tuple(
+        name for name in no_unseen["calibration"] if name != names[-1]
+    )
+    invalid.append((names, no_unseen))
+    for master, phases in invalid:
+        try:
+            expected_fit_jobs(master, phases)
+        except ValueError:
+            continue
+        raise AssertionError("invalid physical fit schedule was accepted")
+
+
 def main() -> None:
     verify_attempt()
     verify_input_derivation()
+    verify_fit_schedule()
     print("universe scaling driver tests passed")
 
 

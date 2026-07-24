@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -26,6 +26,7 @@ MODELS = (
 PHASES = ("fold-0", "fold-1", "calibration")
 COMMANDS = ("validate", "preflight", "calibrate", "analyze")
 OUTPUTS = ("fits", "predictions", "summary", "outcome")
+POOLED_MODELS = ("global_mlp", "panel_transformer")
 SELECTION_ROOT = Path("reports/universe-selection-20260724-06")
 FETCH_PATH = Path("reports/liquid-common-55-20260724-02-fetch.json")
 CALENDAR_PATH = Path(
@@ -155,6 +156,113 @@ def expected_scaling_commands(
             outputs["outcome"],
         ),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class FitJob:
+    kind: str
+    mode: str | None
+    cohort: int | None
+    phase: str
+    model: str
+    seed: int | None
+    members: tuple[str, ...]
+
+
+def _master_names(master: Sequence[str]) -> tuple[str, ...]:
+    names = tuple(master)
+    if len(names) != 55 or len(set(names)) != len(names) or any(
+        not isinstance(name, str) or not name for name in names
+    ):
+        raise ValueError("scaling master must contain 55 unique names")
+    return names
+
+
+def expected_fit_jobs(
+    master: Sequence[str],
+    evaluable: Mapping[str, Sequence[str]],
+) -> tuple[FitJob, ...]:
+    """Return each physical development fit exactly once."""
+    names = _master_names(master)
+    if set(evaluable) != set(PHASES):
+        raise ValueError("scaling coverage phases are invalid")
+    master_set = set(names)
+    coverage = {}
+    for phase in PHASES:
+        members = tuple(evaluable[phase])
+        member_set = set(members)
+        if not member_set <= master_set or members != tuple(
+            name for name in names if name in member_set
+        ):
+            raise ValueError("phase coverage must be an ordered master subset")
+        coverage[phase] = members
+    if any(
+        not set(names[:11]) <= set(coverage[phase]) for phase in PHASES
+    ) or not set(names[44:]) <= set(coverage["calibration"]):
+        raise ValueError("required scaling coverage is incomplete")
+
+    cohorts = tuple(sorted(set((*TRAINING_COHORTS, *TRANSFER_COHORTS))))
+    jobs = []
+    for mode in MODES:
+        for cohort in cohorts:
+            members = names[:cohort]
+            for phase in PHASES:
+                jobs.extend(
+                    FitJob(
+                        "pooled", mode, cohort, phase, model, seed, members,
+                    )
+                    for model in POOLED_MODELS
+                    for seed in SEEDS
+                )
+                if cohort in TRAINING_COHORTS:
+                    jobs.extend(
+                        FitJob(
+                            "pooled", mode, cohort, phase,
+                            "conditioned_panel_transformer", seed, members,
+                        )
+                        for seed in SEEDS
+                    )
+    jobs.extend(
+        FitJob("ridge", None, cohort, phase, "global_ridge", None,
+               names[:cohort])
+        for cohort in cohorts for phase in PHASES
+    )
+    jobs.extend(
+        FitJob("local", None, None, phase, "local_transformer", seed, (name,))
+        for phase in PHASES for name in coverage[phase] for seed in SEEDS
+    )
+    return tuple(jobs)
+
+
+def question_uses(
+    job: FitJob, master: Sequence[str],
+) -> tuple[tuple[str, int], ...]:
+    """Return question/cohort views that may reference one physical fit."""
+    names = _master_names(master)
+    if job.kind == "local":
+        if len(job.members) != 1 or job.members[0] not in names:
+            raise ValueError("local fit member is invalid")
+        rank = names.index(job.members[0]) + 1
+        uses = tuple(
+            ("cohort-scaling", cohort)
+            for cohort in TRAINING_COHORTS if rank <= cohort
+        )
+        return uses + (
+            tuple(
+                ("unseen-transfer", cohort)
+                for cohort in TRANSFER_COHORTS
+            ) if rank in UNSEEN_RANKS else ()
+        )
+    if job.kind not in ("pooled", "ridge") or job.cohort is None:
+        raise ValueError("fit job kind is invalid")
+    uses = (
+        (("cohort-scaling", job.cohort),)
+        if job.cohort in TRAINING_COHORTS else ()
+    )
+    if job.model != "conditioned_panel_transformer" and \
+       job.cohort in TRANSFER_COHORTS:
+        uses += (("unseen-transfer", job.cohort),)
+    return uses
 
 
 @dataclass(frozen=True, slots=True)
