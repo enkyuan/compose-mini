@@ -65,8 +65,9 @@ def atomic_text(path: Path, write: Callable[[TextIO], None]) -> None:
 
 def exclusive_text(
     path: Path, write: Callable[[TextIO], None], directory_fd: int | None = None,
+    before_link: Callable[[], None] | None = None,
 ) -> None:
-    """Publish a new text file atomically without following or replacing it."""
+    """Fsync, optionally revalidate, then link a new file without replacing."""
     if directory_fd is None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(
@@ -85,6 +86,8 @@ def exclusive_text(
             write(file)
             file.flush()
             os.fsync(file.fileno())
+        if before_link is not None:
+            before_link()
         if directory_fd is None:
             os.link(temporary, path)
         else:
@@ -112,12 +115,13 @@ def write_json(path: Path, value: Mapping[str, object]) -> None:
 
 def write_json_exclusive(
     path: Path, value: Mapping[str, object], directory_fd: int | None = None,
+    before_link: Callable[[], None] | None = None,
 ) -> None:
     def write(file: TextIO) -> None:
         json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
         file.write("\n")
 
-    exclusive_text(path, write, directory_fd)
+    exclusive_text(path, write, directory_fd, before_link)
 
 
 def series_arg(value: str, pattern: re.Pattern[str]) -> tuple[str, Path]:

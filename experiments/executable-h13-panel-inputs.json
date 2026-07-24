@@ -1,0 +1,46 @@
+{
+  "baseline_ledger": {
+    "path": "reports/executable-h13-calibration.jsonl",
+    "sha256": "8e8f1c9e53e1acaec71cc0abcf73fc402c735973037abd6f5b56bff4afeae2c5"
+  },
+  "baseline_report": {
+    "path": "reports/executable-h13-calibration.json",
+    "sha256": "0689539de9e7bc0400403b6f7dfe44ead880c11a8fb265d20def48f3e80cfd81"
+  },
+  "schema": 1,
+  "series": [
+    {
+      "csv": {
+        "path": "data/aapl-30m.csv",
+        "sha256": "a821339ae61f1a7169e2e95f5e221a2c9fdbe8d931aa15b9384c0760d394984c"
+      },
+      "first_timestamp": "2024-07-22T13:30:00Z",
+      "last_timestamp": "2026-07-21T19:30:00Z",
+      "name": "AAPL",
+      "rows": 6488,
+      "timestamp_sha256": "fdd3c0e647c5312bac7eca3d2837a83d7d223a4e5931251b6af8c310178588e8"
+    },
+    {
+      "csv": {
+        "path": "data/msft-30m.csv",
+        "sha256": "715b8e27a73417271054985d8a5366a603b42068afe70bbe809fed83c5f59709"
+      },
+      "first_timestamp": "2024-07-22T13:30:00Z",
+      "last_timestamp": "2026-07-21T19:30:00Z",
+      "name": "MSFT",
+      "rows": 6488,
+      "timestamp_sha256": "fdd3c0e647c5312bac7eca3d2837a83d7d223a4e5931251b6af8c310178588e8"
+    },
+    {
+      "csv": {
+        "path": "data/spy-30m.csv",
+        "sha256": "486f199189e53134e1385497606b869ee77b4a4632efc94574d8016f116e562b"
+      },
+      "first_timestamp": "2024-07-22T13:30:00Z",
+      "last_timestamp": "2026-07-21T19:30:00Z",
+      "name": "SPY",
+      "rows": 6488,
+      "timestamp_sha256": "fdd3c0e647c5312bac7eca3d2837a83d7d223a4e5931251b6af8c310178588e8"
+    }
+  ]
+}

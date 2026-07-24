@@ -1,0 +1,41 @@
+{
+  "alignment_horizon_bars": 13,
+  "batch_size": 128,
+  "candidates": [
+    {
+      "feature_set": "ohlcv",
+      "ff_dim": 32,
+      "heads": 2,
+      "layers": 1,
+      "learning_rate": 0.0003,
+      "mlp_dim": 32,
+      "model_dim": 16,
+      "name": "raw-17",
+      "ridge": 0.001,
+      "rolling_window": 8,
+      "seq_len": 17,
+      "weight_decay": 0.0001
+    }
+  ],
+  "epochs": 100,
+  "fold_fraction": 0.1,
+  "folds": 2,
+  "models": [
+    "transformer",
+    "linear",
+    "mlp",
+    "rolling_mean",
+    "last_close",
+    "panel_transformer"
+  ],
+  "patience": 10,
+  "seeds": [
+    7,
+    19,
+    31,
+    43,
+    61
+  ],
+  "target_horizon_bars": 13,
+  "target_kind": "executable-return-v1"
+}

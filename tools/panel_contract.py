@@ -27,9 +27,7 @@ SOURCE_PATHS = (
     "tools/files.py",
     "tools/float32.py",
     "tools/analyze_panel.py",
-    "tools/analyze_universe.py",
-    "tools/fetch_universe.py",
-    "tools/fetch_massive.py",
+    "tools/run_panel_attempt.py",
     "tools/finalize_panel_attempt.py",
 )
 FINALIZER_SOURCE_PATHS = (
@@ -119,9 +117,57 @@ def read_canonical_json(path: Path) -> Mapping[str, object]:
     return value
 
 
+def read_canonical_json_lines(
+    path: Path,
+) -> tuple[Mapping[str, object], ...]:
+    """Decode finite, duplicate-free, canonical JSON objects by line."""
+    try:
+        lines = path.read_bytes().splitlines(keepends=True)
+    except OSError as error:
+        raise ValueError(f"cannot read canonical ledger: {error}") from error
+    if not lines:
+        raise ValueError("canonical ledger must not be empty")
+    values = []
+    for line in lines:
+        try:
+            value = json.loads(
+                line, object_pairs_hook=_pairs,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"invalid numeric constant: {token}")
+                ),
+            )
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"cannot read canonical ledger: {error}") from error
+        _finite_tree(value)
+        if not isinstance(value, dict) or line != (
+            json.dumps(value, allow_nan=False, sort_keys=True) + "\n"
+        ).encode():
+            raise ValueError("ledger rows must be canonical JSON objects")
+        values.append(value)
+    return tuple(values)
+
+
+@contextmanager
+def _open_parent(path: Path) -> Iterator[tuple[int, str]]:
+    """Open each lexical parent without following directory symlinks."""
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+        getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for part in absolute.parts[1:-1]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, absolute.name
+    finally:
+        os.close(descriptor)
+
+
 def _regular_identity(path: Path) -> tuple[int, int]:
     try:
-        metadata = path.stat(follow_symlinks=False)
+        with _open_parent(path) as (parent, name):
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except OSError as error:
         raise ValueError(f"input is unavailable: {path}") from error
     if stat.S_IFMT(metadata.st_mode) != stat.S_IFREG:
@@ -131,7 +177,8 @@ def _regular_identity(path: Path) -> tuple[int, int]:
 
 def _directory_identity(path: Path) -> tuple[int, int]:
     try:
-        metadata = path.stat(follow_symlinks=False)
+        with _open_parent(path) as (parent, name):
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except OSError as error:
         raise ValueError(f"directory is unavailable: {path}") from error
     if stat.S_IFMT(metadata.st_mode) != stat.S_IFDIR:
@@ -141,10 +188,11 @@ def _directory_identity(path: Path) -> tuple[int, int]:
 
 def _open_directory(path: Path) -> tuple[int, tuple[int, int]]:
     try:
-        descriptor = os.open(
-            path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
-            getattr(os, "O_NOFOLLOW", 0),
-        )
+        with _open_parent(path) as (parent, name):
+            descriptor = os.open(
+                name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                getattr(os, "O_NOFOLLOW", 0), dir_fd=parent,
+            )
     except OSError as error:
         raise ValueError(f"directory is unavailable: {path}") from error
     metadata = os.fstat(descriptor)
@@ -152,6 +200,22 @@ def _open_directory(path: Path) -> tuple[int, tuple[int, int]]:
         os.close(descriptor)
         raise ValueError(f"directory must be nonsymlink: {path}")
     return descriptor, (metadata.st_dev, metadata.st_ino)
+
+
+def mkdir_nofollow(path: Path) -> None:
+    """Create one directory only through nonsymlink lexical parents."""
+    try:
+        with _open_parent(path) as (parent, name):
+            os.mkdir(name, dir_fd=parent)
+            metadata = os.stat(
+                name, dir_fd=parent, follow_symlinks=False,
+            )
+    except OSError as error:
+        raise ValueError(f"cannot create directory: {path}") from error
+    identity = metadata.st_dev, metadata.st_ino
+    if stat.S_IFMT(metadata.st_mode) != stat.S_IFDIR or \
+       _directory_identity(path) != identity:
+        raise ValueError(f"created directory changed: {path}")
 
 
 def _regular_inputs(
@@ -163,6 +227,12 @@ def _regular_inputs(
     return tuple(zip(paths, identities, strict=True))
 
 
+def regular_file_identities(
+    paths: Sequence[Path],
+) -> tuple[tuple[int, int], ...]:
+    return tuple(identity for _, identity in _regular_inputs(paths))
+
+
 def _verify_identities(
     identities: Sequence[tuple[Path, tuple[int, int]]],
 ) -> None:
@@ -172,9 +242,23 @@ def _verify_identities(
 
 
 def _absent(path: Path, label: str) -> None:
-    if os.path.lexists(path) or os.path.lexists(Path(os.path.abspath(path))) or \
-       os.path.lexists(path.resolve(strict=False)):
+    try:
+        aliases = (
+            path, Path(os.path.abspath(path)), path.resolve(strict=False),
+        )
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} path is invalid") from error
+    if any(os.path.lexists(alias) for alias in aliases):
         raise ValueError(f"{label} must be absent")
+
+
+def resolve_fresh_output(path: Path) -> Path:
+    """Reject lexical aliases and return one absent resolved output path."""
+    _absent(path, "output")
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("output path is invalid") from error
 
 
 def _tree_digest(files: Sequence[FileBinding]) -> str:
@@ -345,7 +429,8 @@ class PanelInputs:
             {"schema", "series", "baseline_report", "baseline_ledger"},
             "input manifest",
         )
-        if value["schema"] != 1 or not isinstance(value["series"], list) or \
+        if _integer(value["schema"], "schema") != 1 or \
+           not isinstance(value["series"], list) or \
            not value["series"]:
             raise ValueError("input manifest schema or series is invalid")
         series = tuple(
@@ -440,7 +525,8 @@ class PanelAttempt:
             },
             "attempt manifest",
         )
-        if value["schema"] != 1 or value["status"] != "armed":
+        if _integer(value["schema"], "schema") != 1 or \
+           value["status"] != "armed":
             raise ValueError("attempt must be schema 1 and armed")
         run_id = _string(value["run_id"], "run_id")
         if not RUN_ID.fullmatch(run_id):
@@ -540,9 +626,11 @@ class PanelAttempt:
             raise ValueError("Torch runtime identity changed")
 
     def validate_paths(self, stage: str) -> None:
+        if stage == "validate_attempt":
+            return
         run_dir = Path(self.run_dir)
         cache = Path(self.environment["PYTHONPYCACHEPREFIX"])
-        if stage in ("validate_attempt", "preflight"):
+        if stage == "preflight":
             _absent(run_dir, "run directory")
         elif not run_dir.is_dir() or run_dir.is_symlink():
             raise ValueError("run directory must be a nonsymlink directory")
