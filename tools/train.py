@@ -376,7 +376,7 @@ def _prepare_indexed_rows(
     raw: torch.Tensor, config: Config, train_fraction: float,
     validation_fraction: float, split: tuple[int, int, int] | None,
     feature_set: str, horizon_bars: int, split_gap: int, target_kind: str,
-    sample_rows: Sequence[SampleRows],
+    sample_rows: Sequence[SampleRows], allow_empty_later: bool,
 ) -> TrainingData:
     rows = tuple(sample_rows)
     lookback = feature_lookback(feature_set)
@@ -407,20 +407,26 @@ def _prepare_indexed_rows(
 
     usable = len(rows) - split_gap * 2
     counts = split or split_counts(usable, train_fraction, validation_fraction)
-    if len(counts) != 3 or min(counts) <= 0 or sum(counts) > usable:
+    if len(counts) != 3 or counts[0] < 1 or min(counts) < 0 or \
+       not allow_empty_later and min(counts) < 1 or sum(counts) > usable:
         raise ValueError("chronological split is outside the indexed samples")
     train_count, validation_count, test_count = counts
     validation_start = train_count + split_gap
     test_start = validation_start + validation_count + split_gap
-    boundaries = (
-        (0, train_count, validation_start),
-        (validation_start, validation_count, test_start),
+    segments = tuple(
+        (start, count) for start, count in (
+            (0, train_count),
+            (validation_start, validation_count),
+            (test_start, test_count),
+        ) if count
     )
     if any(
         rows[start + count - 1].target > rows[next_start].as_of or
         rows[start + count - 1].as_of_ordinal + horizon_bars >
         rows[next_start].as_of_ordinal
-        for start, count, next_start in boundaries
+        for (start, count), (next_start, _) in zip(
+            segments, segments[1:], strict=False,
+        )
     ):
         raise ValueError("indexed split exposes an unavailable prior label")
 
@@ -477,10 +483,12 @@ def prepare_rows(rows: array, config: Config, train_fraction: float,
                  feature_set: str = "ohlcv", horizon_bars: int = 1,
                  split_gap: int = 0,
                  target_kind: str = CLOSE_RETURN_TARGET, *,
-                 sample_rows: Sequence[SampleRows] | None = None
+                 sample_rows: Sequence[SampleRows] | None = None,
+                 allow_empty_later: bool = False,
                  ) -> TrainingData:
     """Scale purged target-time splits using only their retained training rows."""
-    if horizon_bars < 1 or split_gap < 0 or target_kind not in TARGET_KINDS:
+    if horizon_bars < 1 or split_gap < 0 or target_kind not in TARGET_KINDS or \
+       type(allow_empty_later) is not bool:
         raise ValueError("horizon, split gap, or target kind is invalid")
     row_count = len(rows) // FEATURE_COUNT
     lookback = feature_lookback(feature_set)
@@ -496,7 +504,10 @@ def prepare_rows(rows: array, config: Config, train_fraction: float,
         return _prepare_indexed_rows(
             raw, config, train_fraction, validation_fraction, split,
             feature_set, horizon_bars, split_gap, target_kind, sample_rows,
+            allow_empty_later,
         )
+    if allow_empty_later:
+        raise ValueError("empty later splits require indexed samples")
     if row_count < config.seq_len + lookback + horizon_bars:
         raise ValueError("training requires lookback + seq_len + horizon rows")
     # Preserve price anchors before raw OHLCV features are normalized in place.

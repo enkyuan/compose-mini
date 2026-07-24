@@ -382,6 +382,22 @@ def verify_indexed_windows(csv: Path) -> None:
     )
     assert tuple(map(len, (sparse.train, sparse.validation, sparse.test))) == \
         (2, 1, 1)
+    incomplete = prepare_rows(
+        rows, config, 0.6, 0.2, (2, 0, 2), horizon_bars=3,
+        sample_rows=samples, allow_empty_later=True,
+    )
+    assert tuple(map(len, (
+        incomplete.train, incomplete.validation, incomplete.test,
+    ))) == (2, 0, 2)
+    try:
+        prepare_rows(
+            rows, config, 0.6, 0.2, (2, 0, 2), horizon_bars=3,
+            sample_rows=samples,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unbound empty validation split was accepted")
 
     invalid = list(samples)
     invalid[2] = SampleRows(9, 10, 11, 8)
