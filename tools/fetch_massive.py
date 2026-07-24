@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -29,6 +29,8 @@ from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 API_HOST = "api.massive.com"
 EASTERN = ZoneInfo("America/New_York")
 TICKER = re.compile(r"[A-Z0-9.-]{1,32}")
+INTERNAL_GAP_SCOPE = "internal-between-observed-bars"
+SESSION_GAP_SCOPE = "all-expected-session-bins"
 Bar = tuple[int, float, float, float, float, float]
 Gap = dict[str, str | int]
 Requester = Callable[[str], Mapping[str, object]]
@@ -193,6 +195,19 @@ def _timestamp(timestamp: int) -> str:
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _local(timestamp: int) -> datetime:
+    return datetime.fromtimestamp(
+        timestamp / 1000, timezone.utc,
+    ).astimezone(EASTERN)
+
+
+def _grid_timestamp(day: date, minute: int) -> str:
+    local = datetime(
+        day.year, day.month, day.day, tzinfo=EASTERN,
+    ) + timedelta(minutes=minute)
+    return _timestamp(int(local.timestamp() * 1000))
+
+
 def scan_regular_bars(
     bars: Sequence[Bar], minutes: int,
     calendar: SessionCalendar | None = None,
@@ -201,7 +216,7 @@ def scan_regular_bars(
     sessions: dict[date, list[tuple[int, Bar]]] = {}
     previous = -1
     for bar in bars:
-        local = datetime.fromtimestamp(bar[0] / 1000, timezone.utc).astimezone(EASTERN)
+        local = _local(bar[0])
         minute = local.hour * 60 + local.minute
         bounds = (
             (570, 960) if calendar is None and local.weekday() < 5
@@ -235,6 +250,81 @@ def scan_regular_bars(
     if not selected:
         raise ValueError("Massive returned no regular-session bars")
     return selected, len(sessions), gaps
+
+
+def session_grid_audit(
+    bars: Sequence[Bar],
+    minutes: int,
+    calendar: SessionCalendar,
+    start: date,
+    end: date,
+) -> dict[str, object]:
+    """Compare observed starts with every expected exchange-session start."""
+    if type(minutes) is not int or not 1 <= minutes <= 59 or start > end or \
+       start < calendar.start or end > calendar.end:
+        raise ValueError("invalid session-grid bounds")
+    observed: dict[date, set[int]] = {}
+    for bar in bars:
+        local = _local(bar[0])
+        day = local.date()
+        bounds = calendar.session(day) if start <= day <= end else None
+        minute = local.hour * 60 + local.minute
+        if bounds is None or local.second or local.microsecond or \
+           not bounds[0] <= minute or minute + minutes > bounds[1] or \
+           (minute - bounds[0]) % minutes:
+            raise ValueError("observed bar is outside the requested session grid")
+        starts = observed.setdefault(day, set())
+        if minute in starts:
+            raise ValueError("observed session-grid starts are not unique")
+        starts.add(minute)
+
+    expected_sessions = affected_sessions = expected_bins = missing_bins = 0
+    missing_sessions: list[str] = []
+    ranges: list[dict[str, str | int]] = []
+    day = start
+    while day <= end:
+        bounds = calendar.session(day)
+        if bounds is not None:
+            expected = range(bounds[0], bounds[1] - minutes + 1, minutes)
+            if not expected:
+                day += timedelta(days=1)
+                continue
+            expected_sessions += 1
+            missing = [
+                minute for minute in expected
+                if minute not in observed.get(day, ())
+            ]
+            expected_bins += len(expected)
+            if missing:
+                affected_sessions += 1
+                missing_bins += len(missing)
+                if day not in observed:
+                    missing_sessions.append(str(day))
+                first = previous = missing[0]
+                for minute in (*missing[1:], None):
+                    if minute is not None and minute == previous + minutes:
+                        previous = minute
+                        continue
+                    ranges.append({
+                        "session": str(day),
+                        "start_timestamp": _grid_timestamp(day, first),
+                        "end_timestamp": _grid_timestamp(
+                            day, previous + minutes,
+                        ),
+                        "absent_bins": (previous - first) // minutes + 1,
+                    })
+                    if minute is not None:
+                        first = previous = minute
+        day += timedelta(days=1)
+    return {
+        "scope": SESSION_GAP_SCOPE,
+        "expected_sessions": expected_sessions,
+        "affected_sessions": affected_sessions,
+        "missing_sessions": missing_sessions,
+        "expected_bins": expected_bins,
+        "missing_bins": missing_bins,
+        "ranges": ranges,
+    }
 
 
 def regular_bars(

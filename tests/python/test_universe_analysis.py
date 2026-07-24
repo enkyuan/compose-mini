@@ -192,10 +192,14 @@ def test_gap_audit_contract(directory: Path) -> None:
     manifest_path = directory / "gap-manifest.json"
     manifest = manifest_value()
     manifest["series"] = [{"stratum": "generic", "ticker": "AAPL"}]
+    manifest["end"] = "2024-11-06"
     write_json(manifest_path, manifest)
     values = (
         ("2024-11-01T13:30:00+00:00", 100.0),
-        ("2024-11-01T14:30:00+00:00", 101.0),
+        ("2024-11-01T14:00:00+00:00", 101.0),
+        ("2024-11-01T14:30:00+00:00", 102.0),
+        ("2024-11-04T14:30:00+00:00", 103.0),
+        ("2024-11-04T15:00:00+00:00", 104.0),
     )
 
     def request(url: str) -> dict[str, object]:
@@ -235,12 +239,73 @@ def test_gap_audit_contract(directory: Path) -> None:
         report, parsed, manifest_input, bars, calendar_input,
     )
 
-    previous = json.loads(json.dumps(report))
-    previous["fetch_schema"] = 2
-    del previous["session_calendar"]
-    del previous["series"][0]["reference"]["primary_exchange"]
-    analysis.validate_fetch(previous, parsed, manifest_input, bars)
-    for candidate, supplied in ((report, None), (previous, calendar_input)):
+    assert report["fetch_schema"] == 4
+    audit = report["series"][0]["csv"]["session_audit"]
+    assert audit == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 4,
+        "affected_sessions": 4,
+        "missing_sessions": ["2024-11-05", "2024-11-06"],
+        "expected_bins": 52,
+        "missing_bins": 47,
+        "ranges": [
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T15:00:00Z",
+                "end_timestamp": "2024-11-01T20:00:00Z",
+                "absent_bins": 10,
+            },
+            {
+                "session": "2024-11-04",
+                "start_timestamp": "2024-11-04T15:30:00Z",
+                "end_timestamp": "2024-11-04T21:00:00Z",
+                "absent_bins": 11,
+            },
+            {
+                "session": "2024-11-05",
+                "start_timestamp": "2024-11-05T14:30:00Z",
+                "end_timestamp": "2024-11-05T21:00:00Z",
+                "absent_bins": 13,
+            },
+            {
+                "session": "2024-11-06",
+                "start_timestamp": "2024-11-06T14:30:00Z",
+                "end_timestamp": "2024-11-06T21:00:00Z",
+                "absent_bins": 13,
+            },
+        ],
+    }
+
+    schema3 = json.loads(json.dumps(report))
+    schema3["fetch_schema"] = 3
+    schema3["series"][0]["csv"]["gap_audit"] = {
+        "scope": "internal-between-observed-bars",
+        "affected_sessions": 0,
+        "internal_gap_count": 0,
+        "internal_missing_bins": 0,
+        "gaps": [],
+    }
+    del schema3["series"][0]["csv"]["session_audit"]
+    analysis.validate_fetch(
+        schema3, parsed, manifest_input, bars, calendar_input,
+    )
+
+    schema2 = json.loads(json.dumps(schema3))
+    schema2["fetch_schema"] = 2
+    del schema2["session_calendar"]
+    del schema2["series"][0]["reference"]["primary_exchange"]
+    analysis.validate_fetch(schema2, parsed, manifest_input, bars)
+
+    unversioned = json.loads(json.dumps(schema2))
+    del unversioned["fetch_schema"]
+    del unversioned["gap_policy"]
+    del unversioned["series"][0]["csv"]["gap_audit"]
+    analysis.validate_fetch(unversioned, parsed, manifest_input, bars)
+
+    for candidate, supplied in (
+        (report, None), (schema3, None),
+        (schema2, calendar_input), (unversioned, calendar_input),
+    ):
         try:
             analysis.validate_fetch(
                 candidate, parsed, manifest_input, bars, supplied,
@@ -269,40 +334,62 @@ def test_gap_audit_contract(directory: Path) -> None:
         lambda value: value["series"][0]["reference"].update(
             {"primary_exchange": "XASE"}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
             {"scope": "all-session-bins"}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"expected_sessions": 3}
+        ),
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
             {"affected_sessions": 0}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"].update(
-            {"internal_gap_count": 0}
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"missing_sessions": ["2024-11-06", "2024-11-05"]}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"].update(
-            {"internal_gap_count": 1.0}
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"expected_bins": 51}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"].update(
-            {"internal_missing_bins": 0}
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"missing_bins": 46}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"]["gaps"][0].update(
-            {"absent_bins": 2}
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"extra": True}
         ),
-        lambda value: value["series"][0]["csv"]["gap_audit"]["gaps"][0].update(
-            {"absent_bins": 1.0}
+        lambda value: value["series"][0]["csv"]["session_audit"]["ranges"].reverse(),
+        lambda value: value["series"][0]["csv"]["session_audit"][
+            "ranges"
+        ][0].update({"start_timestamp": "2024-11-01T14:30:00Z"}),
+        lambda value: value["series"][0]["csv"]["session_audit"][
+            "ranges"
+        ][0].update({"end_timestamp": "2024-11-01T19:30:00Z"}),
+        lambda value: value["series"][0]["csv"]["session_audit"][
+            "ranges"
+        ][0].update({"absent_bins": 10.0}),
+        lambda value: value["series"][0]["csv"]["session_audit"][
+            "ranges"
+        ][0].update({"extra": True}),
+        lambda value: value["series"][0]["csv"]["session_audit"].update(
+            {"ranges": value["series"][0]["csv"]["session_audit"][
+                "ranges"
+            ][1:]},
         ),
     ):
         rejected(change)
 
     csv_path = Path(report["series"][0]["csv"]["path"])
-    original = csv_path.read_text(encoding="ascii")
-    try:
+    lines = csv_path.read_text(encoding="ascii").splitlines()
+    for removed, sessions in ((1, 2), (2, 2), (3, 2), ((4, 5), 1)):
+        indexes = {removed} if isinstance(removed, int) else set(removed)
         csv_path.write_text(
-            original + "2024-11-29T18:00:00Z,1,1,1,1,1\n",
+            "\n".join(
+                line for index, line in enumerate(lines)
+                if index not in indexes
+            ) + "\n",
             encoding="ascii",
         )
         candidate = json.loads(json.dumps(report))
         candidate["series"][0]["csv"].update({
-            "rows": 3, "sessions": 2, "source_rows": 3,
+            "rows": 5 - len(indexes), "sessions": sessions,
             "sha256": file_sha256(csv_path),
         })
         try:
@@ -313,9 +400,8 @@ def test_gap_audit_contract(directory: Path) -> None:
         except ValueError:
             pass
         else:
-            raise AssertionError("early-close after-hours row was accepted")
-    finally:
-        csv_path.write_text(original, encoding="ascii")
+            raise AssertionError("stale session audit was accepted")
+    csv_path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
 def request_contract(
@@ -393,7 +479,10 @@ class Fixture:
         self.ledger_path = self.run_dir / "calibration.jsonl"
         self.output_dir = root / "outputs"
         self.output_dir.mkdir()
-        self.manifest = manifest_value()
+        self.manifest = manifest_value() | {
+            "start": "2025-08-01",
+            "end": "2025-10-10",
+        }
         self.config = config_value()
         self.calendar_args = ("--session-calendar", DEFAULT_CALENDAR)
         write_json(self.manifest_path, self.manifest)
@@ -439,6 +528,23 @@ class Fixture:
             ))
 
     def _write_fetch(self) -> None:
+        audit = {
+            "scope": "all-expected-session-bins",
+            "expected_sessions": 50,
+            "affected_sessions": 50,
+            "missing_sessions": [],
+            "expected_bins": 650,
+            "missing_bins": 600,
+            "ranges": [
+                {
+                    "session": timestamp[:10],
+                    "start_timestamp": f"{timestamp[:10]}T14:00:00Z",
+                    "end_timestamp": f"{timestamp[:10]}T20:00:00Z",
+                    "absent_bins": 12,
+                }
+                for timestamp in timestamps()
+            ],
+        }
         records = []
         for item in self.manifest["series"]:
             name = item["ticker"]
@@ -454,13 +560,7 @@ class Fixture:
                     "sessions": 50,
                     "source_rows": 50,
                     "sha256": file_sha256(self.csv_paths[name]),
-                    "gap_audit": {
-                        "scope": "internal-between-observed-bars",
-                        "affected_sessions": 0,
-                        "internal_gap_count": 0,
-                        "internal_missing_bins": 0,
-                        "gaps": [],
-                    },
+                    "session_audit": audit,
                 },
             })
         write_json(self.fetch_path, {
@@ -472,7 +572,7 @@ class Fixture:
                 "path": str(self.manifest_path),
                 "sha256": file_sha256(self.manifest_path),
             },
-            "fetch_schema": 3,
+            "fetch_schema": 4,
             "gap_policy": "retain-observed-bars",
             "session_calendar": {
                 "path": str(DEFAULT_CALENDAR),

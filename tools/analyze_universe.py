@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from statistics import fmean
 from urllib.parse import quote
@@ -27,9 +27,11 @@ from tools.backtest import (
     read_forecasts, run_backtests, validate_policy,
 )
 from tools.data_v1 import EXECUTABLE_RETURN_TARGET
-from tools.fetch_massive import Bar, scan_regular_bars
+from tools.fetch_massive import (
+    INTERNAL_GAP_SCOPE, Bar, scan_regular_bars, session_grid_audit,
+)
 from tools.fetch_universe import (
-    FETCH_SCHEMA, GAP_POLICY, GAP_SCOPE, PREVIOUS_FETCH_SCHEMA,
+    CALENDAR_FETCH_SCHEMA, FETCH_SCHEMA, GAP_POLICY, PREVIOUS_FETCH_SCHEMA,
     UniverseManifest,
 )
 from tools.files import (
@@ -272,11 +274,8 @@ def _manifest_names(manifest: UniverseManifest) -> tuple[str, ...]:
     return names
 
 
-def _gap_audit(
-    timestamps: Sequence[str], minutes: int,
-    calendar: SessionCalendar | None = None,
-) -> tuple[int, dict[str, object]]:
-    observed: list[Bar] = [
+def _observed_bars(timestamps: Sequence[str]) -> list[Bar]:
+    return [
         (
             int(datetime.strptime(
                 timestamp, "%Y-%m-%dT%H:%M:%SZ",
@@ -285,11 +284,18 @@ def _gap_audit(
         )
         for timestamp in timestamps
     ]
+
+
+def _gap_audit(
+    timestamps: Sequence[str], minutes: int,
+    calendar: SessionCalendar | None = None,
+) -> tuple[int, dict[str, object]]:
+    observed = _observed_bars(timestamps)
     selected, sessions, gaps = scan_regular_bars(observed, minutes, calendar)
     if len(selected) != len(observed):
         raise ValueError("audited CSV contains non-regular bars")
     return sessions, {
-        "scope": GAP_SCOPE,
+        "scope": INTERNAL_GAP_SCOPE,
         "affected_sessions": len({gap["session"] for gap in gaps}),
         "internal_gap_count": len(gaps),
         "internal_missing_bins": sum(
@@ -297,6 +303,20 @@ def _gap_audit(
         ),
         "gaps": gaps,
     }
+
+
+def _session_audit(
+    timestamps: Sequence[str],
+    minutes: int,
+    calendar: SessionCalendar,
+    start: date,
+    end: date,
+) -> tuple[int, dict[str, object]]:
+    audit = session_grid_audit(
+        _observed_bars(timestamps), minutes, calendar, start, end,
+    )
+    sessions = int(audit["expected_sessions"]) - len(audit["missing_sessions"])
+    return sessions, audit
 
 
 def validate_fetch(
@@ -311,11 +331,19 @@ def validate_fetch(
     version = value.get("fetch_schema")
     if version is not None and (
         type(version) is not int or
-        version not in (PREVIOUS_FETCH_SCHEMA, FETCH_SCHEMA)
+        version not in (
+            PREVIOUS_FETCH_SCHEMA, CALENDAR_FETCH_SCHEMA, FETCH_SCHEMA,
+        )
     ):
         raise ValueError("fetch report fields are invalid")
     audited = version is not None
-    calendar_aware = version == FETCH_SCHEMA
+    calendar_aware = version in (CALENDAR_FETCH_SCHEMA, FETCH_SCHEMA)
+    session_aware = version == FETCH_SCHEMA
+    audit_field = (
+        "session_audit" if session_aware
+        else "gap_audit" if audited
+        else None
+    )
     expected_fields = legacy_fields | (
         {"fetch_schema", "gap_policy"} if audited else set()
     ) | ({"session_calendar"} if calendar_aware else set())
@@ -325,7 +353,9 @@ def validate_fetch(
     calendar = None
     if calendar_aware:
         if calendar_input is None:
-            raise ValueError("schema-3 fetch requires a session calendar")
+            raise ValueError(
+                f"schema-{version} fetch requires a session calendar"
+            )
         calendar = SessionCalendar.read(calendar_input.snapshot)
         if manifest.start < calendar.start or manifest.end > calendar.end or \
            value["session_calendar"] != {
@@ -394,7 +424,7 @@ def validate_fetch(
         series_bars = bars[spec.ticker]
         csv_fields = {
             "path", "rows", "sessions", "source_rows", "sha256",
-        } | ({"gap_audit"} if audited else set())
+        } | ({audit_field} if audit_field is not None else set())
         if record["reference"] != reference or record["aggregate"] != aggregate or \
            not isinstance(csv, dict) or set(csv) != csv_fields or \
            csv["path"] != series_bars.path or \
@@ -404,18 +434,26 @@ def validate_fetch(
            _integer(csv["source_rows"], "CSV source rows", 1) < csv["rows"]:
             raise ValueError("fetch request or CSV contract is invalid")
         if audited:
-            sessions, audit = _gap_audit(
-                series_bars.timestamps, manifest.interval_minutes, calendar,
+            sessions, audit = (
+                _session_audit(
+                    series_bars.timestamps, manifest.interval_minutes,
+                    calendar, manifest.start, manifest.end,
+                )
+                if session_aware and calendar is not None else
+                _gap_audit(
+                    series_bars.timestamps, manifest.interval_minutes,
+                    calendar,
+                )
             )
             supplied = json.dumps(
-                csv["gap_audit"], allow_nan=False,
+                csv[audit_field], allow_nan=False,
                 separators=(",", ":"), sort_keys=True,
             )
             expected = json.dumps(
                 audit, allow_nan=False, separators=(",", ":"), sort_keys=True,
             )
             if csv["sessions"] != sessions or supplied != expected:
-                raise ValueError("fetch gap audit does not match its CSV")
+                raise ValueError("fetch audit does not match its CSV")
 
 
 def _expected_empty_summary() -> dict[str, object]:

@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.fetch_massive import (
     API_HOST, TICKER, Requester, aggregate_url, api_key, authorized_url,
-    fetch_bars, request_gate, request_json, scan_regular_bars, write_csv,
+    fetch_bars, request_gate, request_json, scan_regular_bars,
+    session_grid_audit, write_csv,
 )
 from tools.files import file_sha256, freeze_inputs, write_json
 from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
@@ -29,10 +30,10 @@ MANIFEST_FIELDS = {
     "interval_minutes", "adjusted", "session", "series",
 }
 SERIES_FIELDS = {"ticker", "stratum"}
-FETCH_SCHEMA = 3
+FETCH_SCHEMA = 4
+CALENDAR_FETCH_SCHEMA = 3
 PREVIOUS_FETCH_SCHEMA = 2
 GAP_POLICY = "retain-observed-bars"
-GAP_SCOPE = "internal-between-observed-bars"
 
 
 def _ticker_valid(value: object) -> bool:
@@ -292,8 +293,12 @@ def fetch_universe(
             )
             aggregate_contract = _contract(aggregate)
             source = fetch_bars(aggregate, secret, item.ticker, transport)
-            bars, sessions, gaps = scan_regular_bars(
+            bars, sessions, _ = scan_regular_bars(
                 source, manifest.interval_minutes, calendar,
+            )
+            audit = session_grid_audit(
+                bars, manifest.interval_minutes, calendar,
+                manifest.start, manifest.end,
             )
             write_csv(path, bars)
             rows = len(read_csv(path)) // FEATURE_COUNT
@@ -309,17 +314,7 @@ def fetch_universe(
                     "rows": rows,
                     "sessions": sessions,
                     "source_rows": len(source),
-                    "gap_audit": {
-                        "scope": GAP_SCOPE,
-                        "affected_sessions": len({
-                            gap["session"] for gap in gaps
-                        }),
-                        "internal_gap_count": len(gaps),
-                        "internal_missing_bins": sum(
-                            int(gap["absent_bins"]) for gap in gaps
-                        ),
-                        "gaps": gaps,
-                    },
+                    "session_audit": audit,
                     "sha256": file_sha256(path),
                 },
             })

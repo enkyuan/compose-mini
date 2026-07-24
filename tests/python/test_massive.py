@@ -26,7 +26,8 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import FEATURE_COUNT, read_bars, read_csv
 from tools.fetch_massive import (
     aggregate_url, api_key, authorized_url, fetch_bars, regular_bars,
-    request_gate, request_json, scan_regular_bars, write_csv,
+    request_gate, request_json, scan_regular_bars, session_grid_audit,
+    write_csv,
 )
 from tools.fetch_universe import (
     SeriesSpec, UniverseManifest, fetch_universe, parse_args as universe_args,
@@ -2434,7 +2435,7 @@ def test_universe_fetch(directory: Path) -> None:
         "eligibility_date", "start", "end", "interval_minutes", "adjusted",
         "session", "gap_policy", "manifest", "session_calendar", "series",
     }
-    assert report["fetch_schema"] == 3
+    assert report["fetch_schema"] == 4
     assert report["manifest"] == {
         "path": str(manifest_path),
         "sha256": hashlib.sha256(frozen_bytes).hexdigest(),
@@ -2470,15 +2471,41 @@ def test_universe_fetch(directory: Path) -> None:
         )
         csv = item["csv"]
         path = Path(csv["path"])
-        assert csv == {
+        audit = csv["session_audit"]
+        assert {name: value for name, value in csv.items()
+                if name != "session_audit"} == {
             "path": str(resolved_output / f"{ticker.lower()}-30m.csv"),
             "rows": 1, "sessions": 1, "source_rows": 1,
-            "gap_audit": {
-                "scope": "internal-between-observed-bars",
-                "affected_sessions": 0, "internal_gap_count": 0,
-                "internal_missing_bins": 0, "gaps": [],
-            },
             "sha256": file_sha256(path),
+        }
+        assert {
+            name: audit[name] for name in (
+                "scope", "expected_sessions", "affected_sessions",
+                "expected_bins", "missing_bins",
+            )
+        } == {
+            "scope": "all-expected-session-bins",
+            "expected_sessions": 428,
+            "affected_sessions": 428,
+            "expected_bins": 5_534,
+            "missing_bins": 5_533,
+        }
+        assert len(audit["missing_sessions"]) == 427
+        assert audit["missing_sessions"][0] == "2024-11-04"
+        assert audit["missing_sessions"][-1] == "2026-07-21"
+        assert len(audit["ranges"]) == 428
+        assert sum(item["absent_bins"] for item in audit["ranges"]) == 5_533
+        assert audit["ranges"][0] == {
+            "session": "2024-11-01",
+            "start_timestamp": "2024-11-01T14:00:00Z",
+            "end_timestamp": "2024-11-01T20:00:00Z",
+            "absent_bins": 12,
+        }
+        assert audit["ranges"][-1] == {
+            "session": "2026-07-21",
+            "start_timestamp": "2026-07-21T13:30:00Z",
+            "end_timestamp": "2026-07-21T20:00:00Z",
+            "absent_bins": 13,
         }
         assert len(read_csv(path)) == FEATURE_COUNT
 
@@ -2527,6 +2554,7 @@ def test_observed_bar_gaps(directory: Path) -> None:
     manifest = directory / "gap-manifest.json"
     value = manifest_value()
     value["series"] = [{"ticker": "AAPL", "stratum": "generic"}]
+    value["end"] = "2024-11-04"
     write_manifest(manifest, value)
     results = [
         aggregate("2024-11-01T13:00:00+00:00", 99.0),
@@ -2593,15 +2621,48 @@ def test_observed_bar_gaps(directory: Path) -> None:
     report = fetch_universe(
         manifest, output, report_path, key="fake-secret", requester=request,
     )
-    assert report["fetch_schema"] == 3
+    assert report["fetch_schema"] == 4
     assert report["gap_policy"] == "retain-observed-bars"
     csv = report["series"][0]["csv"]
-    assert csv["gap_audit"] == {
-        "scope": "internal-between-observed-bars",
+    assert csv["session_audit"] == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 2,
         "affected_sessions": 2,
-        "internal_gap_count": 3,
-        "internal_missing_bins": 5,
-        "gaps": gaps,
+        "missing_sessions": [],
+        "expected_bins": 26,
+        "missing_bins": 21,
+        "ranges": [
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T14:00:00Z",
+                "end_timestamp": "2024-11-01T14:30:00Z",
+                "absent_bins": 1,
+            },
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T15:00:00Z",
+                "end_timestamp": "2024-11-01T16:00:00Z",
+                "absent_bins": 2,
+            },
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T16:30:00Z",
+                "end_timestamp": "2024-11-01T20:00:00Z",
+                "absent_bins": 7,
+            },
+            {
+                "session": "2024-11-04",
+                "start_timestamp": "2024-11-04T15:00:00Z",
+                "end_timestamp": "2024-11-04T16:00:00Z",
+                "absent_bins": 2,
+            },
+            {
+                "session": "2024-11-04",
+                "start_timestamp": "2024-11-04T16:30:00Z",
+                "end_timestamp": "2024-11-04T21:00:00Z",
+                "absent_bins": 9,
+            },
+        ],
     }
     timestamps_, values = read_bars(Path(csv["path"]))
     assert timestamps_ == (
@@ -2615,6 +2676,107 @@ def test_observed_bar_gaps(directory: Path) -> None:
         for value in (close - 0.25, close + 0.5, close - 0.5, close, 1000.0)
     )
     assert tuple(values) == expected
+
+
+def test_session_grid_audit() -> None:
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    observed = [
+        (
+            timestamp(value), 100.0, 100.0, 100.0, 100.0, 1.0,
+        )
+        for value in (
+            "2024-11-01T14:00:00+00:00",
+            "2024-11-01T15:00:00+00:00",
+        )
+    ]
+    audit = session_grid_audit(
+        observed, 30, calendar, date(2024, 11, 1), date(2024, 11, 4),
+    )
+    assert audit == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 2,
+        "affected_sessions": 2,
+        "missing_sessions": ["2024-11-04"],
+        "expected_bins": 26,
+        "missing_bins": 24,
+        "ranges": [
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T13:30:00Z",
+                "end_timestamp": "2024-11-01T14:00:00Z",
+                "absent_bins": 1,
+            },
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T14:30:00Z",
+                "end_timestamp": "2024-11-01T15:00:00Z",
+                "absent_bins": 1,
+            },
+            {
+                "session": "2024-11-01",
+                "start_timestamp": "2024-11-01T15:30:00Z",
+                "end_timestamp": "2024-11-01T20:00:00Z",
+                "absent_bins": 9,
+            },
+            {
+                "session": "2024-11-04",
+                "start_timestamp": "2024-11-04T14:30:00Z",
+                "end_timestamp": "2024-11-04T21:00:00Z",
+                "absent_bins": 13,
+            },
+        ],
+    }
+    assert session_grid_audit(
+        (), 30, calendar, date(2024, 11, 29), date(2024, 11, 29),
+    ) == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 1,
+        "affected_sessions": 1,
+        "missing_sessions": ["2024-11-29"],
+        "expected_bins": 7,
+        "missing_bins": 7,
+        "ranges": [{
+            "session": "2024-11-29",
+            "start_timestamp": "2024-11-29T14:30:00Z",
+            "end_timestamp": "2024-11-29T18:00:00Z",
+            "absent_bins": 7,
+        }],
+    }
+    outside = [
+        (
+            timestamp("2024-11-05T14:30:00+00:00"),
+            100.0, 100.0, 100.0, 100.0, 1.0,
+        )
+    ]
+    assert str(raises(
+        ValueError, session_grid_audit,
+        outside, 30, calendar, date(2024, 11, 1), date(2024, 11, 4),
+    )) == "observed bar is outside the requested session grid"
+    assert str(raises(
+        ValueError, session_grid_audit,
+        [observed[0], observed[0]], 30, calendar,
+        date(2024, 11, 1), date(2024, 11, 4),
+    )) == "observed session-grid starts are not unique"
+    for minutes in (True, 0, 60):
+        raises(
+            ValueError, session_grid_audit,
+            (), minutes, calendar, date(2024, 11, 1), date(2024, 11, 4),
+        )
+    short = SessionCalendar(
+        date(2024, 11, 1), date(2024, 11, 1), 570, 960,
+        ("XNAS", "XNYS"), (), ((date(2024, 11, 1), 580),),
+    )
+    assert session_grid_audit(
+        (), 30, short, short.start, short.end,
+    ) == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 0,
+        "affected_sessions": 0,
+        "missing_sessions": [],
+        "expected_bins": 0,
+        "missing_bins": 0,
+        "ranges": [],
+    }
 
 
 def test_calendar_filtering() -> None:
@@ -2942,6 +3104,7 @@ def main() -> None:
         test_rate_validation(directory)
         test_universe_fetch(directory)
         test_observed_bar_gaps(directory)
+        test_session_grid_audit()
         test_calendar_filtering()
         test_universe_pagination_gate(directory)
         test_reference_identity(directory)

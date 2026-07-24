@@ -64,10 +64,12 @@ For this benchmark:
 
 - retain strictly ordered, aligned regular-session bars that Massive observed;
 - never synthesize, forward-fill, or interpolate OHLCV;
-- record every missing internal interval and affected session in the fetch
-  report;
-- define `t+1` and `t+13` over the next observed bars, so the entry price
-  remains executable;
+- record every missing expected interval, including leading, trailing, and
+  wholly missing sessions, in the fetch report;
+- treat a missing aggregate as ambiguous among no qualifying trade, a halt,
+  provider omission, and pre-listing;
+- define `t+k` over expected exchange-session bins and form a sample only when
+  its complete lookback, entry, and target grid is observed;
 - report the elapsed-time distribution from `as_of` to `target_time` by stock;
 - support unequal row counts and timestamp grids in shared training;
 - align paired comparisons by exact target timestamp.
@@ -252,7 +254,7 @@ per-stock `$100` replays are diagnostics, not one deployable portfolio.
 
 ---
 
-## Task 1: Support audited observed-bar gaps
+## Task 1: Audit the full expected session grid
 
 **Files:**
 
@@ -260,28 +262,29 @@ per-stock `$100` replays are diagnostics, not one deployable portfolio.
 - Modify: `tools/fetch_universe.py`
 - Modify: `tests/python/test_massive.py`
 
-### Step 1: Add failing gap-audit tests
+### Step 1: Add failing session-audit tests
 
 Require:
 
 - the existing single-ticker strict mode still rejects an internal gap;
 - universe mode retains only observed regular-session bars;
 - no synthetic timestamp or OHLCV row is created;
-- each gap records its session, left timestamp, right timestamp, and number of
-  absent bins;
-- gap counts and affected-session counts are exact and deterministic;
+- leading, internal, trailing, and wholly missing session bins appear in
+  maximal, end-exclusive ranges;
+- expected, missing, affected-session, and whole-session counts are exact;
+- daylight-saving offsets and early closes produce exact UTC boundaries;
 - misaligned, duplicated, reversed, pre-market, or after-hours bars still
   fail or filter exactly as before;
 - the fetch report binds the explicit `retain-observed-bars` policy and exact
-  gap audit;
-- a gap-audit mutation invalidates analysis provenance.
+  schema-4 session audit;
+- any session-audit mutation invalidates analysis provenance.
 
 ### Step 2: Implement one shared session scanner
 
-Scan and validate regular-session bars once. Keep strict rejection as the
-default for `tools/fetch_massive.py`. Let `tools/fetch_universe.py` request the
-audited observed-bar result explicitly. Do not duplicate timezone, session, or
-gap arithmetic between the two callers.
+Scan and validate regular-session bars once. Compare selected starts with the
+frozen calendar's complete manifest-range grid. Keep strict rejection as the
+default for `tools/fetch_massive.py`; do not duplicate timezone, session, or
+grid arithmetic between producers and validators.
 
 ### Step 3: Run focused and aggregate tests
 
@@ -332,7 +335,9 @@ Require:
 - every recorded CSV hash and row count matches;
 - all timestamps are strictly chronological;
 - no timestamp duplication;
-- every internal gap appears in the bound audit;
+- every missing expected bin appears in the bound schema-4 audit;
+- audit rows, sessions, missing sessions, and range totals satisfy their exact
+  integer invariants;
 - elapsed horizon durations are finite and ordered;
 - train, calibration, and reserved-test blocks remain nonempty after embargo;
 - no API key byte sequence appears in the output directory or report.

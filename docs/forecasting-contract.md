@@ -47,6 +47,12 @@ non-finite values, non-positive closes, non-increasing time, and requests whose
 interval, feature order, or dimensions do not match the artifact. The artifact
 fixes the forecast horizon; callers do not change it.
 
+Fetch schema 4 audits every expected session bin, including leading, trailing,
+and wholly missing sessions, without filling any bar. That audit is provenance,
+not permission to use row offsets as elapsed time: a training sample must still
+prove its complete lookback, entry, and target grid or explicitly mask the
+missing bins.
+
 `DataSet` stores each scaled row, raw close, and timestamp once. Overlapping
 windows borrow row offsets, so input memory remains O(N) instead of
 O(N * seq_len).
