@@ -34,8 +34,10 @@ EXPECTED_MISSING = (
     ("calibration", ("ALTR", "ZI", "FYBR", "INFA")),
 )
 EXPECTED_FIT_COUNT = 1_215
+EXPECTED_PREDICTION_RECORDS = 14_216
 COMMANDS = ("validate", "preflight", "calibrate", "analyze")
 OUTPUTS = ("fits", "predictions", "summary", "outcome")
+FINALIZER_PYTHON_FLAGS = ("-I", "-S", "-B")
 POOLED_MODELS = ("global_mlp", "panel_transformer")
 SELECTION_ROOT = Path("reports/universe-selection-20260724-06")
 FETCH_PATH = Path("reports/liquid-common-55-20260724-03-fetch.json")
@@ -79,7 +81,20 @@ EXPECTED_BUDGETS = (
     ("fold-1", UpdateBudget(41_042, 128, 100, 321, 32_100)),
     ("calibration", UpdateBudget(47_092, 128, 100, 368, 36_800)),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EpochBudget:
+    batch_size: int
+    epochs: int
+    patience: int
+
+
+FIXED_EPOCH_BUDGET = EpochBudget(128, 100, 10)
+
+
 SOURCE_PATHS = (
+    "tools/__init__.py",
     "tools/analyze_universe.py",
     "tools/arm_universe_scaling.py",
     "tools/artifact_v1.py",
@@ -103,9 +118,15 @@ SOURCE_PATHS = (
     "tools/universe_scaling_inputs.py",
 )
 FINALIZER_SOURCE_PATHS = (
+    "tools/__init__.py",
+    "tools/chronology.py",
+    "tools/data_v1.py",
     "tools/files.py",
     "tools/finalize_universe_scaling.py",
+    "tools/float32.py",
     "tools/panel_contract.py",
+    "tools/session_calendar.py",
+    "tools/session_samples.py",
     "tools/universe_contract.py",
     "tools/universe_scaling.py",
     "tools/universe_scaling_contract.py",
@@ -133,7 +154,7 @@ def expected_protocol() -> dict[str, object]:
     """Return a fresh copy of the frozen development protocol."""
     return {
         "alignment_horizon_bars": 13,
-        "batch_size": 128,
+        "batch_size": FIXED_EPOCH_BUDGET.batch_size,
         "calendar": {
             "calibration": [[0, 4_393], [4_405, 4_943]],
             "folds": [
@@ -143,13 +164,18 @@ def expected_protocol() -> dict[str, object]:
             "opportunities": 5_505,
             "reserved_test": [4_955, 5_505],
         },
+        "device": "cpu",
         "feature_set": "ohlcv",
+        "finalizer_python_flags": list(FINALIZER_PYTHON_FLAGS),
         "fold_fraction": 0.1,
         "folds": 2,
+        "epochs": FIXED_EPOCH_BUDGET.epochs,
         "history_bars": 17,
         "models": list(MODELS),
         "modes": list(MODES),
+        "patience": FIXED_EPOCH_BUDGET.patience,
         "phases": list(PHASES),
+        "prediction_schema": 2,
         "questions": ["cohort-scaling", "unseen-transfer"],
         "seeds": list(SEEDS),
         "target_horizon_bars": 13,
@@ -211,6 +237,40 @@ class FitJob:
     members: tuple[str, ...]
 
 
+def _validate_fit_job(job: FitJob, master: tuple[str, ...]) -> None:
+    """Reject structurally incompatible fit-axis combinations."""
+    if not isinstance(job, FitJob):
+        raise ValueError("fit job axes are invalid")
+    cohorts = set((*TRAINING_COHORTS, *TRANSFER_COHORTS))
+    cohort = type(job.cohort) is int and job.cohort in cohorts
+    seed = type(job.seed) is int and job.seed in SEEDS
+    pooled = (
+        job.kind == "pooled" and job.mode in MODES and
+        cohort and job.phase in PHASES and
+        job.model in (
+            *POOLED_MODELS,
+            *(("conditioned_panel_transformer",)
+              if job.cohort in TRAINING_COHORTS else ()),
+        ) and seed and
+        job.members == master[:job.cohort]
+    )
+    ridge = (
+        job.kind == "ridge" and job.mode is None and
+        cohort and job.phase in PHASES and
+        job.model == "global_ridge" and job.seed is None and
+        job.members == master[:job.cohort]
+    )
+    local = (
+        job.kind == "local" and job.mode is None and
+        job.cohort is None and job.phase in PHASES and
+        job.model == "local_transformer" and seed and
+        type(job.members) is tuple and len(job.members) == 1 and
+        job.members[0] in master
+    )
+    if not (pooled or ridge or local):
+        raise ValueError("fit job axes are invalid")
+
+
 def _master_names(master: Sequence[str]) -> tuple[str, ...]:
     names = tuple(master)
     if len(names) != 55 or len(set(names)) != len(names) or any(
@@ -220,24 +280,31 @@ def _master_names(master: Sequence[str]) -> tuple[str, ...]:
     return names
 
 
+def _phase_evaluable(
+    master: Sequence[str], evaluable: Mapping[str, Sequence[str]],
+) -> dict[str, tuple[str, ...]]:
+    if set(evaluable) != set(PHASES):
+        raise ValueError("scaling coverage phases are invalid")
+    master_set = set(master)
+    coverage = {}
+    for phase in PHASES:
+        members = tuple(evaluable[phase])
+        member_set = set(members)
+        if not member_set <= master_set or members != tuple(
+            name for name in master if name in member_set
+        ):
+            raise ValueError("phase coverage must be an ordered master subset")
+        coverage[phase] = members
+    return coverage
+
+
 def expected_fit_jobs(
     master: Sequence[str],
     evaluable: Mapping[str, Sequence[str]],
 ) -> tuple[FitJob, ...]:
     """Return each physical development fit exactly once."""
     names = _master_names(master)
-    if set(evaluable) != set(PHASES):
-        raise ValueError("scaling coverage phases are invalid")
-    master_set = set(names)
-    coverage = {}
-    for phase in PHASES:
-        members = tuple(evaluable[phase])
-        member_set = set(members)
-        if not member_set <= master_set or members != tuple(
-            name for name in names if name in member_set
-        ):
-            raise ValueError("phase coverage must be an ordered master subset")
-        coverage[phase] = members
+    coverage = _phase_evaluable(names, evaluable)
     if any(
         not set(names[:11]) <= set(coverage[phase]) for phase in PHASES
     ) or not set(names[44:]) <= set(coverage["calibration"]):
@@ -279,11 +346,10 @@ def expected_fit_jobs(
 def question_uses(
     job: FitJob, master: Sequence[str],
 ) -> tuple[tuple[str, int], ...]:
-    """Return question/cohort views that may reference one physical fit."""
+    """Return question/cohort views compatible with one fit identity."""
     names = _master_names(master)
+    _validate_fit_job(job, names)
     if job.kind == "local":
-        if len(job.members) != 1 or job.members[0] not in names:
-            raise ValueError("local fit member is invalid")
         rank = names.index(job.members[0]) + 1
         uses = tuple(
             ("cohort-scaling", cohort)
@@ -295,8 +361,6 @@ def question_uses(
                 for cohort in TRANSFER_COHORTS
             ) if rank in UNSEEN_RANKS else ()
         )
-    if job.kind not in ("pooled", "ridge") or job.cohort is None:
-        raise ValueError("fit job kind is invalid")
     uses = (
         (("cohort-scaling", job.cohort),)
         if job.cohort in TRAINING_COHORTS else ()
@@ -305,6 +369,31 @@ def question_uses(
        job.cohort in TRANSFER_COHORTS:
         uses += (("unseen-transfer", job.cohort),)
     return uses
+
+
+def required_prediction_series(
+    job: FitJob, master: Sequence[str],
+    evaluable: Mapping[str, Sequence[str]],
+) -> tuple[str, ...]:
+    """Return master-ordered physical prediction destinations for one fit."""
+    names = _master_names(master)
+    coverage = _phase_evaluable(names, evaluable)
+    uses = question_uses(job, names)
+    phase_members = coverage[job.phase]
+    if job.kind == "local":
+        return (
+            (job.members[0],) if job.members[0] in phase_members else ()
+        )
+
+    destinations = set()
+    for question, cohort in uses:
+        destinations.update(
+            names[:cohort] if question == "cohort-scaling" else
+            (names[rank - 1] for rank in UNSEEN_RANKS)
+        )
+    return tuple(
+        name for name in phase_members if name in destinations
+    )
 
 
 @dataclass(frozen=True, slots=True)

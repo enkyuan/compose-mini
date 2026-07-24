@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """Verify the immutable development-only universe-scaling contract."""
 
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import ExitStack
 from copy import deepcopy
+from dataclasses import asdict
+from datetime import date, timedelta
+from math import inf, log, nextafter
 from pathlib import Path
+from statistics import fmean
+import base64
 import hashlib
 import json
+import os
+import shutil
+import struct
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -14,17 +25,29 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.universe_scaling_contract import (
-    CALENDAR_SHA256, CONFIG_SHA256, CSV_ROOT, EXPECTED_BUDGETS, FETCH_PATH,
-    FETCH_SHA256, FINALIZER_SOURCE_PATHS, MANIFEST_BINDINGS, PHASES,
-    SELECTION_FILES, SELECTION_SHA256, SOURCE_PATHS, FitJob, ScalingAttempt,
+    CALENDAR_SHA256, CONFIG_SHA256, CSV_ROOT, EXPECTED_BUDGETS,
+    EXPECTED_FIT_COUNT, EXPECTED_MISSING, EXPECTED_PREDICTION_RECORDS,
+    FETCH_PATH, FETCH_SHA256, FINALIZER_PYTHON_FLAGS,
+    FINALIZER_SOURCE_PATHS, FIXED_EPOCH_BUDGET, MANIFEST_BINDINGS, PHASES,
+    SEEDS, SELECTION_FILES, SELECTION_SHA256, SOURCE_PATHS, FitJob,
+    PhaseCoverage, ScalingAttempt, ScalingCoverage, SeriesCoverage,
     expected_fit_jobs, expected_protocol, expected_scaling_commands,
-    question_uses,
+    question_uses, required_prediction_series, timestamp_grid_sha256,
 )
 from tools.universe_scaling_inputs import (
-    ScalingCoverage, common_coverage, fetch_series, selection_binding,
-    selection_paths,
+    common_coverage, fetch_series, selection_binding, selection_paths,
 )
+from tools.float32 import decode_f32le_base64, encode_f32le_base64
+import tools.finalize_universe_scaling as finalizer
+from tools.finalize_universe_scaling import (
+    MarketTruth, PredictionTruth, _gate_results, _transition,
+    build_development_summary, fit_provenance_id,
+    validate_fit_ledger, validate_prediction_ledger,
+)
+from tools.universe_scaling import ForecastPoint, paired_comparison
 from tools.universe_contract import PackedRows
+from tools.session_samples import SampleRows, SessionSamples
+import tools.files as file_tools
 
 
 def sha256(index: int) -> str:
@@ -53,6 +76,63 @@ def executable(path: str, index: int) -> dict[str, str]:
     return binding(path, sha256(index)) | {"version": f"runtime {index}"}
 
 
+def synthetic_master() -> tuple[str, ...]:
+    names = [f"S{index:02d}" for index in range(55)]
+    for index, name in (
+        (14, "ALTR"), (28, "ZI"), (32, "FYBR"), (39, "INFA"),
+    ):
+        names[index] = name
+    return tuple(names)
+
+
+def synthetic_coverage(names: tuple[str, ...]) -> ScalingCoverage:
+    missing = {
+        "fold-0": {"ALTR", "ZI"},
+        "fold-1": {"ALTR", "ZI", "INFA"},
+        "calibration": {"ALTR", "ZI", "FYBR", "INFA"},
+    }
+    timestamps = (
+        "2026-01-01T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+        "2026-01-03T00:00:00Z",
+    )
+    phases = []
+    for phase, budget in EXPECTED_BUDGETS:
+        base, remainder = divmod(budget.control_samples, 11)
+        series = []
+        for index, name in enumerate(names):
+            validation = int(name not in missing[phase])
+            train = (
+                base + int(index < remainder) if index < 11 else
+                100 + index
+            )
+            series.append(SeriesCoverage(
+                name, train, validation,
+                timestamp_grid_sha256((timestamps,))
+                if validation else timestamp_grid_sha256(()),
+            ))
+        phases.append(PhaseCoverage(phase, tuple(series)))
+    return ScalingCoverage(tuple(phases))
+
+
+def coverage_value(coverage: ScalingCoverage) -> list[dict[str, object]]:
+    return [
+        {
+            "phase": phase.phase,
+            "series": [
+                {
+                    "series": item.series,
+                    "train_rows": item.train_rows,
+                    "validation_rows": item.validation_rows,
+                    "timestamp_sha256": item.timestamp_sha256,
+                }
+                for item in phase.series
+            ],
+        }
+        for phase in coverage.phases
+    ]
+
+
 def write_json(path: Path, value: object) -> None:
     path.write_text(
         json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n",
@@ -70,6 +150,7 @@ def attempt_value(repository_root: str) -> dict[str, object]:
         "outcome": "experiments/universe-scaling-run-outcome.json",
     }
     torch_python = executable("/runtime/torch-python", 9_001)
+    coverage = synthetic_coverage(synthetic_master())
     return {
         "attempt_path": attempt_path,
         "budgets": [
@@ -92,6 +173,7 @@ def attempt_value(repository_root: str) -> dict[str, object]:
         "config": binding(
             "experiments/executable-h13-universe.example.json", CONFIG_SHA256,
         ),
+        "coverage": coverage_value(coverage),
         "environment": {
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPYCACHEPREFIX": f"{run_dir}/.pycache",
@@ -216,13 +298,28 @@ def verify_attempt() -> None:
         else:
             raise AssertionError("nested parsed protocol is mutable")
         protocol = expected_protocol()
+        assert (
+            protocol["batch_size"], protocol["epochs"], protocol["patience"],
+        ) == (
+            FIXED_EPOCH_BUDGET.batch_size, FIXED_EPOCH_BUDGET.epochs,
+            FIXED_EPOCH_BUDGET.patience,
+        )
+        assert protocol["finalizer_python_flags"] == \
+            list(FINALIZER_PYTHON_FLAGS) == ["-I", "-S", "-B"]
+        assert finalizer._BOOTSTRAP_PYTHON_FLAGS == FINALIZER_PYTHON_FLAGS
         protocol["models"].clear()
         assert expected_protocol()["models"]
+        assert "tools/__init__.py" in SOURCE_PATHS
+        assert "tools/__init__.py" in FINALIZER_SOURCE_PATHS
         assert {
             "tools/analyze_universe.py",
             "tools/arm_universe_scaling.py",
         } <= set(SOURCE_PATHS)
-        assert "tools/universe_contract.py" in FINALIZER_SOURCE_PATHS
+        assert {
+            "tools/chronology.py", "tools/data_v1.py",
+            "tools/session_calendar.py", "tools/session_samples.py",
+            "tools/universe_contract.py",
+        } <= set(FINALIZER_SOURCE_PATHS)
 
         mutations = []
         for label, mutate in (
@@ -338,6 +435,293 @@ def verify_attempt() -> None:
             raise AssertionError("duplicate attempt field was accepted")
 
 
+def verify_isolated_startup() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-isolation-",
+    ) as directory_name:
+        directory = Path(directory_name)
+
+        def copy_repository(name: str) -> Path:
+            repository = directory / name
+            shutil.copytree(
+                ROOT / "tools", repository / "tools",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            return repository
+
+        environment = {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(directory),
+            "PYTHONPYCACHEPREFIX": str(directory / "forged-cache"),
+            "TMPDIR": str(directory / "private-tmp"),
+        }
+
+        def run(repository: Path, *flags: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                (
+                    sys.executable, *flags,
+                    str(repository / "tools/finalize_universe_scaling.py"),
+                    "--help",
+                ),
+                cwd=repository,
+                env=environment,
+                capture_output=True, text=True, check=False,
+            )
+
+        repository = copy_repository("repository")
+        (directory / "private-tmp").mkdir()
+        markers = (
+            repository / "tools-statistics-ran",
+            repository / "root-statistics-ran",
+            repository / "forged-pyc-ran",
+        )
+        for module, marker in (
+            (repository / "tools" / "statistics.py", markers[0]),
+            (repository / "statistics.py", markers[1]),
+        ):
+            module.write_text(
+                f"open({str(marker)!r}, 'w').write('ran')\n"
+                "def fmean(values):\n"
+                "    return 0.0\n",
+                encoding="ascii",
+            )
+        source = repository / "tools/files.py"
+        malicious = directory / "malicious-files.py"
+        payload = (
+            f"open({str(markers[2])!r}, 'w').write('ran')\n"
+            "raise RuntimeError('forged cache executed')\n"
+        ).encode("ascii")
+        payload += b"#" * (source.stat().st_size - len(payload))
+        malicious.write_bytes(payload)
+        os.utime(malicious, (int(source.stat().st_mtime),) * 2)
+        cache = repository / "tools/__pycache__" / (
+            f"files.{sys.implementation.cache_tag}.pyc"
+        )
+        cache.parent.mkdir()
+        import py_compile
+        py_compile.compile(
+            str(malicious), cfile=str(cache), dfile=str(source), doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+        )
+        assert int.from_bytes(cache.read_bytes()[8:12], "little") == \
+            int(source.stat().st_mtime)
+        assert int.from_bytes(cache.read_bytes()[12:16], "little") == \
+            source.stat().st_size
+        before = tuple(sorted(
+            path.relative_to(repository)
+            for path in repository.rglob("*")
+        ))
+
+        unisolated = run(repository)
+        assert unisolated.returncode != 0
+        assert "isolated" in unisolated.stderr.lower()
+        assert not any(path.exists() for path in markers)
+
+        isolated = run(repository, *FINALIZER_PYTHON_FLAGS)
+        assert isolated.returncode == 0, isolated.stderr
+        assert "usage:" in isolated.stdout
+        assert not any(path.exists() for path in markers)
+        optimized = run(repository, *FINALIZER_PYTHON_FLAGS, "-O")
+        assert optimized.returncode != 0
+        assert "launch" in optimized.stderr.lower()
+        after = tuple(sorted(
+            path.relative_to(repository)
+            for path in repository.rglob("*")
+        ))
+        assert before == after, (
+            set(after) - set(before), set(before) - set(after),
+        )
+        assert not tuple((directory / "private-tmp").iterdir())
+
+        import_repository = copy_repository("isolated-import")
+        import_code = (
+            f"import sys;sys.path.append({str(import_repository)!r});"
+            "import tools.finalize_universe_scaling as finalizer;"
+            "assert callable(finalizer.analyze_ledgers)"
+        )
+        imported = subprocess.run(
+            (sys.executable, *FINALIZER_PYTHON_FLAGS, "-c", import_code),
+            cwd=import_repository, capture_output=True, text=True, check=False,
+        )
+        assert imported.returncode == 0, imported.stderr
+        skipped = subprocess.run(
+            (
+                sys.executable, *FINALIZER_PYTHON_FLAGS, "-c",
+                import_code +
+                ";from pathlib import Path;"
+                "finalizer.finalize("
+                "Path('missing-attempt'),Path('missing-outcome'),"
+                "'2026-07-24T00:00:00Z','2026-07-24T00:00:01Z',"
+                "'setup',2,'setup-failure')",
+            ),
+            cwd=import_repository, capture_output=True, text=True, check=False,
+        )
+        assert skipped.returncode != 0
+        assert "bootstrap" in skipped.stderr.lower()
+
+        forged_prefix = str(directory / "forged-finalizer-cache")
+        script = import_repository / "tools/finalize_universe_scaling.py"
+        forged_argv = (
+            str(script), "missing-attempt", "missing-outcome",
+            "--started", "2026-07-24T00:00:00Z",
+            "--ended", "2026-07-24T00:00:01Z",
+            "--stage", "setup", "--exit", "2",
+            "--status", "setup-failure",
+        )
+        forged = subprocess.run(
+            (
+                sys.executable, *FINALIZER_PYTHON_FLAGS, "-c",
+                import_code +
+                f";finalizer._BOOTSTRAP_CACHE_PREFIX={forged_prefix!r}"
+                f";sys.pycache_prefix={forged_prefix!r}"
+                f";sys.argv={list(forged_argv)!r}"
+                ";sys.orig_argv=[sys.executable,'-I','-S','-B',*sys.argv]"
+                ";from pathlib import Path"
+                ";finalizer.finalize("
+                "Path('missing-attempt'),Path('missing-outcome'),"
+                "'2026-07-24T00:00:00Z','2026-07-24T00:00:01Z',"
+                "'setup',2,'setup-failure')",
+            ),
+            cwd=import_repository, capture_output=True, text=True,
+            check=False,
+        )
+        assert forged.returncode != 0
+        assert "launch" in forged.stderr.lower(), forged.stderr
+
+        foreign = directory / "foreign/tools"
+        foreign.mkdir(parents=True)
+        marker = directory / "foreign-tools-ran"
+        (foreign / "__init__.py").write_text(
+            f"open({str(marker)!r}, 'w').write('ran')\n",
+            encoding="ascii",
+        )
+        script = repository / "tools/finalize_universe_scaling.py"
+        runpy_code = (
+            "import runpy,sys;"
+            f"sys.argv=[{str(script)!r},'--help'];"
+            f"runpy.run_path({str(script)!r},run_name='__main__')"
+        )
+        rejected = subprocess.run(
+            (
+                sys.executable, *FINALIZER_PYTHON_FLAGS,
+                "-c", runpy_code,
+            ),
+            cwd=repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert rejected.returncode != 0
+        assert "launch" in rejected.stderr.lower()
+
+        preloaded_ctypes = subprocess.run(
+            (
+                sys.executable, *FINALIZER_PYTHON_FLAGS, "-c",
+                "import ctypes,runpy,sys;"
+                f"sys.argv=[{str(script)!r},'--help'];"
+                f"runpy.run_path({str(script)!r},run_name='__main__')",
+            ),
+            cwd=repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert preloaded_ctypes.returncode != 0
+        assert "inspection" in preloaded_ctypes.stderr.lower()
+
+        code = (
+            f"import sys;sys.path.append({str(import_repository)!r});"
+            "import tools.finalize_universe_scaling as finalizer;"
+            "[sys.modules.pop(name) for name in tuple(sys.modules) "
+            "if name=='tools' or name.startswith('tools.')];"
+            f"sys.path.insert(0,{str(foreign.parent)!r});"
+            "finalizer._bootstrap_main()"
+        )
+        rejected = subprocess.run(
+            (sys.executable, *FINALIZER_PYTHON_FLAGS, "-c", code),
+            cwd=import_repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert rejected.returncode != 0
+        assert "namespace" in rejected.stderr.lower(), rejected.stderr
+        assert not marker.exists()
+
+        marker = directory / "spoofed-original-argv-ran"
+        code = (
+            "import runpy,sys,types;"
+            "module=types.ModuleType('tools.files');"
+            "noop=lambda *args,**kwargs:None;"
+            "module.FrozenInput=noop;"
+            "module.freeze_inputs=noop;"
+            "module.verify_frozen=noop;"
+            "module.write_json_exclusive=noop;"
+            f"module.__getattr__=lambda name:"
+            f"(open({str(marker)!r},'w').write(name),noop)[1];"
+            "sys.modules['tools.files']=module;"
+            f"sys.argv=[{str(script)!r},'--help'];"
+            "sys.orig_argv=[sys.executable,'-I','-S','-B',*sys.argv];"
+            f"runpy.run_path({str(script)!r},run_name='__main__')"
+        )
+        rejected = subprocess.run(
+            (sys.executable, *FINALIZER_PYTHON_FLAGS, "-c", code),
+            cwd=repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert rejected.returncode != 0
+        assert "launch" in rejected.stderr.lower()
+        assert not marker.exists()
+
+        for injected in ("tools", "tools.files"):
+            marker = directory / f"preloaded-{injected.replace('.', '-')}-ran"
+            code = (
+                f"import sys;sys.path.append({str(import_repository)!r});"
+                "import tools.finalize_universe_scaling as finalizer;"
+                "[sys.modules.pop(name) for name in tuple(sys.modules) "
+                "if name=='tools' or name.startswith('tools.')];"
+                "import types;module=types.ModuleType('injected');"
+                "noop=lambda *args,**kwargs:None;"
+                "module.FrozenInput=noop;"
+                "module.freeze_inputs=noop;"
+                "module.verify_frozen=noop;"
+                "module.write_json_exclusive=noop;"
+                f"module.__getattr__=lambda name:"
+                f"(open({str(marker)!r},'w').write(name),noop)[1];"
+                f"sys.modules[{injected!r}]=module;"
+                "finalizer._bootstrap_main()"
+            )
+            rejected = subprocess.run(
+                (sys.executable, *FINALIZER_PYTHON_FLAGS, "-c", code),
+                cwd=import_repository, env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            assert rejected.returncode != 0
+            assert "namespace" in rejected.stderr.lower()
+            assert not marker.exists()
+
+        package_repository = copy_repository("package-shadow")
+        marker = package_repository / "files-package-ran"
+        package = package_repository / "tools/files"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            f"open({str(marker)!r}, 'w').write('ran')\n",
+            encoding="ascii",
+        )
+        rejected = run(package_repository, *FINALIZER_PYTHON_FLAGS)
+        assert rejected.returncode != 0
+        assert "namespace" in rejected.stderr.lower()
+        assert not marker.exists()
+
+        for name, install in (
+            ("extension-shadow", lambda tools: (
+                tools / "files.so"
+            ).write_bytes(b"not an extension")),
+            ("symlink-shadow", lambda tools: (
+                tools / "shadow.py"
+            ).symlink_to(tools / "files.py")),
+        ):
+            unsafe = copy_repository(name)
+            install(unsafe / "tools")
+            rejected = run(unsafe, *FINALIZER_PYTHON_FLAGS)
+            assert rejected.returncode != 0
+            assert "namespace" in rejected.stderr.lower()
+
+
 def verify_input_derivation() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-scaling-series-",
@@ -360,6 +744,36 @@ def verify_input_derivation() -> None:
         assert tuple(item.name for item in series) == tuple(
             f"S{index:02d}" for index in range(55)
         )
+        report = root / "fetch.json"
+        write_json(report, value)
+        with patch.object(finalizer, "ROOT", root):
+            names, bindings = finalizer._fetch_bindings(report)
+        assert names == tuple(item.name for item in series)
+        assert bindings == tuple(item.csv for item in series)
+        (root / "selection").mkdir()
+        attempt = SimpleNamespace(
+            config=SimpleNamespace(path=str(root / "config.json")),
+            fetch_report=SimpleNamespace(
+                path=str(report),
+                sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+            ),
+            manifests=(),
+            selection_tree=SimpleNamespace(root="selection"),
+            session_calendar=SimpleNamespace(path=str(root / "calendar.json")),
+            source_tree=SimpleNamespace(files=()),
+            torch_probe=SimpleNamespace(
+                package_tree=SimpleNamespace(
+                    root=str(root / "torch-package"), files=(),
+                ),
+                python=SimpleNamespace(path=str(root / "torch-python")),
+            ),
+        )
+        with patch.object(finalizer, "ROOT", root):
+            success = finalizer._success_inputs(attempt)
+        assert success.csv_names == names
+        assert success.csv == bindings
+        assert set(map(Path, (item.path for item in bindings))) <= \
+            set(success.paths)
         invalid = deepcopy(value)
         invalid["series"][0]["csv"]["path"] = str(root / "outside.csv")
         try:
@@ -484,7 +898,7 @@ def verify_input_derivation() -> None:
         raise AssertionError("reordered coverage timestamps were accepted")
 
     try:
-        ScalingCoverage((), ()).require_promotable()
+        ScalingCoverage(()).require_promotable()
     except ValueError:
         pass
     else:
@@ -625,10 +1039,1580 @@ def verify_fit_schedule() -> None:
         raise AssertionError("invalid physical fit schedule was accepted")
 
 
+def verify_market_truth_derivation() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-truth-",
+    ) as directory_name:
+        root = Path(directory_name)
+        names = synthetic_master()
+        manifest = root / "manifest.json"
+        calendar = root / "calendar.json"
+        csv_paths = tuple(root / f"{name}.csv" for name in names)
+        write_json(manifest, {
+            "adjusted": True,
+            "declared_on": "2025-12-01",
+            "eligibility_date": "2025-12-01",
+            "end": "2026-01-03",
+            "interval_minutes": 30,
+            "purpose": "test",
+            "schema": 1,
+            "series": [
+                {"stratum": "test", "ticker": name} for name in names
+            ],
+            "session": "regular",
+            "start": "2026-01-01",
+        })
+        write_json(calendar, {"test": True})
+        csv = (
+            "timestamp,open,high,low,close,volume\n"
+            "2026-01-01T00:00:00Z,99,101,98,100,1\n"
+            "2026-01-02T00:00:00Z,101,103,100,102,1\n"
+            "2026-01-03T00:00:00Z,103,105,102,104,1\n"
+        )
+        for path in csv_paths:
+            path.write_text(csv, encoding="ascii")
+        missing = dict(EXPECTED_MISSING)
+        truth_row = (
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        )
+        coverage = ScalingCoverage(tuple(
+            PhaseCoverage(phase, tuple(
+                SeriesCoverage(
+                    name, 1, int(name not in missing[phase]),
+                    timestamp_grid_sha256((truth_row,))
+                    if name not in missing[phase] else
+                    timestamp_grid_sha256(()),
+                )
+                for name in names
+            ))
+            for phase in PHASES
+        ))
+        calls = 0
+        sample_stops = []
+        calibration_stop = expected_protocol()[
+            "calendar"
+        ]["calibration"][-1][-1]
+        assert calibration_stop == 4_943
+
+        def sampled(
+            *_: object, opportunity_stop: int | None = None,
+        ) -> SessionSamples:
+            sample_stops.append(opportunity_stop)
+            return SessionSamples(
+                (SampleRows(0, 1, 2, 0),), 5_505,
+            )
+
+        def packed(*_: object) -> PackedRows:
+            nonlocal calls
+            name = names[calls // len(PHASES)]
+            phase = PHASES[calls % len(PHASES)]
+            validation = int(name not in missing[phase])
+            calls += 1
+            row = SampleRows(0, 1, 2, 0)
+            return PackedRows(
+                (row, row) if validation else (row,),
+                (1, validation),
+            )
+
+        with file_tools.freeze_inputs(
+            (manifest, calendar, *csv_paths),
+        ) as frozen:
+            csv_paths[0].write_text(
+                csv.replace(",101,103,100,102,", ",999,1000,998,999,"),
+                encoding="ascii",
+            )
+            with patch.object(
+                finalizer.SessionCalendar, "read",
+                return_value=SimpleNamespace(),
+            ), patch.object(
+                finalizer, "session_samples", side_effect=sampled,
+            ), patch.object(
+                finalizer, "pack_rows", side_effect=packed,
+            ):
+                derived = finalizer.derive_market_truth(
+                    frozen[0].snapshot, frozen[1].snapshot,
+                    {
+                        name: item.snapshot
+                        for name, item in zip(
+                            names, frozen[2:], strict=True,
+                        )
+                    },
+                    coverage, expected_protocol(),
+                )
+        assert calls == 55 * len(PHASES)
+        assert sample_stops == [calibration_stop] * 55
+        assert derived.coverage == coverage
+        assert tuple(
+            len(phase.evaluable) for phase in derived.coverage.phases
+        ) == (53, 52, 51)
+        assert finalizer.LOCKS["reserved_test_materialized_samples"] == 0
+        first = derived.rows[("fold-0", names[0])][0]
+        assert (
+            first.reference_price, first.outcome_price, first.actual_return,
+        ) == (101.0, 104.0, log(104.0 / 101.0))
+
+        changed = list(coverage.phases)
+        first_phase = changed[0]
+        first_series = list(first_phase.series)
+        first_series[0] = SeriesCoverage(
+            first_series[0].series, first_series[0].train_rows,
+            first_series[0].validation_rows, "0" * 64,
+        )
+        changed[0] = PhaseCoverage(first_phase.phase, tuple(first_series))
+        calls = 0
+        sample_stops.clear()
+        with patch.object(
+            finalizer.SessionCalendar, "read",
+            return_value=SimpleNamespace(),
+        ), patch.object(
+            finalizer, "session_samples", side_effect=sampled,
+        ), patch.object(finalizer, "pack_rows", side_effect=packed):
+            try:
+                finalizer.derive_market_truth(
+                    manifest, calendar,
+                    dict(zip(names, csv_paths, strict=True)),
+                    ScalingCoverage(tuple(changed)), expected_protocol(),
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("changed armed truth was accepted")
+        assert sample_stops == [calibration_stop] * 55
+
+
+def scaling_finalizer_fixture() -> tuple[
+    tuple[str, ...], ScalingCoverage,
+    list[dict[str, object]], list[dict[str, object]], MarketTruth,
+]:
+    names = synthetic_master()
+    market = (
+        PredictionTruth(
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+            100.0, 104.0, log(104.0 / 100.0),
+        ),
+        PredictionTruth(
+            "2026-01-04T00:00:00Z",
+            "2026-01-05T00:00:00Z",
+            "2026-01-06T00:00:00Z",
+            100.0, 98.0, log(98.0 / 100.0),
+        ),
+    )
+    grid = tuple(
+        (row.as_of, row.entry_time, row.target_time) for row in market
+    )
+    coverage = ScalingCoverage(tuple(
+        PhaseCoverage(phase.phase, tuple(
+            SeriesCoverage(
+                item.series, item.train_rows,
+                2 if item.validation_rows else 0,
+                timestamp_grid_sha256(grid)
+                if item.validation_rows else timestamp_grid_sha256(()),
+            )
+            for item in phase.series
+        ))
+        for phase in synthetic_coverage(names).phases
+    ))
+    evaluable = {
+        phase.phase: phase.evaluable for phase in coverage.phases
+    }
+    rows = {
+        (phase.phase, item.series): (
+            item.train_rows, item.validation_rows,
+        )
+        for phase in coverage.phases for item in phase.series
+    }
+    fits = []
+    for job in expected_fit_jobs(names, evaluable):
+        provenance = fit_provenance_id(job)
+        fixed = job.kind == "pooled" and job.mode == "fixed-update"
+        ridge = job.kind == "ridge"
+        fixed_epoch = not ridge and not fixed
+        epochs_trained = 11 if fixed_epoch else 0
+        rows_per_epoch = (
+            sum(rows[(job.phase, name)][0] for name in job.members) +
+            FIXED_EPOCH_BUDGET.batch_size - 1
+        ) // FIXED_EPOCH_BUDGET.batch_size
+        fits.append({
+            "budget": (
+                asdict(dict(EXPECTED_BUDGETS)[job.phase]) if fixed else
+                asdict(FIXED_EPOCH_BUDGET) if fixed_epoch else None
+            ),
+            "cohort": job.cohort,
+            "coverage": [
+                {
+                    "series": name,
+                    "train_rows": rows[(job.phase, name)][0],
+                    "validation_rows": rows[(job.phase, name)][1],
+                }
+                for name in job.members
+            ],
+            "kind": job.kind,
+            "members": list(job.members),
+            "mode": job.mode,
+            "model": job.model,
+            "model_fingerprint": hashlib.sha256(
+                f"model:{provenance}".encode()
+            ).hexdigest(),
+            "epochs_trained": epochs_trained,
+            "optimizer_updates": (
+                0 if ridge else
+                dict(EXPECTED_BUDGETS)[job.phase].total_updates
+                if fixed else epochs_trained * rows_per_epoch
+            ),
+            "phase": job.phase,
+            "provenance_id": provenance,
+            "question_uses": [
+                {"question": question, "cohort": cohort}
+                for question, cohort in question_uses(job, names)
+            ],
+            "schema": 1,
+            "seed": job.seed,
+            "selected_checkpoint": 1 if fixed else None,
+            "selected_epoch": None if ridge or fixed else 1,
+        })
+    closure = validate_fit_ledger(fits, names, coverage)
+    model_prediction = {
+        "global_ridge": 0.01,
+        "global_mlp": 0.02,
+        "panel_transformer": 0.03,
+        "conditioned_panel_transformer": 0.025,
+        "local_transformer": 0.015,
+    }
+    predictions = []
+    for job in closure.jobs:
+        provenance = fit_provenance_id(job)
+        predicted = model_prediction[job.model] + (
+            0.0001 * SEEDS.index(job.seed)
+            if job.seed is not None else 0.0
+        )
+        for series in required_prediction_series(
+            job, names, closure.evaluable,
+        ):
+            predictions.append({
+                "grid_sha256": closure.timestamp_sha256[
+                    (job.phase, series)
+                ],
+                "model_fingerprint": closure.fingerprints[provenance],
+                "phase": job.phase,
+                "predictions": encode_f32le_base64(tuple(
+                    predicted + 0.001 * index
+                    for index in range(
+                        closure.rows[(job.phase, series)][1],
+                    )
+                )),
+                "provenance_id": provenance,
+                "schema": 2,
+                "series": series,
+            })
+    truth = MarketTruth(coverage, {
+        (phase.phase, item.series):
+        market if item.validation_rows else ()
+        for phase in coverage.phases for item in phase.series
+    })
+    return names, coverage, fits, predictions, truth
+
+
+def reject_finalizer_fit(
+    values: list[dict[str, object]], names: tuple[str, ...],
+    coverage: ScalingCoverage,
+) -> None:
+    try:
+        validate_fit_ledger(values, names, coverage)
+    except ValueError:
+        return
+    raise AssertionError("invalid fit ledger was accepted")
+
+
+def reject_finalizer_predictions(
+    values: Iterable[Mapping[str, object]], closure: object,
+    truth: MarketTruth,
+) -> None:
+    try:
+        validate_prediction_ledger(values, closure, truth)
+    except ValueError:
+        return
+    raise AssertionError("invalid prediction ledger was accepted")
+
+
+def prediction_record_index(
+    values: list[dict[str, object]], closure: object, series: str,
+    **axes: object,
+) -> int:
+    """Locate one physical prediction by its fit axes and destination."""
+    matches = tuple(
+        index for index, record in enumerate(values)
+        if record["series"] == series and all(
+            getattr(
+                closure.jobs_by_id[record["provenance_id"]], name,
+            ) == value
+            for name, value in axes.items()
+        )
+    )
+    if len(matches) != 1:
+        raise AssertionError(f"expected one physical prediction: {matches}")
+    return matches[0]
+
+
+def replace_prediction(
+    values: list[dict[str, object]], index: int, value: float,
+) -> list[dict[str, object]]:
+    """Return a ledger copy with one complete prediction vector replaced."""
+    changed = deepcopy(values)
+    count = changed[index]["predictions"]["count"]
+    changed[index]["predictions"] = encode_f32le_base64(
+        (value,) * count,
+    )
+    return changed
+
+
+def fake_paired_comparison(
+    candidate: dict[str, tuple[ForecastPoint, ...]],
+    reference: dict[str, tuple[ForecastPoint, ...]],
+    **_: object,
+) -> dict[str, object]:
+    gains = {
+        name: sum(
+            abs(right.actual_return - right.predicted_return) -
+            abs(left.actual_return - left.predicted_return)
+            for left, right in zip(
+                candidate[name], reference[name], strict=True,
+            )
+        ) / len(candidate[name])
+        for name in candidate
+    }
+    mean = sum(gains.values()) / len(gains)
+    return {
+        "common_dates": ("2026-01-03",),
+        "mean_gain": mean,
+        "per_stock_mean_gain": gains,
+        "wins": sum(value > 0 for value in gains.values()),
+        "ties": sum(value == 0 for value in gains.values()),
+        "losses": sum(value < 0 for value in gains.values()),
+        "intervals": {
+            str(block): (mean, mean) for block in (5, 10, 20)
+        },
+        "effective_count": {
+            "value": None,
+            "included": tuple(gains),
+            "excluded": (),
+            "reason": "synthetic",
+        },
+    }
+
+
+def verify_scaling_finalizer() -> None:
+    names, coverage, fits, predictions, truth = scaling_finalizer_fixture()
+    assert tuple(
+        len(phase.evaluable) for phase in coverage.phases
+    ) == (53, 52, 51)
+    closure = validate_fit_ledger(fits, names, coverage)
+    assert len(closure.jobs) == EXPECTED_FIT_COUNT
+    parsed = validate_prediction_ledger(
+        (record for record in predictions), closure, truth,
+    )
+
+    invalid_fits = (
+        fits[:-1],
+        [*fits, fits[-1]],
+        [fits[1], fits[0], *fits[2:]],
+        [{**fits[0], "provenance_id": "0" * 64}, *fits[1:]],
+        [{**fits[0], "policy_selected": True}, *fits[1:]],
+        [{
+            **fits[0],
+            "coverage": [{
+                **fits[0]["coverage"][0], "validation_rows": 0,
+            }, *fits[0]["coverage"][1:]],
+        }, *fits[1:]],
+        [{
+            **fits[0],
+            "coverage": [{
+                **fits[0]["coverage"][0],
+                "train_rows": fits[0]["coverage"][0]["train_rows"] + 1,
+            }, *fits[0]["coverage"][1:]],
+        }, *fits[1:]],
+    )
+    for invalid in invalid_fits:
+        reject_finalizer_fit(invalid, names, coverage)
+
+    epoch_indices = (
+        next(
+            index for index, item in enumerate(fits)
+            if item["kind"] == "pooled" and item["mode"] == "fixed-epoch"
+        ),
+        next(
+            index for index, item in enumerate(fits)
+            if item["kind"] == "local"
+        ),
+    )
+
+    def epoch_record(
+        source: Mapping[str, object], selected: int, trained: int,
+    ) -> dict[str, object]:
+        coverage_rows = source["coverage"]
+        rows_per_epoch = (
+            sum(item["train_rows"] for item in coverage_rows) +
+            FIXED_EPOCH_BUDGET.batch_size - 1
+        ) // FIXED_EPOCH_BUDGET.batch_size
+        return {
+            **source,
+            "epochs_trained": trained,
+            "optimizer_updates": trained * rows_per_epoch,
+            "selected_epoch": selected,
+        }
+
+    for index in epoch_indices:
+        boundary = deepcopy(fits)
+        boundary[index] = epoch_record(boundary[index], 90, 100)
+        validate_fit_ledger(boundary, names, coverage)
+        for mutate in (
+            lambda item: item["budget"].update(epochs=99),
+            lambda item: item.update(epochs_trained=0, optimizer_updates=0),
+            lambda item: item.update(epochs_trained=101),
+            lambda item: item.update(selected_epoch=0),
+            lambda item: item.update(selected_epoch=12),
+            lambda item: item.update(
+                selected_epoch=2, epochs_trained=11,
+            ),
+            lambda item: item.update(
+                selected_epoch=1, epochs_trained=12,
+            ),
+            lambda item: item.update(optimizer_updates=(
+                item["optimizer_updates"] + 1
+            )),
+        ):
+            invalid = deepcopy(fits)
+            mutate(invalid[index])
+            reject_finalizer_fit(invalid, names, coverage)
+
+    for index in (
+        next(
+            index for index, item in enumerate(fits)
+            if item["kind"] == "ridge"
+        ),
+        next(
+            index for index, item in enumerate(fits)
+            if item["mode"] == "fixed-update"
+        ),
+    ):
+        invalid = deepcopy(fits)
+        invalid[index]["epochs_trained"] = 1
+        reject_finalizer_fit(invalid, names, coverage)
+
+    assert len(predictions) == EXPECTED_PREDICTION_RECORDS == 14_216
+    assert set(predictions[0]) == finalizer.PREDICTION_FIELDS
+    assert parsed.records == EXPECTED_PREDICTION_RECORDS
+    assert parsed.stored_values == sum(
+        record["predictions"]["count"] for record in predictions
+    ) == 2 * EXPECTED_PREDICTION_RECORDS
+    assert parsed.stored_values != parsed.records
+    assert parsed.synthesized_zero_values == sum(
+        len(rows) for rows in truth.rows.values()
+    ) == 312
+
+    physical_keys = {
+        (*finalizer._family(job), series)
+        for job in closure.jobs
+        for series in required_prediction_series(
+            job, names, closure.evaluable,
+        )
+    }
+    zero_series = sum(bool(rows) for rows in truth.rows.values())
+    assert len(parsed.metrics) == len(physical_keys) + zero_series
+    assert set(parsed.calibration) == {
+        key for key in physical_keys if key[3] == "calibration"
+    }
+    assert all(key[3] == "calibration" for key in parsed.calibration)
+    assert {key[3] for key in parsed.metrics} == set(PHASES)
+
+    ensemble_series = names[44]
+    ensemble_jobs = tuple(
+        job for job in closure.jobs
+        if (
+            job.kind, job.mode, job.cohort, job.phase, job.model
+        ) == (
+            "pooled", "fixed-update", 44, "calibration",
+            "panel_transformer",
+        )
+    )
+    assert tuple(job.seed for job in ensemble_jobs) == SEEDS
+    by_identity = {
+        (record["provenance_id"], record["series"]): record
+        for record in predictions
+    }
+    seed_predictions = tuple(
+        decode_f32le_base64(by_identity[
+            (fit_provenance_id(job), ensemble_series)
+        ]["predictions"])
+        for job in ensemble_jobs
+    )
+    expected_ensemble = tuple(
+        fmean(values)
+        for values in zip(*seed_predictions, strict=True)
+    )
+    ensemble_key = (*finalizer._family(ensemble_jobs[0]), ensemble_series)
+    assert parsed.calibration[ensemble_key] == expected_ensemble
+
+    first_key, first_values = next(iter(parsed.calibration.items()))
+    expected_truth = truth.rows[(first_key[3], first_key[-1])][0]
+    first_point = finalizer._points(
+        truth.rows[(first_key[3], first_key[-1])], first_values,
+    )[0]
+    assert (
+        first_point.target_time, first_point.actual_return,
+        first_point.reference_price, first_point.outcome_price,
+    ) == (
+        expected_truth.target_time, expected_truth.actual_return,
+        expected_truth.reference_price, expected_truth.outcome_price,
+    )
+
+    try:
+        finalizer._family_key(
+            parsed, "unseen-transfer", "fixed-update", 44,
+            "calibration", ensemble_series,
+            "conditioned_panel_transformer",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("conditioned unseen prediction was accepted")
+
+    def changed_record(**fields: object) -> list[dict[str, object]]:
+        changed = deepcopy(predictions)
+        changed[0].update(fields)
+        return changed
+
+    def changed_payload(**fields: object) -> list[dict[str, object]]:
+        changed = deepcopy(predictions)
+        changed[0]["predictions"].update(fields)
+        return changed
+
+    wrong_phase = next(
+        phase for phase in PHASES if phase != predictions[0]["phase"]
+    )
+    wrong_series = next(
+        name for name in names if name != predictions[0]["series"]
+    )
+    invalid_predictions = (
+        lambda: predictions[1:],
+        lambda: [*predictions, predictions[-1]],
+        lambda: [predictions[1], predictions[0], *predictions[2:]],
+        lambda: changed_record(schema=1),
+        lambda: changed_record(provenance_id="0" * 64),
+        lambda: changed_record(model_fingerprint="0" * 64),
+        lambda: changed_record(phase=wrong_phase),
+        lambda: changed_record(series=wrong_series),
+        lambda: changed_record(grid_sha256="0" * 64),
+        lambda: changed_record(backtest_run=False),
+        lambda: changed_payload(encoding="f64le-base64"),
+        lambda: changed_payload(count=0),
+        lambda: changed_payload(base64="!"),
+        lambda: changed_payload(unexpected=True),
+    )
+    for invalid in invalid_predictions:
+        reject_finalizer_predictions(invalid(), closure, truth)
+
+    for value in (float("nan"), float("inf"), -float("inf")):
+        encoded = base64.b64encode(
+            struct.pack("<2f", value, value),
+        ).decode("ascii")
+        reject_finalizer_predictions(
+            changed_record(predictions={
+                "encoding": "f32le-base64",
+                "count": 2,
+                "base64": encoded,
+            }),
+            closure, truth,
+        )
+    reject_finalizer_predictions(
+        changed_record(predictions={
+            "encoding": "f32le-base64",
+            "count": 2,
+            "base64": base64.b64encode(b"\0" * 9).decode("ascii"),
+        }),
+        closure, truth,
+    )
+
+    truth_rows = dict(truth.rows)
+    truth_key = next(key for key, rows in truth_rows.items() if rows)
+    row = truth_rows[truth_key][0]
+    truth_rows[truth_key] = (PredictionTruth(
+        row.as_of, row.entry_time, "2026-01-04T00:00:00Z",
+        row.reference_price, row.outcome_price, row.actual_return,
+    ), *truth_rows[truth_key][1:])
+    reject_finalizer_predictions(
+        predictions, closure, MarketTruth(coverage, truth_rows),
+    )
+
+    finite_index = prediction_record_index(
+        predictions, closure, names[44], kind="pooled",
+        mode="fixed-update", cohort=44, phase="fold-0",
+        model="panel_transformer", seed=SEEDS[0],
+    )
+    finite = validate_prediction_ledger(
+        replace_prediction(predictions, finite_index, 0.05),
+        closure, truth,
+    )
+    finite_key = (
+        *finalizer._family(
+            closure.jobs_by_id[predictions[finite_index]["provenance_id"]],
+        ),
+        names[44],
+    )
+    assert finite.metrics[finite_key] != parsed.metrics[finite_key]
+
+    with patch(
+        "tools.finalize_universe_scaling.paired_comparison",
+        fake_paired_comparison,
+    ):
+        baseline = build_development_summary(closure, parsed)
+        assert baseline["prediction_evidence"] == {
+            "schema": 2,
+            "records": EXPECTED_PREDICTION_RECORDS,
+            "stored_values": 2 * EXPECTED_PREDICTION_RECORDS,
+            "synthesized_zero_values": 312,
+        }
+        assert baseline["model_binding_role"] == \
+            "cross-ledger-consistency-not-independent-execution-proof"
+        assert all(
+            "conditioned_panel_transformer" not in view["metrics"]
+            for result in baseline["results"]
+            if result["question"] == "unseen-transfer"
+            for view in result["views"].values()
+        )
+        paired = baseline["paired_calibration"]
+        assert tuple(paired) == ("fixed-update", "fixed-epoch")
+        comparison_count = 0
+        for mode in paired:
+            evidence = paired[mode]
+            assert tuple(evidence["candidate_vs_baselines"]) == (
+                "core:55", "unseen:44",
+            )
+            assert all(
+                tuple(models) == finalizer.CONTROL_MODELS
+                for models in evidence["candidate_vs_baselines"].values()
+            )
+            assert tuple(evidence["breadth_vs_11"]["core"]) == (
+                "22", "33", "55",
+            )
+            assert tuple(evidence["breadth_vs_11"]["unseen"]) == (
+                "22", "33", "44",
+            )
+            comparisons = (
+                *(
+                    item
+                    for models in
+                    evidence["candidate_vs_baselines"].values()
+                    for item in models.values()
+                ),
+                *evidence["breadth_vs_11"]["core"].values(),
+                *evidence["breadth_vs_11"]["unseen"].values(),
+                evidence["unseen_44_vs_33"],
+            )
+            assert len(comparisons) == 15
+            comparison_count += len(comparisons)
+            assert all(
+                tuple(item["intervals"]) == ("5", "10", "20") and
+                "effective_count" in item
+                for item in comparisons
+            )
+        assert comparison_count == 30
+        assert len({
+            name for name in baseline["gates"] if name != "all_pass"
+        }) == 8
+        expansion = paired["fixed-update"][
+            "breadth_vs_11"
+        ]["unseen"]["44"]
+        marginal = paired["fixed-update"]["unseen_44_vs_33"]
+        assert baseline["gates"]["positive_paired_intervals"][
+            "intervals"
+        ] == expansion["intervals"]
+        assert baseline["gates"]["majority_unseen_improved"]["wins"] == \
+            expansion["wins"]
+        assert baseline["gates"]["unseen_33_to_44_marginal"][
+            "mean_gain"
+        ] == marginal["mean_gain"]
+
+        changed_fold = build_development_summary(
+            closure, validate_prediction_ledger(
+                replace_prediction(predictions, finite_index, 0.05),
+                closure, truth,
+            ),
+        )
+        assert changed_fold["results"] != baseline["results"]
+        assert changed_fold["gates"] == baseline["gates"]
+        assert changed_fold["paired_calibration"] == paired
+
+        fixed_epoch_index = prediction_record_index(
+            predictions, closure, names[44], kind="pooled",
+            mode="fixed-epoch", cohort=44, phase="calibration",
+            model="panel_transformer", seed=SEEDS[0],
+        )
+        changed_fixed_epoch = build_development_summary(
+            closure, validate_prediction_ledger(
+                replace_prediction(
+                    predictions, fixed_epoch_index, -0.5,
+                ),
+                closure, truth,
+            ),
+        )
+        assert changed_fixed_epoch["gates"] == baseline["gates"]
+        assert changed_fixed_epoch["paired_calibration"][
+            "fixed-update"
+        ] == paired["fixed-update"]
+        assert changed_fixed_epoch["paired_calibration"][
+            "fixed-epoch"
+        ] != paired["fixed-epoch"]
+
+        gated_index = prediction_record_index(
+            predictions, closure, names[44], kind="pooled",
+            mode="fixed-update", cohort=44, phase="calibration",
+            model="panel_transformer", seed=SEEDS[0],
+        )
+        changed_gate = build_development_summary(
+            closure, validate_prediction_ledger(
+                replace_prediction(predictions, gated_index, -0.5),
+                closure, truth,
+            ),
+        )
+        assert changed_gate["gates"] != baseline["gates"]
+        assert baseline["locks"] == {
+            "reserved_test_materialized_samples": 0,
+            "policy_selected": False,
+            "backtest_run": False,
+            "trading_authorized": False,
+        }
+
+    transitions = (
+        ("preflight", 2, "preflight-failure"),
+        ("setup", 2, "setup-failure"),
+        ("experiment", 2, "experiment-failure"),
+        ("analysis", 2, "analysis-integrity-failure"),
+        ("analysis", 3, "gate-failure"),
+        ("analysis", 0, "pass"),
+        ("experiment", 129, "experiment-failure"),
+        ("experiment", 130, "experiment-failure"),
+        ("experiment", 143, "experiment-failure"),
+    )
+    for stage, code, status in transitions:
+        _transition(stage, code, status)
+    try:
+        _transition("experiment", 0, "pass")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid terminal transition was accepted")
+
+
+def passing_gate_inputs() -> dict[str, object]:
+    metrics = {
+        "return_mae": 0.9,
+        "direction_accuracy": 0.8,
+        "close_mae": 0.8,
+    }
+    controls = {
+        view: {
+            model: {
+                "return_mae": 1.1,
+                "direction_accuracy": 0.5,
+                "close_mae": 1.0,
+            }
+            for model in finalizer.CONTROL_MODELS
+        }
+        for view in ("core", "unseen")
+    }
+    return {
+        "unseen_metrics": dict(metrics),
+        "unseen_control_metrics": {
+            **metrics, "return_mae": 1.0,
+        },
+        "core_metrics": dict(metrics),
+        "core_control_metrics": {
+            **metrics, "return_mae": 1.0,
+        },
+        "expansion": {
+            "intervals": {
+                str(block): (0.1, 0.2) for block in (5, 10, 20)
+            },
+            "wins": 6,
+            "per_stock_mean_gain": {
+                f"S{index:02d}": 0.1 for index in range(11)
+            },
+        },
+        "marginal": {"mean_gain": 0.0},
+        "control_metrics": controls,
+        "core_majority": 0.7,
+        "unseen_majority": 0.7,
+    }
+
+
+def evaluate_gates(values: Mapping[str, object]) -> dict[str, object]:
+    return _gate_results(
+        values["unseen_metrics"],
+        values["unseen_control_metrics"],
+        values["core_metrics"],
+        values["core_control_metrics"],
+        values["expansion"],
+        values["marginal"],
+        values["control_metrics"],
+        values["core_majority"],
+        values["unseen_majority"],
+    )
+
+
+def verify_gate_boundaries() -> None:
+    values = passing_gate_inputs()
+    values["unseen_metrics"]["return_mae"] = 0.99
+    values["core_metrics"]["return_mae"] = 1.01
+    gates = evaluate_gates(values)
+    assert gates["all_pass"]
+    assert gates["unseen_33_to_44_marginal"]["pass"]
+
+    mutations: tuple[tuple[str, Callable[[dict[str, object]], None]], ...] = (
+        ("unseen_mae_improvement", lambda item: item[
+            "unseen_metrics"
+        ].update(return_mae=nextafter(0.99, inf))),
+        ("positive_paired_intervals", lambda item: item[
+            "expansion"
+        ]["intervals"].update({"10": (0.0, 0.2)})),
+        ("majority_unseen_improved", lambda item: item[
+            "expansion"
+        ].update(wins=5)),
+        ("core_degradation", lambda item: item[
+            "core_metrics"
+        ].update(return_mae=nextafter(1.01, inf))),
+        ("pooled_and_local_controls", lambda item: item[
+            "control_metrics"
+        ]["core"]["zero"].update(return_mae=0.9)),
+        ("direction_majority", lambda item: item[
+            "core_metrics"
+        ].update(direction_accuracy=0.7)),
+        ("close_mae", lambda item: item[
+            "control_metrics"
+        ]["unseen"]["zero"].update(close_mae=0.8)),
+        ("unseen_33_to_44_marginal", lambda item: item[
+            "marginal"
+        ].update(mean_gain=nextafter(0.0, -inf))),
+    )
+    for gate, mutate in mutations:
+        invalid = passing_gate_inputs()
+        mutate(invalid)
+        assert not evaluate_gates(invalid)[gate]["pass"], gate
+
+    invalid = passing_gate_inputs()
+    invalid["expansion"]["per_stock_mean_gain"].pop("S10")
+    assert not evaluate_gates(invalid)["majority_unseen_improved"]["pass"]
+
+
+def verify_real_paired_comparison() -> None:
+    candidate = {}
+    reference = {}
+    start = date(2026, 1, 1)
+    for stock in range(11):
+        candidate_points = []
+        reference_points = []
+        for offset in range(20):
+            target = (start + timedelta(days=offset)).isoformat()
+            actual = 0.1 + stock * 0.0001 + offset * 0.00001
+            candidate_points.append(ForecastPoint(
+                target, actual, actual - 0.01, 100.0, 110.0,
+            ))
+            reference_points.append(ForecastPoint(
+                target, actual, actual - 0.1, 100.0, 110.0,
+            ))
+        candidate[f"S{stock:02d}"] = tuple(candidate_points)
+        reference[f"S{stock:02d}"] = tuple(reference_points)
+    result = paired_comparison(
+        candidate, reference, block_days=(5, 10, 20),
+        replicates=100,
+    )
+    assert result["wins"] == 11
+    assert result["mean_gain"] > 0
+    assert all(
+        result["intervals"][str(block)][0] > 0
+        for block in (5, 10, 20)
+    )
+
+
+def verify_majority_baseline() -> None:
+    def points(signs: tuple[int, ...]) -> tuple[ForecastPoint, ...]:
+        return tuple(
+            ForecastPoint(
+                f"2026-01-{index + 1:02d}T00:00:00Z",
+                float(sign), 0.0, 100.0, 100.0,
+            )
+            for index, sign in enumerate(signs)
+        )
+
+    flat_majority = points((0, 0, 0, 1, 1, -1))
+    tied_up_down = points((1, 1, -1, -1, 0))
+    assert finalizer._majority_accuracy({"flat": flat_majority}) == 0.5
+    assert finalizer._majority_accuracy({"tie": tied_up_down}) == 0.4
+    assert finalizer._majority_accuracy({
+        "flat": flat_majority, "tie": tied_up_down,
+    }) == 0.45
+
+
+TERMINALS = {
+    "preflight-failure": ("preflight", 2),
+    "setup-failure": ("setup", 2),
+    "experiment-failure": ("experiment", 2),
+    "analysis-integrity-failure": ("analysis", 2),
+    "gate-failure": ("analysis", 3),
+    "pass": ("analysis", 0),
+}
+
+
+class DirectFinalizerFixture:
+    def __init__(
+        self, root: Path, status: str,
+        experiment_outputs: tuple[str, ...] = ("fits",),
+    ) -> None:
+        self.root = root.resolve()
+        self.experiments = self.root / "experiments"
+        self.reports = self.root / "reports"
+        self.experiments.mkdir(parents=True)
+        self.reports.mkdir()
+        self.attempt_path = self.experiments / "direct-attempt.json"
+        self.outcome = self.experiments / "direct-outcome.json"
+        self.run = self.reports / "direct"
+        self.fits = self.run / "fits.jsonl"
+        self.predictions = self.run / "predictions.jsonl"
+        self.summary = self.run / "summary.json"
+        self.attempt_path.write_text('{"schema":1}\n', encoding="ascii")
+        if status != "preflight-failure":
+            self.run.mkdir()
+        present = (
+            experiment_outputs if status == "experiment-failure" else
+            ("fits", "predictions")
+            if status not in ("preflight-failure", "setup-failure") else ()
+        )
+        for name in present:
+            getattr(self, name).write_text("{}\n", encoding="ascii")
+        self.trusted = self.root / "trusted.py"
+        self.trusted.write_text("trusted = True\n", encoding="ascii")
+        support = self.root / "csv"
+        support.mkdir()
+        self.support = tuple(
+            support / f"s{index:02d}.csv" for index in range(55)
+        )
+        for index, path in enumerate(self.support):
+            path.write_text(f"{index}\n", encoding="ascii")
+        self.names = synthetic_master()
+        outputs = {
+            "fits": "reports/direct/fits.jsonl",
+            "predictions": "reports/direct/predictions.jsonl",
+            "summary": "reports/direct/summary.json",
+            "outcome": "experiments/direct-outcome.json",
+        }
+        prefix = (
+            "tools/finalize_universe_scaling.py",
+            "experiments/direct-attempt.json",
+            outputs["outcome"],
+        )
+        self.attempt = SimpleNamespace(
+            attempt_path="experiments/direct-attempt.json",
+            commands={"finalizer_prefix": prefix},
+            coverage=synthetic_coverage(self.names),
+            finalizer_tree=SimpleNamespace(sha256=sha256(8_000)),
+            manifests=(
+                SimpleNamespace(file=SimpleNamespace(
+                    path=str(self.support[0]),
+                )),
+            ),
+            outputs=outputs,
+            primary_python=SimpleNamespace(
+                path=sys.executable, sha256=sha256(8_001),
+            ),
+            protocol=expected_protocol(),
+            run_dir="reports/direct",
+            run_id="direct",
+            session_calendar=SimpleNamespace(path=str(self.support[1])),
+        )
+        self.success = finalizer.SuccessInputs(
+            self.names,
+            tuple(SimpleNamespace(path=str(path)) for path in self.support),
+            (), self.support,
+        )
+
+    def invoke(
+        self, status: str,
+        writer: Callable[..., None] | None = None,
+        *, patch_isolation_boundary: bool = True,
+    ) -> dict[str, object]:
+        stage, code = TERMINALS[status]
+        prefix = self.attempt.commands["finalizer_prefix"]
+        argv = (
+            *prefix,
+            "--started", "2026-07-24T00:00:00Z",
+            "--ended", "2026-07-24T00:01:00Z",
+            "--stage", stage, "--exit", str(code), "--status", status,
+        )
+
+        def analysis(*_: object) -> dict[str, object]:
+            return {
+                "schema": 1,
+                "status": status,
+                "gates": {"all_pass": status == "pass"},
+            }
+
+        with ExitStack() as stack:
+            if patch_isolation_boundary:
+                stack.enter_context(patch.object(
+                    finalizer, "_require_isolated_execution",
+                ))
+                stack.enter_context(patch.object(
+                    finalizer, "_require_exact_launch",
+                ))
+            stack.enter_context(patch.object(finalizer, "ROOT", self.root))
+            stack.enter_context(patch.object(
+                finalizer.ScalingAttempt, "read",
+                return_value=self.attempt,
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "_trusted_paths",
+                return_value=(self.trusted,),
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "_validate_trusted",
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "_success_inputs",
+                return_value=self.success,
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "_validate_success_inputs",
+                return_value=self.names,
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "_validate_live_success",
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "derive_market_truth",
+                return_value=MarketTruth(self.attempt.coverage, {}),
+            ))
+            stack.enter_context(patch.object(
+                finalizer, "analyze_ledgers", side_effect=analysis,
+            ))
+            stack.enter_context(patch.object(sys, "argv", list(argv)))
+            if writer is not None:
+                stack.enter_context(patch.object(
+                    finalizer, "write_json_exclusive", writer,
+                ))
+            return finalizer.finalize(
+                self.attempt_path, self.outcome,
+                "2026-07-24T00:00:00Z",
+                "2026-07-24T00:01:00Z",
+                stage, code, status,
+            )
+
+
+def reject_direct(
+    fixture: DirectFinalizerFixture, status: str,
+    writer: Callable[..., None] | None = None,
+) -> None:
+    try:
+        fixture.invoke(status, writer)
+    except (OSError, ValueError):
+        return
+    raise AssertionError("invalid direct finalization was accepted")
+
+
+def intercepted_writer(
+    target: Path,
+    mutate: Callable[[], None] | None = None,
+    *, fail_after_verify: bool = False,
+    mutate_after: Callable[[], None] | None = None,
+) -> Callable[..., None]:
+    original = finalizer.write_json_exclusive
+
+    def writer(
+        path: Path, value: Mapping[str, object],
+        directory_fd: int | None = None,
+        before_link: Callable[[], None] | None = None,
+        *,
+        before_link_with_temp: Callable[[object], None] | None = None,
+        on_temp_created: Callable[[object], None] | None = None,
+    ) -> None:
+        if path != target:
+            original(
+                path, value, directory_fd, before_link,
+                before_link_with_temp=before_link_with_temp,
+                on_temp_created=on_temp_created,
+            )
+            return
+        assert before_link is None
+        assert before_link_with_temp is not None
+
+        def inject(temporary: object) -> None:
+            if mutate is not None:
+                mutate()
+            before_link_with_temp(temporary)
+            if fail_after_verify:
+                raise OSError("injected publication failure")
+
+        original(
+            path, value, directory_fd,
+            before_link_with_temp=inject,
+            on_temp_created=on_temp_created,
+        )
+        if mutate_after is not None:
+            mutate_after()
+
+    return writer
+
+
+def verify_direct_finalization() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-direct-",
+    ) as directory:
+        root = Path(directory)
+        fixture = DirectFinalizerFixture(
+            root / "nonisolated", "setup-failure",
+        )
+        try:
+            fixture.invoke(
+                "setup-failure", patch_isolation_boundary=False,
+            )
+        except ValueError as error:
+            assert "isolated" in str(error)
+        else:
+            raise AssertionError("nonisolated direct finalization was accepted")
+        assert not fixture.outcome.exists()
+
+        for status in TERMINALS:
+            case = root / status
+            case.mkdir()
+            fixture = DirectFinalizerFixture(case, status)
+            result = fixture.invoke(status)
+            assert result["status"] == status
+            assert fixture.outcome.exists()
+            assert fixture.summary.exists() == (
+                status in ("gate-failure", "pass")
+            )
+            expected = {
+                "preflight-failure": (False, False),
+                "setup-failure": (False, False),
+                "experiment-failure": (True, False),
+                "analysis-integrity-failure": (True, True),
+                "gate-failure": (True, True),
+                "pass": (True, True),
+            }[status]
+            assert (
+                result["outputs"]["fits"]["state"] == "present",
+                result["outputs"]["predictions"]["state"] == "present",
+            ) == expected
+
+        for index, present in enumerate((
+            (), ("predictions",), ("fits", "predictions"),
+        )):
+            fixture = DirectFinalizerFixture(
+                root / f"experiment-partial-{index}",
+                "experiment-failure", present,
+            )
+            result = fixture.invoke("experiment-failure")
+            assert tuple(
+                name for name in ("fits", "predictions")
+                if result["outputs"][name]["state"] == "present"
+            ) == present
+
+        fixture = DirectFinalizerFixture(root / "no-clobber", "setup-failure")
+        fixture.invoke("setup-failure")
+        original = fixture.outcome.read_bytes()
+        reject_direct(fixture, "setup-failure")
+        assert fixture.outcome.read_bytes() == original
+
+    args = finalizer.parse_args([
+        "attempt.json", "outcome.json",
+        "--started", "2026-07-24T00:00:00Z",
+        "--ended", "2026-07-24T00:01:00Z",
+        "--stage", "analysis", "--exit", "0", "--status", "pass",
+    ])
+    assert (args.stage, args.exit_code, args.status) == (
+        "analysis", 0, "pass",
+    )
+
+
+def verify_summary_retry() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-retry-",
+    ) as directory:
+        fixture = DirectFinalizerFixture(Path(directory), "pass")
+        writer = intercepted_writer(
+            fixture.outcome, fail_after_verify=True,
+        )
+        reject_direct(fixture, "pass", writer)
+        assert fixture.summary.exists()
+        assert not fixture.outcome.exists()
+        assert not tuple(fixture.experiments.glob(".*.tmp"))
+        identity = (fixture.summary.stat().st_dev, fixture.summary.stat().st_ino)
+        result = fixture.invoke("pass")
+        assert result["status"] == "pass"
+        assert identity == (
+            fixture.summary.stat().st_dev, fixture.summary.stat().st_ino,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-retry-changed-",
+    ) as directory:
+        fixture = DirectFinalizerFixture(Path(directory), "pass")
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.outcome, fail_after_verify=True),
+        )
+        fixture.summary.write_bytes(fixture.summary.read_bytes() + b" ")
+        reject_direct(fixture, "pass")
+        assert not fixture.outcome.exists()
+
+
+def verify_publication_races() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-races-",
+    ) as directory:
+        root = Path(directory)
+        mutations = {
+            "preflight-failure": lambda item: (
+                item.run.mkdir(),
+                item.fits.write_text("{}\n", encoding="ascii"),
+            ),
+            "setup-failure": lambda item:
+                item.fits.write_text("{}\n", encoding="ascii"),
+            "experiment-failure": lambda item: (
+                item.fits.unlink(),
+                item.fits.write_text('{"changed":true}\n', encoding="ascii"),
+            ),
+            "analysis-integrity-failure": lambda item: (
+                item.predictions.unlink(),
+                item.predictions.write_text(
+                    '{"changed":true}\n', encoding="ascii",
+                ),
+            ),
+        }
+        for status, mutate in mutations.items():
+            case = root / f"callback-{status}"
+            case.mkdir()
+            fixture = DirectFinalizerFixture(case, status)
+            reject_direct(
+                fixture, status,
+                intercepted_writer(
+                    fixture.outcome, lambda: mutate(fixture),
+                ),
+            )
+            assert not fixture.outcome.exists()
+            assert not tuple(fixture.experiments.glob(".*.tmp"))
+
+        case = root / "summary-extra"
+        case.mkdir()
+        fixture = DirectFinalizerFixture(case, "pass")
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(
+                fixture.summary,
+                lambda: (fixture.run / "policy.json").write_text(
+                    "{}\n", encoding="ascii",
+                ),
+            ),
+        )
+        assert not fixture.summary.exists()
+        assert not tuple(fixture.run.glob(".*.tmp"))
+
+        case = root / "csv"
+        case.mkdir()
+        fixture = DirectFinalizerFixture(case, "pass")
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(
+                fixture.summary,
+                lambda: fixture.support[-1].write_text(
+                    "changed\n", encoding="ascii",
+                ),
+            ),
+        )
+        assert not fixture.summary.exists()
+
+        case = root / "summary-replaced"
+        case.mkdir()
+        fixture = DirectFinalizerFixture(case, "pass")
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.outcome, fail_after_verify=True),
+        )
+        content = fixture.summary.read_bytes()
+
+        def replace_summary() -> None:
+            fixture.summary.unlink()
+            fixture.summary.write_bytes(content)
+
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.outcome, replace_summary),
+        )
+        assert not fixture.outcome.exists()
+
+
+def verify_parent_replacement_races() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-parent-races-",
+    ) as directory:
+        root = Path(directory)
+
+        fixture = DirectFinalizerFixture(root / "summary-parent", "pass")
+        moved_run = fixture.run.with_name("direct-summary-moved")
+
+        def replace_summary_parent() -> None:
+            fixture.run.rename(moved_run)
+            fixture.run.mkdir()
+
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.summary, replace_summary_parent),
+        )
+        assert not fixture.summary.exists()
+        assert not tuple(moved_run.glob(".*.tmp"))
+
+        fixture = DirectFinalizerFixture(root / "run-parent", "pass")
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.outcome, fail_after_verify=True),
+        )
+        moved_run = fixture.run.with_name("direct-outcome-moved")
+
+        def replace_run_parent() -> None:
+            fixture.run.rename(moved_run)
+            fixture.run.mkdir()
+
+        reject_direct(
+            fixture, "pass",
+            intercepted_writer(fixture.outcome, replace_run_parent),
+        )
+        assert not fixture.outcome.exists()
+
+        fixture = DirectFinalizerFixture(
+            root / "outcome-parent", "setup-failure",
+        )
+        moved_experiments = fixture.experiments.with_name(
+            "experiments-moved",
+        )
+
+        def replace_outcome_parent() -> None:
+            fixture.experiments.rename(moved_experiments)
+            fixture.experiments.mkdir()
+
+        reject_direct(
+            fixture, "setup-failure",
+            intercepted_writer(fixture.outcome, replace_outcome_parent),
+        )
+        assert not fixture.outcome.exists()
+        assert not tuple(moved_experiments.glob(".*.tmp"))
+
+        fixture = DirectFinalizerFixture(
+            root / "outcome-parent-after", "setup-failure",
+        )
+        moved_experiments = fixture.experiments.with_name(
+            "experiments-after-moved",
+        )
+
+        def replace_outcome_parent_after() -> None:
+            fixture.experiments.rename(moved_experiments)
+            fixture.experiments.mkdir()
+
+        reject_direct(
+            fixture, "setup-failure",
+            intercepted_writer(
+                fixture.outcome, mutate_after=replace_outcome_parent_after,
+            ),
+        )
+        assert not fixture.outcome.exists()
+        assert (moved_experiments / fixture.outcome.name).exists()
+
+
+def verify_temp_cleanup_safety() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-temp-cleanup-",
+    ) as directory_name:
+        root = Path(directory_name)
+        for mode in ("owned", "replaced", "hardlinked"):
+            directory = root / mode
+            directory.mkdir()
+            output = directory / "output.json"
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            captured = []
+
+            def reject(temporary: object) -> None:
+                captured.append(temporary)
+                temporary_path = directory / temporary.name
+                if mode == "replaced":
+                    temporary_path.unlink()
+                    temporary_path.write_text(
+                        "unowned\n", encoding="ascii",
+                    )
+                elif mode == "hardlinked":
+                    os.link(temporary_path, directory / "alias")
+                raise ValueError("injected callback failure")
+
+            try:
+                try:
+                    finalizer._publish_exclusive(
+                        output, {"status": "test"}, descriptor, reject,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "failed exclusive callback was accepted"
+                    )
+            finally:
+                os.close(descriptor)
+            assert len(captured) == 1
+            temporary = directory / captured[0].name
+            if mode == "owned":
+                assert not temporary.exists()
+            elif mode == "replaced":
+                assert temporary.read_text(encoding="ascii") == "unowned\n"
+            else:
+                assert temporary.exists()
+                assert (directory / "alias").stat().st_ino == \
+                    temporary.stat().st_ino
+
+
+def verify_early_temp_capture() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-early-temp-",
+    ) as directory_name:
+        root = Path(directory_name)
+        for mode in ("owned", "replaced", "hardlinked"):
+            directory = root / mode
+            directory.mkdir()
+            output = directory / "output.json"
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+
+            def writer(
+                path: Path, value: Mapping[str, object],
+                directory_fd: int | None = None,
+                before_link: Callable[[], None] | None = None,
+                *,
+                before_link_with_temp: Callable[[object], None] | None = None,
+                on_temp_created: Callable[[object], None] | None = None,
+            ) -> None:
+                assert path == output and before_link is None
+
+                def capture(temporary: object) -> None:
+                    assert on_temp_created is not None
+                    on_temp_created(temporary)
+                    temporary_path = directory / temporary.name
+                    if mode == "replaced":
+                        temporary_path.unlink()
+                        temporary_path.write_text(
+                            "unowned\n", encoding="ascii",
+                        )
+                    elif mode == "hardlinked":
+                        os.link(temporary_path, directory / "alias")
+
+                def fail(_: object) -> None:
+                    raise OSError("injected write failure")
+
+                file_tools.exclusive_text(
+                    path, fail, directory_fd,
+                    before_link_with_temp=before_link_with_temp,
+                    on_temp_created=capture,
+                )
+
+            try:
+                try:
+                    with patch.object(
+                        finalizer, "write_json_exclusive", writer,
+                    ):
+                        finalizer._publish_exclusive(
+                            output, {"status": "test"}, descriptor,
+                            lambda _: None,
+                        )
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("pre-link write failure was accepted")
+            finally:
+                os.close(descriptor)
+            temporary = tuple(directory.glob(".output.json.*.tmp"))
+            if mode == "owned":
+                assert not temporary
+            elif mode == "replaced":
+                assert len(temporary) == 1
+                assert temporary[0].read_text(encoding="ascii") == "unowned\n"
+            else:
+                assert len(temporary) == 1
+                assert temporary[0].stat().st_ino == \
+                    (directory / "alias").stat().st_ino
+
+
+def verify_status_closure_rejections() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-closures-",
+    ) as directory:
+        root = Path(directory)
+        for status in (
+            "preflight-failure", "setup-failure",
+            "experiment-failure", "analysis-integrity-failure",
+        ):
+            case = root / f"extra-{status}"
+            case.mkdir()
+            fixture = DirectFinalizerFixture(case, status)
+            fixture.run.mkdir(exist_ok=True)
+            (fixture.run / "test.jsonl").write_text("{}\n", encoding="ascii")
+            reject_direct(fixture, status)
+
+            case = root / f"alias-{status}"
+            case.mkdir()
+            fixture = DirectFinalizerFixture(case, status)
+            fixture.run.mkdir(exist_ok=True)
+            alias = (
+                fixture.predictions
+                if status == "analysis-integrity-failure" else fixture.fits
+            )
+            alias.unlink(missing_ok=True)
+            source = (
+                fixture.fits
+                if status == "analysis-integrity-failure" else
+                fixture.attempt_path
+            )
+            os.link(source, alias)
+            reject_direct(fixture, status)
+
+        case = root / "symlink"
+        case.mkdir()
+        fixture = DirectFinalizerFixture(case, "pass")
+        moved = fixture.run.with_name("direct-real")
+        fixture.run.rename(moved)
+        fixture.run.symlink_to(moved, target_is_directory=True)
+        reject_direct(fixture, "pass")
+        assert not fixture.summary.exists()
+
+
 def main() -> None:
     verify_attempt()
+    verify_isolated_startup()
     verify_input_derivation()
     verify_fit_schedule()
+    verify_market_truth_derivation()
+    verify_scaling_finalizer()
+    verify_gate_boundaries()
+    verify_real_paired_comparison()
+    verify_majority_baseline()
+    verify_direct_finalization()
+    verify_summary_retry()
+    verify_publication_races()
+    verify_parent_replacement_races()
+    verify_temp_cleanup_safety()
+    verify_early_temp_capture()
+    verify_status_closure_rejections()
     print("universe scaling driver tests passed")
 
 

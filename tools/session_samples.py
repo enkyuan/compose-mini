@@ -32,13 +32,23 @@ def session_samples(
     history_bars: int,
     horizon_bars: int,
     alignment_horizon_bars: int,
+    *,
+    opportunity_stop: int | None = None,
 ) -> SessionSamples:
-    """Return rows whose history, entry, and fixed-horizon target exist."""
+    """Return eligible rows before the stop and the full opportunity count."""
     values = (history_bars, horizon_bars, alignment_horizon_bars)
     if any(type(value) is not int or value < 1 for value in values) or \
        horizon_bars > alignment_horizon_bars:
         raise ValueError("invalid sample history or horizon")
     grid = tuple(expected_bins(calendar, start, end, minutes))
+    first_target = history_bars + alignment_horizon_bars - 1
+    opportunities = max(0, len(grid) - first_target)
+    if opportunity_stop is not None and (
+        type(opportunity_stop) is not int or
+        not 0 <= opportunity_stop <= opportunities
+    ):
+        raise ValueError("invalid opportunity stop")
+    stop = opportunities if opportunity_stop is None else opportunity_stop
     ordinal_by_time = {
         item.timestamp: ordinal for ordinal, item in enumerate(grid)
     }
@@ -53,12 +63,12 @@ def session_samples(
         observed[ordinal] = row
         previous = ordinal
 
-    first_target = history_bars + alignment_horizon_bars - 1
     rows, streak = [], 0
     for as_of_ordinal, row in enumerate(observed):
         streak = streak + 1 if row >= 0 else 0
         target_ordinal = as_of_ordinal + horizon_bars
         if first_target <= target_ordinal < len(grid) and \
+           target_ordinal - first_target < stop and \
            streak >= history_bars and \
            observed[as_of_ordinal + 1] >= 0 and \
            observed[target_ordinal] >= 0:
@@ -66,6 +76,4 @@ def session_samples(
                 observed[as_of_ordinal], observed[as_of_ordinal + 1],
                 observed[target_ordinal], as_of_ordinal,
             ))
-    return SessionSamples(
-        tuple(rows), max(0, len(grid) - first_target),
-    )
+    return SessionSamples(tuple(rows), opportunities)

@@ -4,6 +4,7 @@
 from datetime import date
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -11,15 +12,18 @@ sys.path.insert(0, str(ROOT))
 from tools.session_calendar import (
     DEFAULT_CALENDAR, SessionCalendar, expected_bins,
 )
+import tools.session_samples as sample_tools
 from tools.session_samples import SampleRows, SessionSamples, session_samples
 
 START = date(2024, 11, 1)
 END = date(2024, 11, 5)
 
 
-def raises(function: object, *args: object) -> None:
+def raises(
+    function: object, *args: object, **kwargs: object,
+) -> None:
     try:
-        function(*args)  # type: ignore[operator]
+        function(*args, **kwargs)  # type: ignore[operator]
     except ValueError:
         return
     raise AssertionError("expected ValueError")
@@ -110,6 +114,49 @@ def test_early_close_boundary() -> None:
     assert result.rows[0] == SampleRows(16, 17, 29, 16)
 
 
+def test_opportunity_stop() -> None:
+    timestamps = grid()
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    original = SampleRows
+    constructed = []
+    first_target = 17 + 13 - 1
+
+    def opportunity(as_of_ordinal: int) -> int:
+        return as_of_ordinal + 13 - first_target
+
+    def construct(
+        as_of: int, entry: int, target: int, as_of_ordinal: int,
+    ) -> SampleRows:
+        index = opportunity(as_of_ordinal)
+        assert index < 3
+        constructed.append(index)
+        return original(as_of, entry, target, as_of_ordinal)
+
+    with patch.object(sample_tools, "SampleRows", new=construct):
+        result = session_samples(
+            timestamps, 30, calendar, START, END, 17, 13, 13,
+            opportunity_stop=3,
+        )
+    assert result.opportunities == 10
+    assert constructed == [0, 1, 2]
+    assert tuple(
+        opportunity(row.as_of_ordinal) for row in result.rows
+    ) == (0, 1, 2)
+    assert len(session_samples(
+        timestamps, 30, calendar, START, END, 17, 13, 13,
+        opportunity_stop=0,
+    ).rows) == 0
+    assert session_samples(
+        timestamps, 30, calendar, START, END, 17, 13, 13,
+        opportunity_stop=10,
+    ) == samples(timestamps)
+    for stop in (-1, 11, True):
+        raises(
+            session_samples, timestamps, 30, calendar, START, END,
+            17, 13, 13, opportunity_stop=stop,
+        )
+
+
 def test_invalid_observations() -> None:
     timestamps = grid()
     calendar = SessionCalendar.read(DEFAULT_CALENDAR)
@@ -134,6 +181,7 @@ def main() -> None:
     test_complete_samples()
     test_missing_rows()
     test_early_close_boundary()
+    test_opportunity_stop()
     test_invalid_observations()
     print("session grid and sample tests passed")
 

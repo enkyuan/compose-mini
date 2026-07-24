@@ -51,7 +51,8 @@ from tools.panel_contract import (
     expected_panel_commands, expected_panel_sweep, panel_analysis_protocol,
     panel_gates, panel_profile, selected_source_tree,
     validate_panel_analysis,
-    mkdir_nofollow, read_canonical_json, read_canonical_json_lines,
+    iter_canonical_json_lines, mkdir_nofollow, read_canonical_json,
+    read_canonical_json_lines,
     regular_file_identities,
 )
 
@@ -2125,6 +2126,35 @@ def verify_rejection_surface() -> None:
         nonfinite = root / "nonfinite.json"
         duplicate.write_text('{"schema":1,"schema":1}\n', encoding="ascii")
         nonfinite.write_text('{"value":NaN}\n', encoding="ascii")
+        streaming = root / "streaming.jsonl"
+        streaming.write_text(
+            '{"row": 1}\n{ "row": 2 }\n', encoding="ascii",
+        )
+        rows = iter_canonical_json_lines(streaming)
+        assert next(rows) == {"row": 1}
+        try:
+            next(rows)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("streamed noncanonical JSONL was accepted")
+        limited = iter_canonical_json_lines(
+            streaming, max_line_bytes=len(b'{"row": 1}\n') - 1,
+        )
+        try:
+            next(limited)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("oversized canonical JSONL was accepted")
+        for limit in (0, True):
+            try:
+                next(iter_canonical_json_lines(
+                    streaming, max_line_bytes=limit,
+                ))
+            except ValueError:
+                continue
+            raise AssertionError("invalid JSONL byte limit was accepted")
         real_parent = root / "real-parent"
         linked_parent = root / "linked-parent"
         real_parent.mkdir()

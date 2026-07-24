@@ -8,9 +8,9 @@
 whether expanding the shared training universe improves horizon-13 forecasts,
 then execute only after preflight proves complete declared gate coverage.
 
-**Known preflight outcome:** The current frozen inputs lack calibration rows
-for unseen rank-50 ENLC, so implementation stops before fitting unless a
-separately versioned input contract resolves that coverage failure.
+**Known preflight outcome:** The current frozen inputs are coverage-valid:
+fold 0 evaluates 53 stocks, fold 1 evaluates 52, and calibration evaluates 51,
+including all 11 unseen-transfer stocks.
 
 **Architecture:** Bind the frozen selection package, four nested manifests,
 schema-4 fetch report, exchange calendar, raw-17 configuration, 55 CSVs,
@@ -248,22 +248,19 @@ silently shrink the training cohort. The reserved block is recorded as
 metadata but is never passed to `pack_rows()`.
 
 For the current frozen inputs, preflight must record exact validation coverage
-of 52 stocks for fold 0, 51 for fold 1, and 50 for calibration, including the
+of 53 stocks for fold 0, 52 for fold 1, and 51 for calibration, including the
 ordered misses:
 
 ```python
 {
-    "fold-0": ("ALTR", "ZI", "ENLC"),
-    "fold-1": ("ALTR", "ZI", "INFA", "ENLC"),
-    "calibration": ("ALTR", "ZI", "FYBR", "INFA", "ENLC"),
+    "fold-0": ("ALTR", "ZI"),
+    "fold-1": ("ALTR", "ZI", "INFA"),
+    "calibration": ("ALTR", "ZI", "FYBR", "INFA"),
 }
 ```
 
-ENLC is unseen rank 50, so calibration covers only 10 of the mandatory 11
-unseen stocks. Fail preflight before fitting. Do not shrink the denominator or
-spend the 1,200-fit budget on an attempt that cannot pass its declared gate.
-Continuing requires a separately versioned, pre-training coverage contract and
-newly bound inputs.
+Calibration covers all 11 mandatory unseen stocks. Preserve the explicit
+added-stock misses without shrinking a denominator or synthesizing rows.
 
 - [ ] **Step 5: Run focused and aggregate checks**
 
@@ -291,7 +288,7 @@ feat(training): bind universe scaling preflight
 ### Task 2: Execute every pooled development fit
 
 This task begins only after Task 1 produces a coverage-valid armed attempt.
-The current frozen inputs fail that precondition.
+The current frozen inputs satisfy that precondition.
 
 **Files:**
 
@@ -325,13 +322,13 @@ for mode in ("fixed-update", "fixed-epoch"):
 ```
 
 This would yield 420 neural pooled fits. Add 15 seedless `global_ridge` fits, once
-per `(cohort, phase)`, and reuse them across modes and questions. Generate zero
-predictions once per evaluation grid. Fit local Transformers only for
+per `(cohort, phase)`, and reuse them across modes and questions. Synthesize
+analytic zero during analysis; it has no fit or prediction-ledger rows. Fit
+local Transformers only for
 phase-evaluable stock/phase pairs: current frozen coverage requires exactly
-`5 * (52 + 51 + 50) = 765` seeded local fits. Reuse each local fit across
+`5 * (53 + 52 + 51) = 780` seeded local fits. Reuse each local fit across
 questions, cohorts, modes, and views with the same grid. The complete physical
-schedule would therefore be 1,200 fits for the current coverage; zero is
-analytic. Do not execute it after the known preflight failure.
+schedule is therefore 1,215 fits for the current coverage; zero is analytic.
 
 Map unique fits into question views afterward: `cohort-scaling` uses
 `11/22/33/55` and all six comparators; `unseen-transfer` uses `11/22/33/44`
@@ -398,7 +395,6 @@ Canonical identities omit evaluation-only axes:
 pooled_id = (mode, cohort, phase, model, seed, member_ids)
 ridge_id = (cohort, phase, member_ids)
 local_id = (phase, series, seed)
-zero_id = (phase, series)
 ```
 
 Question and view never enter a fit identity; mode enters only neural pooled
@@ -412,34 +408,31 @@ every row.
 Each physical fit record contains its canonical fit ID, applicable training
 axes, ordered member IDs, exact budget, train/validation coverage, selected
 checkpoint or epoch, optimizer updates, model fingerprint, and declared
-question uses. Reused zero, ridge, and local controls retain one canonical
-provenance ID; they cannot emit a second conflicting fit.
+question uses. Reused ridge and local controls retain one canonical provenance
+ID; they cannot emit a second conflicting fit. Zero is synthesized by analysis
+and has neither a fit nor a prediction-ledger row.
 
 Each prediction record contains:
 
 ```python
 {
-    "schema": 1,
-    "question": question,
-    "mode": mode,
-    "cohort": cohort,
+    "schema": 2,
+    "provenance_id": provenance_id,
+    "model_fingerprint": model_fingerprint,
     "phase": phase,
     "series": series,
-    "model": model,
-    "seed": seed,
-    "provenance_id": provenance_id,
-    "as_of": as_of,
-    "entry_time": entry_time,
-    "target_time": target_time,
-    "actual_return": actual_return,
-    "predicted_return": predicted_return,
-    "reference_price": reference_price,
-    "outcome_price": outcome_price,
+    "grid_sha256": grid_sha256,
+    "predictions": {
+        "encoding": "f32le-base64",
+        "count": count,
+        "base64": canonical_base64,
+    },
 }
 ```
 
-Inverse each stock's target scaler before publication. Sort by declared
-schedule, manifest order, and target time.
+Emit one record per physical fit and required destination in fit-schedule and
+manifest order. Inverse each stock's target scaler before encoding finite
+binary32 returns. Zero is synthesized by analysis and emits no ledger rows.
 
 - [ ] **Step 4: Implement one-shot process control**
 
@@ -485,7 +478,9 @@ every stage failure and SIGHUP/SIGINT/SIGTERM window.
 
 Use only `stock_macro_metrics()`, `cohort_views()`, `unseen_view()`, and
 `paired_comparison()`. Average the five neural predictions in return space
-before metrics. Emit core, added, all, and unseen views with 5-, 10-, and
+before metrics. Stream the prediction ledger once, retain per-series metrics
+for every phase and prediction arrays only for calibration, and synthesize
+zero on demand. Emit core, added, all, and unseen views with 5-, 10-, and
 20-trading-day paired intervals.
 
 ```python
@@ -542,7 +537,7 @@ feat(training): finalize universe scaling evidence
 ### Task 4: Run the frozen development benchmark once
 
 This task is conditional on a coverage-valid armed attempt; the current frozen
-inputs are not eligible.
+inputs are eligible.
 
 **Generated files:**
 

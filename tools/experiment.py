@@ -97,7 +97,9 @@ class SeriesTransformer(nn.Module):
 def _torch_identity() -> TorchIdentity:
     package = Path(torch.__file__).resolve().parent
     return TorchIdentity(
-        executable_binding(Path(sys.executable), sys.version),
+        executable_binding(
+            Path(sys.executable), f"Python {sys.version.split()[0]}",
+        ),
         str(torch.__version__), torch.version.git_version,
         torch.version.cuda, torch.__config__.show(), source_tree(package),
     )

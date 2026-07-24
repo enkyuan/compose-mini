@@ -26,8 +26,10 @@ from tools.panel_contract import (
     FileBinding, TorchIdentity, executable_binding, selected_source_tree,
 )
 from tools.universe_scaling_contract import (
-    EXPECTED_BUDGETS, EXPECTED_MISSING, PHASES, PhaseCoverage,
-    ScalingCoverage, SeriesCoverage, TreeBinding, timestamp_grid_sha256,
+    EXPECTED_BUDGETS, EXPECTED_MISSING, EXPECTED_PREDICTION_RECORDS,
+    MODES, PHASES, SEEDS, FitJob, PhaseCoverage, ScalingCoverage,
+    SeriesCoverage, TreeBinding, expected_fit_jobs, expected_protocol,
+    question_uses, required_prediction_series, timestamp_grid_sha256,
 )
 from tools.universe_scaling_inputs import ScalingSeries
 
@@ -491,6 +493,104 @@ def verify_exact_coverage_and_fit_closure() -> None:
             raise AssertionError("nonfrozen fit closure was accepted")
 
 
+def verify_prediction_schedule() -> None:
+    names = tuple(f"S{54 - index:02d}" for index in range(55))
+    coverage = synthetic_coverage(names)
+    evaluable = {
+        phase.phase: phase.evaluable for phase in coverage.phases
+    }
+    jobs = expected_fit_jobs(names, evaluable)
+    records = {
+        kind: sum(
+            len(required_prediction_series(job, names, evaluable))
+            for job in jobs if job.kind == kind
+        )
+        for kind in ("pooled", "ridge", "local")
+    }
+    assert records == {
+        "pooled": 12_960,
+        "ridge": 476,
+        "local": 780,
+    }
+    assert sum(records.values()) == EXPECTED_PREDICTION_RECORDS == 14_216
+
+    conditioned = FitJob(
+        "pooled", MODES[0], 11, PHASES[0],
+        "conditioned_panel_transformer", SEEDS[0], names[:11],
+    )
+    pooled = replace(conditioned, model="panel_transformer")
+    assert required_prediction_series(
+        conditioned, names, evaluable,
+    ) == names[:11]
+    assert required_prediction_series(
+        pooled, names, evaluable,
+    ) == (*names[:11], *names[44:])
+    local_missing = FitJob(
+        "local", None, None, PHASES[0], "local_transformer",
+        SEEDS[0], (names[14],),
+    )
+    assert required_prediction_series(
+        local_missing, names, evaluable,
+    ) == ()
+    assert question_uses(local_missing, names)
+    ridge = FitJob(
+        "ridge", None, 11, PHASES[0], "global_ridge", None, names[:11],
+    )
+    zero = FitJob("zero", None, None, PHASES[0], "zero", None, ())
+    invalid_axes = (
+        replace(pooled, mode=None),
+        replace(pooled, mode="invalid"),
+        replace(pooled, cohort=11.0),
+        replace(pooled, model="global_ridge"),
+        replace(pooled, seed=None),
+        replace(pooled, members=names[:10]),
+        replace(conditioned, cohort=44, members=names[:44]),
+        replace(ridge, mode=MODES[0]),
+        replace(ridge, model="panel_transformer"),
+        replace(ridge, seed=SEEDS[0]),
+        replace(local_missing, mode=MODES[0]),
+        replace(local_missing, cohort=11),
+        replace(local_missing, model="panel_transformer"),
+        replace(local_missing, seed=None),
+        replace(local_missing, members=names[14:16]),
+        replace(pooled, phase="invalid"),
+        replace(pooled, kind="invalid"),
+        zero,
+    )
+    for job in invalid_axes:
+        for call in (
+            lambda job=job: question_uses(job, names),
+            lambda job=job: required_prediction_series(
+                job, names, evaluable,
+            ),
+        ):
+            try:
+                call()
+            except ValueError:
+                continue
+            raise AssertionError("invalid fit axes were accepted")
+
+    invalid_evaluable = dict(evaluable)
+    invalid_evaluable[PHASES[0]] = tuple(
+        reversed(invalid_evaluable[PHASES[0]])
+    )
+    invalid = (
+        (pooled, names[:-1], evaluable),
+        (pooled, names, {PHASES[0]: evaluable[PHASES[0]]}),
+        (pooled, names, invalid_evaluable),
+    )
+    for job, master, phase_evaluable in invalid:
+        try:
+            required_prediction_series(job, master, phase_evaluable)
+        except ValueError:
+            continue
+        raise AssertionError("invalid prediction schedule was accepted")
+
+    protocol = expected_protocol()
+    assert protocol["device"] == "cpu"
+    assert protocol["prediction_schema"] == 2
+
+
 class PackedGrid:
     def __init__(self, train: int, row: object | None) -> None:
         self.train = train
@@ -682,6 +782,7 @@ def main() -> None:
     ) as directory:
         verify_nonpromotable_coverage(Path(directory))
     verify_exact_coverage_and_fit_closure()
+    verify_prediction_schedule()
     verify_timestamp_grid_provenance()
     verify_coverage_parser()
     verify_schema_precedes_data_and_runtime()

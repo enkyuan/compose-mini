@@ -11,6 +11,7 @@ import json
 import hashlib
 import math
 import os
+import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
@@ -32,7 +33,7 @@ from tools.experiment import (
     _panel_members, _panel_selected_epochs, _prediction_records, _prepare_packed,
     _run_experiment, _selected_epochs, _SeriesDataset, _stock_uniform_loader,
     _stock_uniform_weights, _verify_test_state, expected_runs, holdout_split,
-    linear_model, purged_split, run_experiment, select_candidates,
+    _torch_identity, linear_model, purged_split, run_experiment, select_candidates,
     stock_macro_linear_model, walk_forward_splits, write_predictions,
     write_report,
 )
@@ -1781,6 +1782,13 @@ def verify_universe_contract(root: Path) -> None:
 
 
 def main() -> None:
+    with patch("tools.experiment.source_tree"):
+        identity = _torch_identity()
+    version = subprocess.run(
+        [sys.executable, "--version"], check=True, capture_output=True, text=True,
+    )
+    assert identity.python.version == \
+        (version.stdout or version.stderr).strip()
     assert walk_forward_splits(20, 2, 0.2) == ((8, 4), (12, 4))
     assert walk_forward_splits(100, 2, 0.1) == ((70, 10), (80, 10))
     assert walk_forward_splits(100, 2, 0.1, 2) == ((60, 10), (70, 10))

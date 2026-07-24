@@ -151,6 +151,7 @@ def exclusive_text(
     before_link: Callable[[], None] | None = None,
     *,
     before_link_with_temp: Callable[[ExclusiveTemp], None] | None = None,
+    on_temp_created: Callable[[ExclusiveTemp], None] | None = None,
 ) -> None:
     """Fsync, revalidate, then rename a writer-bound inode without replacing."""
     if before_link is not None and before_link_with_temp is not None:
@@ -172,6 +173,8 @@ def exclusive_text(
         )
         metadata = os.fstat(descriptor)
         binding = ExclusiveTemp(name, (metadata.st_dev, metadata.st_ino))
+        if on_temp_created is not None:
+            on_temp_created(binding)
         with os.fdopen(
             descriptor, "w", encoding="utf-8", closefd=False,
         ) as file:
@@ -223,6 +226,7 @@ def write_json_exclusive(
     before_link: Callable[[], None] | None = None,
     *,
     before_link_with_temp: Callable[[ExclusiveTemp], None] | None = None,
+    on_temp_created: Callable[[ExclusiveTemp], None] | None = None,
 ) -> None:
     def write(file: TextIO) -> None:
         json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
@@ -231,6 +235,7 @@ def write_json_exclusive(
     exclusive_text(
         path, write, directory_fd, before_link,
         before_link_with_temp=before_link_with_temp,
+        on_temp_created=on_temp_created,
     )
 
 

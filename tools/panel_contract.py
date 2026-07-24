@@ -1078,34 +1078,58 @@ def read_canonical_json(path: Path) -> Mapping[str, object]:
     return value
 
 
+def iter_canonical_json_lines(
+    path: Path, *, max_line_bytes: int | None = None,
+) -> Iterator[Mapping[str, object]]:
+    """Stream finite, duplicate-free, canonical JSON objects by line."""
+    if max_line_bytes is not None and (
+        type(max_line_bytes) is not int or max_line_bytes < 1
+    ):
+        raise ValueError("canonical ledger line limit is invalid")
+    found = False
+    try:
+        with path.open("rb") as file:
+            while line := file.readline(
+                -1 if max_line_bytes is None else max_line_bytes + 1,
+            ):
+                found = True
+                if max_line_bytes is not None and \
+                        len(line) > max_line_bytes:
+                    raise ValueError(
+                        "canonical ledger row exceeds its byte limit"
+                    )
+                try:
+                    value = json.loads(
+                        line, object_pairs_hook=_pairs,
+                        parse_constant=lambda token: (_ for _ in ()).throw(
+                            ValueError(f"invalid numeric constant: {token}")
+                        ),
+                    )
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        f"cannot read canonical ledger: {error}"
+                    ) from error
+                _finite_tree(value)
+                if not isinstance(value, dict) or line != (
+                    json.dumps(
+                        value, allow_nan=False, sort_keys=True,
+                    ) + "\n"
+                ).encode():
+                    raise ValueError(
+                        "ledger rows must be canonical JSON objects"
+                    )
+                yield value
+    except OSError as error:
+        raise ValueError(f"cannot read canonical ledger: {error}") from error
+    if not found:
+        raise ValueError("canonical ledger must not be empty")
+
+
 def read_canonical_json_lines(
     path: Path,
 ) -> tuple[Mapping[str, object], ...]:
     """Decode finite, duplicate-free, canonical JSON objects by line."""
-    try:
-        lines = path.read_bytes().splitlines(keepends=True)
-    except OSError as error:
-        raise ValueError(f"cannot read canonical ledger: {error}") from error
-    if not lines:
-        raise ValueError("canonical ledger must not be empty")
-    values = []
-    for line in lines:
-        try:
-            value = json.loads(
-                line, object_pairs_hook=_pairs,
-                parse_constant=lambda token: (_ for _ in ()).throw(
-                    ValueError(f"invalid numeric constant: {token}")
-                ),
-            )
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"cannot read canonical ledger: {error}") from error
-        _finite_tree(value)
-        if not isinstance(value, dict) or line != (
-            json.dumps(value, allow_nan=False, sort_keys=True) + "\n"
-        ).encode():
-            raise ValueError("ledger rows must be canonical JSON objects")
-        values.append(value)
-    return tuple(values)
+    return tuple(iter_canonical_json_lines(path))
 
 
 @contextmanager
