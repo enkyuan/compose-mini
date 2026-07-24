@@ -21,13 +21,13 @@ PRIMARY = Path(
     "codex-primary-runtime/dependencies/python/bin/python3"
 )
 UV = Path("/Users/Enkang.Yuan1/.local/bin/uv")
-ATTEMPT = Path("experiments/executable-h13-panel-attempt.json")
+ATTEMPT = Path("experiments/executable-h13-conditioned-panel-attempt.json")
 INPUTS = Path("experiments/executable-h13-panel-inputs.json")
-CONFIG = Path("experiments/executable-h13-panel.example.json")
+CONFIG = Path("experiments/executable-h13-conditioned-panel.example.json")
 BASELINE_REPORT = Path("reports/executable-h13-calibration.json")
 BASELINE_LEDGER = Path("reports/executable-h13-calibration.jsonl")
-RUN_DIR = Path("reports/h13-panel-20260723-01")
-OUTCOME = Path("experiments/executable-h13-panel-outcome.json")
+RUN_DIR = Path("reports/h13-conditioned-panel-20260724-01")
+OUTCOME = Path("experiments/executable-h13-conditioned-panel-outcome.json")
 SERIES = (
     "AAPL=data/aapl-30m.csv",
     "MSFT=data/msft-30m.csv",
@@ -93,7 +93,7 @@ def _experiment() -> tuple[object, ...]:
         "--baseline-ledger", BASELINE_LEDGER,
         "--device", "cpu", "--calibration-only",
         "--calibration-predictions", RUN_DIR / "calibration.jsonl",
-        "--max-runs", "162",
+        "--max-runs", "207",
     )
 
 

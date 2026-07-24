@@ -16,6 +16,43 @@ sys.path.insert(0, str(ROOT))
 from tools import run_panel_attempt as driver
 
 
+def verify_frozen_bindings() -> None:
+    assert driver.ATTEMPT == Path(
+        "experiments/executable-h13-conditioned-panel-attempt.json"
+    )
+    assert driver.INPUTS == Path(
+        "experiments/executable-h13-panel-inputs.json"
+    )
+    assert driver.CONFIG == Path(
+        "experiments/executable-h13-conditioned-panel.example.json"
+    )
+    assert driver.BASELINE_REPORT == Path(
+        "reports/executable-h13-calibration.json"
+    )
+    assert driver.BASELINE_LEDGER == Path(
+        "reports/executable-h13-calibration.jsonl"
+    )
+    assert driver.RUN_DIR == Path(
+        "reports/h13-conditioned-panel-20260724-01"
+    )
+    assert driver.OUTCOME == Path(
+        "experiments/executable-h13-conditioned-panel-outcome.json"
+    )
+    assert driver.SERIES == (
+        "AAPL=data/aapl-30m.csv",
+        "MSFT=data/msft-30m.csv",
+        "SPY=data/spy-30m.csv",
+    )
+
+    command = tuple(map(str, driver._experiment()))
+    assert "--calibration-only" in command
+    assert command[command.index("--max-runs") + 1] == "207"
+    assert not {
+        "--predictions", "--policy", "--authorization", "--test",
+        "tools/backtest.py",
+    } & set(command)
+
+
 def stage(command: tuple[object, ...]) -> str:
     values = tuple(map(str, command))
     if any(item.endswith("finalize_panel_attempt.py") for item in values):
@@ -351,6 +388,7 @@ def verify_symlinked_setup_parent() -> None:
 
 
 def main() -> None:
+    verify_frozen_bindings()
     cases = (
         ({"preflight": 7, "finalizer": 0},
          ("preflight", 7, "preflight-failure"), False),

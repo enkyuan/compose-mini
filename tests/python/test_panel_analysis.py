@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import fmean
+from types import SimpleNamespace
+import ast
 import hashlib
 import json
 import math
@@ -22,12 +26,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 ANALYZER = ROOT / "tools/analyze_panel.py"
+ARMER = ROOT / "tools/arm_panel_attempt.py"
 FINALIZER = ROOT / "tools/finalize_panel_attempt.py"
 CONFIG = ROOT / "experiments/executable-h13-panel.example.json"
+COMPARISON_CONFIG = ROOT / \
+    "experiments/executable-h13-conditioned-panel.example.json"
 INPUTS = ROOT / "experiments/executable-h13-panel-inputs.json"
 
 from tools import (
-    analyze_panel as panel_analysis,
+    analyze_panel as panel_analysis, arm_panel_attempt as panel_armer,
     analyze_universe,
     backtest,
     finalize_panel_attempt as panel_finalizer,
@@ -39,7 +46,8 @@ from tools.files import file_sha256, write_json
 from tools.panel_contract import (
     BOOTSTRAP_BLOCKS, BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED,
     COMPARISON_PROFILE, FINALIZER_SOURCE_PATHS, LEGACY_PROFILE, SOURCE_PATHS,
-    SERIES, TARGET_KIND, PanelAttempt, PanelInputs, PanelProfile,
+    SERIES, TARGET_KIND, PanelAttempt, PanelInputs, PanelProfile, SourceTree,
+    TorchIdentity,
     expected_panel_commands, expected_panel_sweep, panel_analysis_protocol,
     panel_gates, panel_profile, selected_source_tree,
     validate_panel_analysis,
@@ -266,6 +274,196 @@ def tree_value(root: Path, paths: tuple[str, ...],
         )
     return {"root": str(root.resolve()), "files": files,
             "sha256": digest.hexdigest()}
+
+
+class ArmFixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.relative = root.relative_to(ROOT)
+        self.output_parent = root / "armed"
+        self.output_parent.mkdir()
+        self.output = self.relative / "armed/attempt.json"
+        self.inputs_path = self.relative / "inputs.json"
+        self.config_path = self.relative / "config.json"
+        self.legacy_config_path = self.relative / "legacy-config.json"
+        self.template_path = self.relative / "template.json"
+        self.run_dir = self.relative / "run"
+        self.outcome = self.relative / "outcome.json"
+        self.baseline_report = self.relative / "baseline.json"
+        self.baseline_ledger = self.relative / "baseline.jsonl"
+        self.csv_paths = {
+            name: self.relative / f"{name.lower()}.csv"
+            for name in SERIES
+        }
+        (ROOT / self.baseline_report).write_text("{}\n", encoding="ascii")
+        (ROOT / self.baseline_ledger).write_text("{}\n", encoding="ascii")
+        for name, path in self.csv_paths.items():
+            (ROOT / path).write_text(f"{name}\n", encoding="ascii")
+
+        timestamp = "2026-07-24T00:00:00Z"
+        write_canonical_json(ROOT / self.inputs_path, {
+            "baseline_ledger": {
+                "path": self.baseline_ledger.as_posix(),
+                "sha256": file_sha256(ROOT / self.baseline_ledger),
+            },
+            "baseline_report": {
+                "path": self.baseline_report.as_posix(),
+                "sha256": file_sha256(ROOT / self.baseline_report),
+            },
+            "schema": 1,
+            "series": [
+                {
+                    "csv": {
+                        "path": self.csv_paths[name].as_posix(),
+                        "sha256": file_sha256(ROOT / self.csv_paths[name]),
+                    },
+                    "first_timestamp": timestamp,
+                    "last_timestamp": timestamp,
+                    "name": name,
+                    "rows": 1,
+                    "timestamp_sha256": digest_text(f"{timestamp}\n"),
+                }
+                for name in SERIES
+            ],
+        })
+        write_canonical_json(
+            ROOT / self.config_path, expected_config(COMPARISON_PROFILE),
+        )
+        write_canonical_json(
+            ROOT / self.legacy_config_path, expected_config(LEGACY_PROFILE),
+        )
+
+        primary = root / "primary"
+        uv = root / "uv"
+        primary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'synthetic primary'\n",
+            encoding="ascii",
+        )
+        uv.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'synthetic uv'\n",
+            encoding="ascii",
+        )
+        primary.chmod(0o700)
+        uv.chmod(0o700)
+        self.primary = primary
+        self.uv = uv
+        self.primary_binding = {
+            "path": str(primary.resolve()),
+            "sha256": file_sha256(primary),
+            "version": "synthetic primary",
+        }
+        self.uv_binding = {
+            "path": str(uv.resolve()),
+            "sha256": file_sha256(uv),
+            "version": "synthetic uv",
+        }
+        package = root / "torch"
+        package.mkdir()
+        module = package / "module.py"
+        module.write_text("synthetic = True\n", encoding="ascii")
+        self.torch_probe = TorchIdentity.parse({
+            "config": "synthetic-config",
+            "cuda_version": None,
+            "git_version": None,
+            "package_tree": tree_value(package, ("module.py",)),
+            "python": self.primary_binding,
+            "version": "synthetic-torch",
+        })
+        self._write_template()
+
+    def _write_template(self) -> None:
+        inputs = PanelInputs.read(ROOT / self.inputs_path)
+        old_run = self.relative / "old-run"
+        old_outcome = self.relative / "old-outcome.json"
+        outputs = {
+            "experiment_report": f"{old_run}/experiment.json",
+            "calibration_ledger": f"{old_run}/calibration.jsonl",
+            "analysis_report": f"{old_run}/analysis.json",
+            "outcome": str(old_outcome),
+        }
+        commands = expected_panel_commands(
+            self.template_path, self.inputs_path.as_posix(),
+            self.legacy_config_path.as_posix(),
+            self.baseline_report.as_posix(),
+            self.baseline_ledger.as_posix(), outputs, inputs, LEGACY_PROFILE,
+        )
+        write_canonical_json(ROOT / self.template_path, {
+            "baseline_ledger": {
+                "path": self.baseline_ledger.as_posix(),
+                "sha256": file_sha256(ROOT / self.baseline_ledger),
+            },
+            "baseline_report": {
+                "path": self.baseline_report.as_posix(),
+                "sha256": file_sha256(ROOT / self.baseline_report),
+            },
+            "commands": {
+                name: list(command) for name, command in commands.items()
+            },
+            "config": {
+                "path": self.legacy_config_path.as_posix(),
+                "sha256": file_sha256(ROOT / self.legacy_config_path),
+            },
+            "environment": {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPYCACHEPREFIX": f"{old_run}/.pycache",
+            },
+            "expected_equivalent_runs": LEGACY_PROFILE.expected_runs,
+            "expected_panel_fits": LEGACY_PROFILE.expected_panel_fits,
+            "finalizer_tree": tree_value(ROOT, FINALIZER_SOURCE_PATHS),
+            "implementation_commit": "0" * 40,
+            "input_manifest": {
+                "path": self.inputs_path.as_posix(),
+                "sha256": file_sha256(ROOT / self.inputs_path),
+            },
+            "outputs": outputs,
+            "primary_python": self.primary_binding,
+            "run_dir": str(old_run),
+            "run_id": "legacy-template",
+            "schema": 1,
+            "source_tree": tree_value(ROOT, SOURCE_PATHS),
+            "status": "armed",
+            "torch_argv": [
+                self.uv_binding["path"], "run", "--offline",
+                "--with", "torch", "python",
+            ],
+            "torch_probe": asdict(self.torch_probe),
+            "uv": self.uv_binding,
+        })
+
+    def arm(
+        self, *, output: Path | None = None, config: Path | None = None,
+        commit: str = "1" * 40, run_dir: Path | None = None,
+        outcome: Path | None = None, observed: TorchIdentity | None = None,
+        pinned: bool = True, template_sha: str | None = None,
+        inputs_sha: str | None = None,
+    ) -> PanelAttempt:
+        pins = patch.multiple(
+            panel_armer,
+            HISTORICAL_TEMPLATE=self.template_path,
+            HISTORICAL_TEMPLATE_SHA256=(
+                template_sha if template_sha is not None else
+                file_sha256(ROOT / self.template_path)
+            ),
+            HISTORICAL_INPUTS=self.inputs_path,
+            HISTORICAL_INPUTS_SHA256=(
+                inputs_sha if inputs_sha is not None else
+                file_sha256(ROOT / self.inputs_path)
+            ),
+        )
+        with (pins if pinned else nullcontext()), patch.object(
+            panel_armer, "observe_torch",
+            return_value=observed or self.torch_probe,
+        ):
+            return panel_armer.arm(
+                output or self.output,
+                self.template_path,
+                self.inputs_path,
+                config or self.config_path,
+                commit,
+                "conditioned-panel",
+                run_dir or self.run_dir,
+                outcome or self.outcome,
+            )
 
 
 class PanelFixture:
@@ -1276,10 +1474,415 @@ def verify_profiles_and_sources() -> None:
         assert observed.sha256 == expected
 
 
+def verify_comparison_config() -> None:
+    config = json.loads(COMPARISON_CONFIG.read_text(encoding="utf-8"))
+    assert config == expected_config(COMPARISON_PROFILE)
+    tree = ast.parse((ROOT / "tools/experiment.py").read_text(
+        encoding="utf-8",
+    ))
+    functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+        node.name in ("_model_runs", "expected_runs")
+    ]
+    namespace = {
+        "NEURAL": frozenset((
+            "transformer", "mlp", "panel_transformer",
+            "conditioned_panel_transformer",
+        )),
+        "Sequence": Sequence,
+        "Sweep": object,
+    }
+    exec(compile(
+        ast.Module(body=functions, type_ignores=[]),
+        str(ROOT / "tools/experiment.py"), "exec",
+    ), namespace)
+    sweep = SimpleNamespace(
+        models=tuple(config["models"]),
+        seeds=tuple(config["seeds"]),
+        folds=config["folds"],
+        candidates=tuple(config["candidates"]),
+    )
+    assert namespace["expected_runs"](sweep, 3) == 207
+
+
+def arm_rejects(call: Callable[[], object], output: Path) -> None:
+    try:
+        call()
+    except (OSError, TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("invalid panel attempt was armed")
+    assert not (ROOT / output).exists()
+
+
+def verify_armer() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        created = fixture.arm()
+        assert created == PanelAttempt.read(ROOT / fixture.output)
+        assert created.expected_equivalent_runs == 207
+        assert created.expected_panel_fits == 30
+        assert tuple(item.path for item in created.source_tree.files) == \
+            tuple(sorted(SOURCE_PATHS))
+        assert tuple(item.path for item in created.finalizer_tree.files) == \
+            tuple(sorted(FINALIZER_SOURCE_PATHS))
+        assert "tools/arm_panel_attempt.py" not in {
+            item.path for item in (
+                *created.source_tree.files, *created.finalizer_tree.files,
+            )
+        }
+        template = PanelAttempt.read(ROOT / fixture.template_path)
+        assert created.primary_python == template.primary_python
+        assert created.uv == template.uv
+        assert created.torch_argv == template.torch_argv
+        assert created.torch_probe == template.torch_probe
+        assert created.input_manifest == template.input_manifest
+        inputs = PanelInputs.read(ROOT / fixture.inputs_path)
+        expected_commands = expected_panel_commands(
+            fixture.output, fixture.inputs_path.as_posix(),
+            fixture.config_path.as_posix(),
+            fixture.baseline_report.as_posix(),
+            fixture.baseline_ledger.as_posix(), dict(created.outputs),
+            inputs, COMPARISON_PROFILE,
+        )
+        assert dict(created.commands) == expected_commands
+
+        encoded = (ROOT / fixture.output).read_bytes()
+        (ROOT / fixture.output).unlink()
+        assert fixture.arm() == created
+        assert (ROOT / fixture.output).read_bytes() == encoded
+        try:
+            fixture.arm()
+        except (OSError, ValueError):
+            pass
+        else:
+            raise AssertionError("existing attempt was overwritten")
+        assert (ROOT / fixture.output).read_bytes() == encoded
+
+        rejects(lambda: panel_armer._validate_constructed(
+            replace(created, expected_equivalent_runs=206),
+            COMPARISON_PROFILE, created.commands,
+        ))
+        rejects(lambda: panel_armer._validate_constructed(
+            created, LEGACY_PROFILE, created.commands,
+        ))
+        commands = dict(created.commands)
+        commands["experiment"] = ("invalid",)
+        rejects(lambda: panel_armer._validate_constructed(
+            created, COMPARISON_PROFILE, commands,
+        ))
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-commit-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        for commit in ("1" * 39, "1" * 41, "A" * 40):
+            arm_rejects(
+                lambda commit=commit: fixture.arm(commit=commit),
+                fixture.output,
+            )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-profile-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        arm_rejects(
+            lambda: fixture.arm(config=fixture.legacy_config_path),
+            fixture.output,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-alternate-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        arm_rejects(
+            lambda: fixture.arm(pinned=False), fixture.output,
+        )
+
+    for field in ("template_sha", "inputs_sha"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-panel-arm-{field}-", dir=ROOT,
+        ) as directory:
+            fixture = ArmFixture(Path(directory))
+            arm_rejects(
+                lambda field=field: fixture.arm(**{field: "0" * 64}),
+                fixture.output,
+            )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-input-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        template = read_canonical_json(ROOT / fixture.template_path)
+        template["input_manifest"]["sha256"] = "0" * 64
+        write_canonical_json(ROOT / fixture.template_path, template)
+        arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-baseline-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        inputs = read_canonical_json(ROOT / fixture.inputs_path)
+        inputs["baseline_report"]["sha256"] = "0" * 64
+        write_canonical_json(ROOT / fixture.inputs_path, inputs)
+        template = read_canonical_json(ROOT / fixture.template_path)
+        template["input_manifest"]["sha256"] = file_sha256(
+            ROOT / fixture.inputs_path
+        )
+        write_canonical_json(ROOT / fixture.template_path, template)
+        arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-runtime-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        fixture.primary.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'changed'\n", encoding="ascii",
+        )
+        fixture.primary.chmod(0o700)
+        arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-torch-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        arm_rejects(
+            lambda: fixture.arm(observed=replace(
+                fixture.torch_probe, config="changed",
+            )),
+            fixture.output,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-paths-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        (ROOT / fixture.run_dir).mkdir()
+        arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-outcome-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        (ROOT / fixture.outcome).write_text("occupied\n", encoding="ascii")
+        arm_rejects(fixture.arm, fixture.output)
+
+    for field in ("run_dir", "outcome"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-panel-arm-file-parent-{field}-", dir=ROOT,
+        ) as directory:
+            fixture = ArmFixture(Path(directory))
+            child = fixture.inputs_path / (
+                "run" if field == "run_dir" else "outcome.json"
+            )
+            arm_rejects(
+                lambda field=field, child=child:
+                    fixture.arm(**{field: child}),
+                fixture.output,
+            )
+
+    for field in ("run_dir", "outcome"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-panel-arm-link-parent-{field}-", dir=ROOT,
+        ) as directory:
+            fixture = ArmFixture(Path(directory))
+            real = fixture.root / f"real-{field}"
+            linked = fixture.root / f"linked-{field}"
+            real.mkdir()
+            linked.symlink_to(real.name, target_is_directory=True)
+            child = fixture.relative / linked.name / (
+                "run" if field == "run_dir" else "outcome.json"
+            )
+            arm_rejects(
+                lambda field=field, child=child:
+                    fixture.arm(**{field: child}),
+                fixture.output,
+            )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-run-parent-race-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        original = panel_armer.write_json_exclusive
+        parent = fixture.root / "run-parent"
+        moved = fixture.root / "moved-run-parent"
+        parent.mkdir()
+        run_dir = fixture.relative / parent.name / "run"
+
+        def replace_run_parent(
+            path: Path, value: Mapping[str, object],
+            directory_fd: int | None = None,
+            before_link: Callable[[], None] | None = None,
+        ) -> None:
+            assert directory_fd is not None and callable(before_link)
+
+            def replace_directory() -> None:
+                parent.rename(moved)
+                parent.mkdir()
+                try:
+                    before_link()
+                finally:
+                    parent.rmdir()
+                    moved.rename(parent)
+
+            original(path, value, directory_fd, replace_directory)
+
+        with patch.object(
+            panel_armer, "write_json_exclusive", replace_run_parent,
+        ):
+            arm_rejects(
+                lambda: fixture.arm(run_dir=run_dir), fixture.output,
+            )
+
+    for collision in ("output-run", "output-outcome", "run-outcome"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-panel-arm-{collision}-", dir=ROOT,
+        ) as directory:
+            fixture = ArmFixture(Path(directory))
+            arguments = {
+                "output-run": {"run_dir": fixture.output / "run"},
+                "output-outcome": {
+                    "outcome": fixture.output / "outcome.json",
+                },
+                "run-outcome": {
+                    "outcome": fixture.run_dir / "outcome.json",
+                },
+            }[collision]
+            arm_rejects(
+                lambda arguments=arguments: fixture.arm(**arguments),
+                fixture.output,
+            )
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-mutation-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        original = panel_armer.write_json_exclusive
+
+        def mutate_before_link(
+            path: Path, value: Mapping[str, object],
+            directory_fd: int | None = None,
+            before_link: Callable[[], None] | None = None,
+        ) -> None:
+            assert directory_fd is not None and callable(before_link)
+
+            def mutate() -> None:
+                (ROOT / fixture.config_path).write_text(
+                    "{}\n", encoding="ascii",
+                )
+                before_link()
+
+            original(path, value, directory_fd, mutate)
+
+        with patch.object(
+            panel_armer, "write_json_exclusive", mutate_before_link,
+        ):
+            arm_rejects(fixture.arm, fixture.output)
+
+    for stale_paths in (SOURCE_PATHS, FINALIZER_SOURCE_PATHS):
+        with tempfile.TemporaryDirectory(
+            prefix="compose-mini-panel-arm-stale-tree-", dir=ROOT,
+        ) as directory:
+            fixture = ArmFixture(Path(directory))
+            live = panel_armer.selected_source_tree
+            hashes = {
+                path: file_sha256(ROOT / path) for path in stale_paths
+            }
+            hashes[stale_paths[0]] = "0" * 64
+            stale = SourceTree.parse(
+                tree_value(ROOT, stale_paths, hashes),
+                "stale source tree", stale_paths,
+            )
+
+            def consistently_stale(
+                root: Path, paths: tuple[str, ...],
+            ) -> SourceTree:
+                if tuple(paths) == stale_paths:
+                    return stale
+                return live(root, paths)
+
+            with patch.object(
+                panel_armer, "selected_source_tree", consistently_stale,
+            ):
+                arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-symlink-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        parent = ROOT / fixture.output.parent
+        real = parent.with_name("real-armed")
+        parent.rename(real)
+        parent.symlink_to(real.name, target_is_directory=True)
+        arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-parent-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        original = panel_armer.write_json_exclusive
+        parent = ROOT / fixture.output.parent
+        moved = parent.with_name("moved-armed")
+
+        def replace_parent(
+            path: Path, value: Mapping[str, object],
+            directory_fd: int | None = None,
+            before_link: Callable[[], None] | None = None,
+        ) -> None:
+            assert directory_fd is not None and callable(before_link)
+
+            def replace_directory() -> None:
+                parent.rename(moved)
+                parent.mkdir()
+                try:
+                    before_link()
+                finally:
+                    parent.rmdir()
+                    moved.rename(parent)
+
+            original(path, value, directory_fd, replace_directory)
+
+        with patch.object(
+            panel_armer, "write_json_exclusive", replace_parent,
+        ):
+            arm_rejects(fixture.arm, fixture.output)
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-arm-clobber-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        original = panel_armer.write_json_exclusive
+
+        def occupy_before_link(
+            path: Path, value: Mapping[str, object],
+            directory_fd: int | None = None,
+            before_link: Callable[[], None] | None = None,
+        ) -> None:
+            assert directory_fd is not None and callable(before_link)
+            (ROOT / path).write_text("original\n", encoding="ascii")
+            original(path, value, directory_fd, before_link)
+
+        with patch.object(
+            panel_armer, "write_json_exclusive", occupy_before_link,
+        ):
+            try:
+                fixture.arm()
+            except (OSError, ValueError):
+                pass
+            else:
+                raise AssertionError("occupied attempt was overwritten")
+        assert (ROOT / fixture.output).read_text(
+            encoding="ascii",
+        ) == "original\n"
+
+
 def verify_cli_surface() -> None:
     missing = [
         str(path.relative_to(ROOT))
-        for path in (ANALYZER, FINALIZER)
+        for path in (ANALYZER, ARMER, FINALIZER)
         if not path.is_file()
     ]
     assert not missing, f"missing panel tools: {', '.join(missing)}"
@@ -1289,6 +1892,12 @@ def verify_cli_surface() -> None:
     finalizer_help = run([sys.executable, FINALIZER, "--help"]).stdout
     for option in ("--started", "--ended", "--stage", "--exit", "--status"):
         assert option in finalizer_help
+    armer_help = run([sys.executable, ARMER, "--help"]).stdout
+    for option in (
+        "--runtime-template", "--input-manifest", "--config",
+        "--implementation-commit", "--run-id", "--run-dir", "--outcome",
+    ):
+        assert option in armer_help
 
 
 def verify_finalizer_transitions() -> None:
@@ -2931,7 +3540,9 @@ def main() -> None:
         replay_calibration.POLICY_MODELS
     assert "conditioned_panel_transformer" not in select_policy.POLICY_MODELS
 
+    verify_comparison_config()
     verify_profiles_and_sources()
+    verify_armer()
     verify_cli_surface()
     verify_panel_semantics()
     verify_bootstrap_boundaries()
