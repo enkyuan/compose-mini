@@ -24,10 +24,11 @@ from tools.artifact_v1 import Artifact, Config, write_artifact
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.float32 import ulp_distance
 from tools.reference import predict_windows
+from tools.session_samples import SampleRows
 from tools.train import (
     DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
-    evaluate, fit_epochs, fit_model, mean_loss, parse_args, prepare_data,
-    train as train_model, train_epoch,
+    evaluate, feature_values, fit_epochs, fit_model, mean_loss, parse_args,
+    prepare_data, prepare_rows, train as train_model, train_epoch,
 )
 
 
@@ -236,6 +237,98 @@ def verify_data_splits(csv: Path) -> None:
     assert changed.horizon_bars == 2
 
 
+def verify_indexed_windows(csv: Path) -> None:
+    config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
+    rows = read_csv(csv)
+    raw = torch.frombuffer(rows, dtype=torch.float32).view(-1, FEATURE_COUNT).clone()
+    samples = (
+        SampleRows(2, 3, 4, 2),
+        SampleRows(6, 7, 8, 6),
+        SampleRows(9, 10, 11, 9),
+        SampleRows(12, 13, 14, 12),
+    )
+    data = prepare_rows(
+        rows, config, 0.6, 0.2, (2, 1, 1),
+        horizon_bars=3, target_kind="executable-return-v1",
+        sample_rows=samples,
+    )
+    expected_rows = torch.cat((raw[:3], raw[4:7]))
+    torch.testing.assert_close(data.feature_mean, expected_rows.mean(0))
+    torch.testing.assert_close(
+        data.feature_scale, expected_rows.std(0, unbiased=False),
+    )
+    expected_targets = torch.log(torch.stack((
+        raw[4, 3] / raw[3, 0],
+        raw[8, 3] / raw[7, 0],
+    )))
+    torch.testing.assert_close(data.target_mean, expected_targets.mean())
+    torch.testing.assert_close(
+        data.target_scale, expected_targets.std(unbiased=False),
+    )
+    assert data.train.indexed
+    assert data.train.feature_starts == (0, 4, 7, 10)
+    assert data.train.sample_rows == samples
+    scaled = (raw - data.feature_mean) / data.feature_scale
+    for index, start in enumerate((0, 4)):
+        values, target, reference, outcome = data.train[index]
+        torch.testing.assert_close(values, scaled[start:start + 3])
+        torch.testing.assert_close(reference, raw[samples[index].entry, 0])
+        torch.testing.assert_close(outcome, raw[samples[index].target, 3])
+        torch.testing.assert_close(
+            target * data.target_scale + data.target_mean,
+            torch.log(outcome / reference),
+        )
+
+    stationary_samples = tuple(
+        SampleRows(as_of, as_of + 1, as_of + 2, ordinal)
+        for as_of, ordinal in ((3, 3), (7, 7), (10, 10), (13, 13))
+    )
+    stationary = prepare_rows(
+        rows, config, 0.6, 0.2, (2, 1, 1),
+        feature_set="stationary-v1", horizon_bars=3,
+        sample_rows=stationary_samples,
+    )
+    assert stationary.train.feature_starts == (0, 4, 7, 10)
+    transformed = feature_values(raw, "stationary-v1")
+    expected = (
+        transformed[:3] - stationary.feature_mean
+    ) / stationary.feature_scale
+    torch.testing.assert_close(stationary.train[0][0], expected)
+
+    sparse = prepare_rows(
+        rows[:13 * FEATURE_COUNT], config, 0.6, 0.2, (2, 1, 1),
+        horizon_bars=20,
+        sample_rows=(
+            SampleRows(2, 3, 6, 2),
+            SampleRows(5, 6, 7, 5),
+            SampleRows(8, 9, 10, 25),
+            SampleRows(11, 12, 12, 45),
+        ),
+    )
+    assert tuple(map(len, (sparse.train, sparse.validation, sparse.test))) == \
+        (2, 1, 1)
+
+    invalid = list(samples)
+    invalid[2] = SampleRows(9, 10, 11, 8)
+    late_target = list(samples)
+    late_target[1] = replace(late_target[1], target=10)
+    for options in (
+        {"sample_start": 1, "sample_rows": samples},
+        {"sample_rows": invalid},
+        {"sample_rows": late_target},
+        {"sample_rows": (object(), *samples[1:])},
+    ):
+        try:
+            prepare_rows(
+                rows, config, 0.6, 0.2, (2, 1, 1),
+                horizon_bars=3, **options,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid indexed sample contract was accepted")
+
+
 def verify_conditioned_batches() -> None:
     torch.manual_seed(17)
     config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
@@ -279,6 +372,7 @@ def main() -> None:
         trained_distance = verify_training(binary, Path(directory))
         verify_restoration(Path(directory) / "training.csv", Path(directory))
         verify_data_splits(Path(directory) / "training.csv")
+        verify_indexed_windows(Path(directory) / "training.csv")
         verify_fixed_epochs(Path(directory) / "training.csv")
         verify_conditioned_batches()
     print("training and export tests passed "

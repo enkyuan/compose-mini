@@ -31,6 +31,7 @@ from tools.data_v1 import (
     CLOSE_RETURN_TARGET, FEATURE_COUNT, TARGET_KINDS, read_csv,
 )
 from tools.float32 import f32
+from tools.session_samples import SampleRows
 
 FEATURE_NAMES = {
     "ohlcv": ("open", "high", "low", "close", "volume"),
@@ -152,18 +153,40 @@ class ForecastTransformer(nn.Module):
 class Windows(Dataset):
     def __init__(self, features: torch.Tensor, targets: torch.Tensor,
                  references: torch.Tensor, outcomes: torch.Tensor,
-                 seq_len: int, start: int, count: int) -> None:
+                 seq_len: int, start: int, count: int, *,
+                 feature_starts: Sequence[int] | None = None,
+                 sample_rows: Sequence[SampleRows] | None = None) -> None:
+        if (feature_starts is None) != (sample_rows is None):
+            raise ValueError("indexed windows require starts and sample rows")
         self.features, self.targets = features, targets
         self.references, self.outcomes = references, outcomes
         self.seq_len, self.start, self.count = seq_len, start, count
+        self.feature_starts = (
+            tuple(feature_starts) if feature_starts is not None else None
+        )
+        self.sample_rows = tuple(sample_rows) if sample_rows is not None else None
+        if self.indexed and (
+            len(self.feature_starts) != len(self.sample_rows) or
+            len(self.sample_rows) != len(targets) or
+            not 0 <= start <= start + count <= len(self.sample_rows)
+        ):
+            raise ValueError("indexed window coordinates are invalid")
+
+    @property
+    def indexed(self) -> bool:
+        return self.sample_rows is not None
 
     def __len__(self) -> int:
         return self.count
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
         sample = self.start + index
+        feature = (
+            self.feature_starts[sample] if self.feature_starts is not None
+            else sample
+        )
         return (
-            self.features[sample:sample + self.seq_len], self.targets[sample],
+            self.features[feature:feature + self.seq_len], self.targets[sample],
             self.references[sample], self.outcomes[sample],
         )
 
@@ -305,26 +328,148 @@ def prepare_data(path: Path, config: Config, train_fraction: float,
     )
 
 
+def _indexed_training_rows(
+    values: torch.Tensor, starts: Sequence[int], seq_len: int, count: int,
+) -> torch.Tensor:
+    intervals, left, right = [], starts[0], starts[0] + seq_len
+    for start in starts[1:count]:
+        end = start + seq_len
+        if start > right:
+            intervals.append((left, right))
+            left, right = start, end
+        else:
+            right = max(right, end)
+    intervals.append((left, right))
+    return torch.cat(tuple(values[start:end] for start, end in intervals))
+
+
+def _prepare_indexed_rows(
+    raw: torch.Tensor, config: Config, train_fraction: float,
+    validation_fraction: float, split: tuple[int, int, int] | None,
+    feature_set: str, horizon_bars: int, split_gap: int, target_kind: str,
+    sample_rows: Sequence[SampleRows],
+) -> TrainingData:
+    rows = tuple(sample_rows)
+    lookback = feature_lookback(feature_set)
+    if not rows or any(not isinstance(item, SampleRows) for item in rows) or \
+       any(
+           any(type(value) is not int or value < 0 for value in (
+               item.as_of, item.entry, item.target, item.as_of_ordinal,
+           ))
+           for item in rows
+       ):
+        raise ValueError("indexed sample rows are invalid")
+    starts = tuple(
+        item.as_of - (config.seq_len + lookback) + 1 for item in rows
+    )
+    row_count = len(raw)
+    if any(
+        not 0 <= start <= len(raw) - lookback - config.seq_len or
+        item.as_of >= item.entry or item.entry > item.target or
+        item.target >= row_count
+        for item, start in zip(rows, starts, strict=True)
+    ) or any(
+        left.as_of_ordinal >= right.as_of_ordinal or left_start >= right_start
+        for left, right, left_start, right_start in zip(
+            rows[:-1], rows[1:], starts[:-1], starts[1:], strict=True,
+        )
+    ):
+        raise ValueError("indexed sample rows are invalid")
+
+    usable = len(rows) - split_gap * 2
+    counts = split or split_counts(usable, train_fraction, validation_fraction)
+    if len(counts) != 3 or min(counts) <= 0 or sum(counts) > usable:
+        raise ValueError("chronological split is outside the indexed samples")
+    train_count, validation_count, test_count = counts
+    validation_start = train_count + split_gap
+    test_start = validation_start + validation_count + split_gap
+    boundaries = (
+        (0, train_count, validation_start),
+        (validation_start, validation_count, test_start),
+    )
+    if any(
+        rows[start + count - 1].target > rows[next_start].as_of or
+        rows[start + count - 1].as_of_ordinal + horizon_bars >
+        rows[next_start].as_of_ordinal
+        for start, count, next_start in boundaries
+    ):
+        raise ValueError("indexed split exposes an unavailable prior label")
+
+    values = feature_values(raw, feature_set)
+    references = (
+        raw[[item.as_of for item in rows], 3]
+        if target_kind == CLOSE_RETURN_TARGET else
+        raw[[item.entry for item in rows], 0]
+    )
+    outcomes = raw[[item.target for item in rows], 3]
+    if not torch.all(references > 0):
+        raise ValueError("target reference prices must be positive")
+    raw_targets = torch.log(outcomes / references)
+    if not torch.isfinite(raw_targets).all():
+        raise ValueError("target price ratios must produce finite log returns")
+
+    training_rows = _indexed_training_rows(
+        values, starts, config.seq_len, train_count,
+    )
+    training_targets = raw_targets[:train_count]
+    feature_mean = training_rows.mean(0)
+    feature_scale = training_rows.std(0, unbiased=False)
+    target_mean = training_targets.mean()
+    target_scale = training_targets.std(unbiased=False)
+    if not torch.isfinite(feature_mean).all() or \
+       not torch.isfinite(feature_scale).all() or \
+       not torch.all(feature_scale > 0) or not torch.isfinite(target_mean) or \
+       not torch.isfinite(target_scale) or target_scale <= 0:
+        raise ValueError(
+            "training rows require positive finite feature and target scales"
+        )
+    features = values.sub_(feature_mean).div_(feature_scale)
+    targets = (raw_targets - target_mean) / target_scale
+
+    def windows(start: int, count: int) -> Windows:
+        return Windows(
+            features, targets, references, outcomes, config.seq_len,
+            start, count, feature_starts=starts, sample_rows=rows,
+        )
+
+    return TrainingData(
+        windows(0, train_count),
+        windows(validation_start, validation_count),
+        windows(test_start, test_count),
+        feature_mean, feature_scale, target_mean, target_scale, feature_set,
+        horizon_bars, target_kind,
+    )
+
+
 def prepare_rows(rows: array, config: Config, train_fraction: float,
                  validation_fraction: float,
                  split: tuple[int, int, int] | None = None,
                  sample_start: int = 0,
                  feature_set: str = "ohlcv", horizon_bars: int = 1,
                  split_gap: int = 0,
-                 target_kind: str = CLOSE_RETURN_TARGET) -> TrainingData:
+                 target_kind: str = CLOSE_RETURN_TARGET, *,
+                 sample_rows: Sequence[SampleRows] | None = None
+                 ) -> TrainingData:
     """Scale purged target-time splits using only their retained training rows."""
     if horizon_bars < 1 or split_gap < 0 or target_kind not in TARGET_KINDS:
         raise ValueError("horizon, split gap, or target kind is invalid")
     row_count = len(rows) // FEATURE_COUNT
     lookback = feature_lookback(feature_set)
-    if row_count < config.seq_len + lookback + horizon_bars:
-        raise ValueError("training requires lookback + seq_len + horizon rows")
     # The clone gives PyTorch ownership while callers retain one compact row buffer.
     raw = torch.frombuffer(rows, dtype=torch.float32).view(
         row_count, FEATURE_COUNT,
     ).clone()
     if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
         raise ValueError("CSV values must remain finite binary32 with positive closes")
+    if sample_rows is not None:
+        if sample_start:
+            raise ValueError("indexed samples cannot use a row offset")
+        return _prepare_indexed_rows(
+            raw, config, train_fraction, validation_fraction, split,
+            feature_set, horizon_bars, split_gap, target_kind, sample_rows,
+        )
+    if row_count < config.seq_len + lookback + horizon_bars:
+        raise ValueError("training requires lookback + seq_len + horizon rows")
     # Preserve price anchors before raw OHLCV features are normalized in place.
     opens, closes = raw[lookback:, 0].clone(), raw[lookback:, 3].clone()
     values = feature_values(raw, feature_set)

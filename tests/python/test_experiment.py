@@ -25,14 +25,14 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     PANEL_MODEL_SET, Candidate, ConstantReturn, RollingMean,
-    SeriesTransformer, Sweep, _authorize_test, _candidate_data, _fit_neural,
-    _label_available, _model_fingerprint, _panel_data,
-    _panel_selected_epochs, _run_experiment, _selected_epochs, _SeriesDataset,
-    _verify_test_state, expected_runs, holdout_split, linear_model,
-    purged_split, run_experiment, select_candidates, walk_forward_splits,
-    write_predictions, write_report,
+    SeriesTransformer, Sweep, _authorize_test, _boundary, _candidate_data,
+    _fit_neural, _label_available, _matrix, _model_fingerprint, _panel_data,
+    _panel_selected_epochs, _prediction_records, _run_experiment,
+    _selected_epochs, _SeriesDataset, _verify_test_state, expected_runs,
+    holdout_split, linear_model, purged_split, run_experiment,
+    select_candidates, walk_forward_splits, write_predictions, write_report,
 )
-from tools.backtest import experiment_fingerprint, validate_policy
+from tools.backtest import Forecast, experiment_fingerprint, validate_policy
 from tools.data_v1 import (
     CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET, read_bars,
 )
@@ -45,6 +45,7 @@ from tools.panel_contract import (
     FINALIZER_SOURCE_PATHS, SOURCE_PATHS, ExecutableBinding, SourceTree,
     TorchIdentity, executable_binding, freeze_panel_execution, source_tree,
 )
+from tools.session_samples import SampleRows
 
 
 def close_value(index: int) -> float:
@@ -425,6 +426,75 @@ def verify_ridge() -> None:
                         torch.ones(5), torch.tensor(0.0), torch.tensor(1.0))
     torch.testing.assert_close(linear_model(data, 1e-8)(windows[:30]), targets[:30],
                                rtol=1e-5, atol=1e-5)
+
+
+def verify_indexed_coordinates() -> None:
+    features = torch.arange(70, dtype=torch.float32).view(14, 5)
+    targets = torch.arange(4, dtype=torch.float32)
+    anchors = torch.ones(4)
+    rows = (
+        SampleRows(1, 2, 3, 0),
+        SampleRows(5, 6, 7, 3),
+        SampleRows(8, 9, 10, 6),
+        SampleRows(10, 11, 12, 9),
+    )
+    dataset = Windows(
+        features, targets, anchors, anchors, 2, 0, 2,
+        feature_starts=(0, 4, 7, 9), sample_rows=rows,
+    )
+    values, actual_targets = _matrix(dataset)
+    expected = torch.stack((features[:2], features[4:6])).reshape(2, -1)
+    torch.testing.assert_close(values, expected.double())
+    torch.testing.assert_close(actual_targets, targets[:2].double())
+
+    timestamps = tuple(f"t{index}" for index in range(14))
+    assert _boundary(
+        timestamps, 999, (2, 1, 1), 0, sample_rows=rows,
+    ) == {
+        "train": ["t3", "t7"],
+        "validation": ["t10", "t10"],
+        "test": ["t12", "t12"],
+    }
+    _label_available(
+        timestamps, 999, (2, 1, 1), 0, 3, sample_rows=rows,
+    )
+    invalid = (*rows[:2], replace(rows[2], as_of_ordinal=5), rows[3])
+    late_target = (
+        rows[0], replace(rows[1], target=9), rows[2], rows[3],
+    )
+    for invalid_rows in (invalid, late_target):
+        try:
+            _label_available(
+                timestamps, 999, (2, 1, 1), 0, 3,
+                sample_rows=invalid_rows,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("overlapping indexed split labels were accepted")
+
+    candidate_ = candidate("indexed", 2)
+    data = TrainingData(
+        dataset, dataset, dataset, torch.zeros(5), torch.ones(5),
+        torch.tensor(0.0), torch.tensor(1.0), horizon_bars=3,
+    )
+    records = tuple(_prediction_records(
+        "transformer", candidate_, "SYNTH", 7, data, timestamps, "0" * 64,
+        (0.1, 0.2), dataset, "validation", 0,
+    ))
+    assert [(item["schema"], item["as_of"], item["entry_time"],
+             item["target_time"]) for item in records] == [
+        (4, "t1", "t2", "t3"),
+        (4, "t5", "t6", "t7"),
+    ]
+    try:
+        Forecast.parse(records[0])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("indexed predictions reached the row backtester")
+    assert {"tools/session_calendar.py", "tools/session_samples.py"} <= \
+        set(SOURCE_PATHS)
 
 
 def verify_model_fingerprint(data: TrainingData) -> None:
@@ -1427,6 +1497,7 @@ def main() -> None:
     verify_selection_is_validation_only()
     verify_selected_epochs()
     verify_ridge()
+    verify_indexed_coordinates()
     verify_stationary_features()
     sweep = Sweep(
         (candidate("short", 3), candidate("stationary", 5, "stationary-v1")),

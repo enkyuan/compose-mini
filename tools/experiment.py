@@ -41,6 +41,7 @@ from tools.panel_contract import (
     PanelExecution, TorchIdentity, executable_binding, freeze_panel_execution,
     source_tree,
 )
+from tools.session_samples import SampleRows
 from tools.train import (
     FEATURE_NAMES, FEATURE_SETS, DataSplits, Fit, ForecastTransformer,
     TrainingData, Windows, data_loaders, evaluate, feature_lookback, fit_epochs,
@@ -353,8 +354,27 @@ def purged_split(split: tuple[int, ...], gap: int,
 
 def _label_available(
     timestamps: Sequence[str], target_offset: int,
-    split: Sequence[int], gap: int, horizon: int,
+    split: Sequence[int], gap: int, horizon: int, *,
+    sample_rows: Sequence[SampleRows] | None = None,
 ) -> None:
+    if sample_rows is not None:
+        starts, offset = [], 0
+        for count in split:
+            starts.append(offset)
+            offset += count + gap
+        if offset - gap > len(sample_rows) or any(
+            sample_rows[start + count - 1].target >
+            sample_rows[next_start].as_of or
+            sample_rows[start + count - 1].as_of_ordinal + horizon >
+            sample_rows[next_start].as_of_ordinal
+            for start, count, next_start in zip(
+                starts, split, starts[1:], strict=False,
+            )
+        ):
+            raise ValueError(
+                "training labels are unavailable at the next decision"
+            )
+        return
     last_train_target = target_offset + split[0] - 1
     first_validation_as_of = target_offset + split[0] + gap - horizon
     if timestamps[last_train_target] > timestamps[first_validation_as_of]:
@@ -364,9 +384,18 @@ def _label_available(
 
 
 def _matrix(dataset: Windows) -> tuple[torch.Tensor, torch.Tensor]:
-    windows = dataset.features.unfold(0, dataset.seq_len, 1).transpose(1, 2)
     start, end = dataset.start, dataset.start + dataset.count
-    return (windows[start:end].reshape(dataset.count, -1).double(),
+    windows = (
+        torch.stack([
+            dataset.features[index:index + dataset.seq_len]
+            for index in dataset.feature_starts[start:end]
+        ])
+        if dataset.indexed else
+        dataset.features.unfold(0, dataset.seq_len, 1).transpose(1, 2)[
+            start:end
+        ]
+    )
+    return (windows.reshape(dataset.count, -1).double(),
             dataset.targets[start:end].double())
 
 
@@ -381,14 +410,22 @@ def linear_model(data: TrainingData, ridge: float) -> Affine:
     return Affine(weight.float(), bias.float())
 
 
-def _boundary(timestamps: list[str], target_offset: int,
-              split: tuple[int, ...], gap: int) -> dict[str, list[str]]:
-    starts, offset = [], target_offset
+def _boundary(
+    timestamps: Sequence[str], target_offset: int,
+    split: tuple[int, ...], gap: int, *,
+    sample_rows: Sequence[SampleRows] | None = None,
+) -> dict[str, list[str]]:
+    starts, offset = [], 0 if sample_rows is not None else target_offset
     for count in split:
         starts.append(offset)
         offset += count + gap
     return {
-        name: [timestamps[start], timestamps[start + count - 1]]
+        name: [
+            timestamps[sample_rows[start].target],
+            timestamps[sample_rows[start + count - 1].target],
+        ] if sample_rows is not None else [
+            timestamps[start], timestamps[start + count - 1],
+        ]
         for name, start, count in zip(
             ("train", "validation", "test"), starts, split, strict=False,
         )
@@ -397,16 +434,22 @@ def _boundary(timestamps: list[str], target_offset: int,
 
 def _candidate_data(rows: array, candidate: Candidate,
                     split: tuple[int, int, int],
-                    max_history: int, sweep: Sweep) -> TrainingData:
+                    max_history: int, sweep: Sweep, *,
+                    sample_rows: Sequence[SampleRows] | None = None,
+                    ) -> TrainingData:
     history = candidate.seq_len + feature_lookback(candidate.feature_set)
     return prepare_rows(
         rows, candidate.config(), 0.7, 0.15, split=split,
-        sample_start=max_history - history + sweep.alignment_horizon_bars -
-        sweep.target_horizon_bars,
+        sample_start=(
+            max_history - history + sweep.alignment_horizon_bars -
+            sweep.target_horizon_bars
+            if sample_rows is None else 0
+        ),
         feature_set=candidate.feature_set,
         horizon_bars=sweep.target_horizon_bars,
         split_gap=sweep.alignment_horizon_bars - 1,
         target_kind=sweep.target_kind,
+        sample_rows=sample_rows,
     )
 
 
@@ -424,14 +467,24 @@ def _prediction_records(model: str, candidate: Candidate, series: str,
     start = feature_lookback(candidate.feature_set) + dataset.start + \
         candidate.seq_len - 1
     for offset, prediction in enumerate(predictions):
-        as_of = start + offset
-        target = as_of + data.horizon_bars
-        yield {
-            "schema": 3, "split": split, "fold": fold, "series": series,
+        if dataset.sample_rows is None:
+            as_of = start + offset
+            times = {
+                "schema": 3, "as_of": timestamps[as_of],
+                "target_time": timestamps[as_of + data.horizon_bars],
+            }
+        else:
+            coordinates = dataset.sample_rows[dataset.start + offset]
+            times = {
+                "schema": 4, "as_of": timestamps[coordinates.as_of],
+                "entry_time": timestamps[coordinates.entry],
+                "target_time": timestamps[coordinates.target],
+            }
+        yield times | {
+            "split": split, "fold": fold, "series": series,
             "model": model, "candidate": candidate.name,
             "feature_set": candidate.feature_set, "seed": seed,
             "csv_sha256": csv_sha256,
-            "as_of": timestamps[as_of], "target_time": timestamps[target],
             "horizon_bars": data.horizon_bars,
             "target_kind": data.target_kind,
             "predicted_log_return": prediction,

@@ -24,6 +24,8 @@ SOURCE_PATHS = (
     "tools/train.py",
     "tools/artifact_v1.py",
     "tools/data_v1.py",
+    "tools/session_calendar.py",
+    "tools/session_samples.py",
     "tools/backtest.py",
     "tools/files.py",
     "tools/float32.py",
