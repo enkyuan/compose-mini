@@ -24,15 +24,16 @@ except ModuleNotFoundError as error:
     raise SystemExit("experiment tests require PyTorch") from error
 
 from tools.experiment import (
-    PANEL_MODEL_SET, Candidate, ConstantReturn, RollingMean,
+    PANEL_MODEL_SET, Candidate, ConstantReturn, FlatMLP, RollingMean,
     SeriesTransformer, Sweep, _authorize_test, _boundary, _candidate_data,
-    _fit_neural, _fit_panel_epochs, _fit_panel_updates, _label_available,
+    _fit_neural, _fit_shared_epochs, _fit_shared_updates, _label_available,
     _macro_validation_loss, _matrix, _model_fingerprint, _panel_data,
     _panel_members, _panel_selected_epochs, _prediction_records,
     _run_experiment, _selected_epochs, _SeriesDataset, _stock_uniform_loader,
     _stock_uniform_weights, _verify_test_state, expected_runs, holdout_split,
     linear_model, purged_split, run_experiment, select_candidates,
-    walk_forward_splits, write_predictions, write_report,
+    stock_macro_linear_model, walk_forward_splits, write_predictions,
+    write_report,
 )
 from tools.backtest import Forecast, experiment_fingerprint, validate_policy
 from tools.data_v1 import (
@@ -418,6 +419,27 @@ def verify_selected_epochs() -> None:
 
 
 def verify_ridge() -> None:
+    def reject(function: Callable[..., object], *args: object) -> None:
+        try:
+            function(*args)
+        except ValueError:
+            return
+        raise AssertionError("invalid ridge input was accepted")
+
+    def member(values: tuple[float, ...], targets: tuple[float, ...],
+               seq_len: int = 1) -> TrainingData:
+        features = torch.zeros(len(values), 5)
+        features[:, 0] = torch.tensor(values)
+        outcomes = torch.ones(len(targets))
+        dataset = Windows(
+            features, torch.tensor(targets), outcomes, outcomes,
+            seq_len, 0, len(targets),
+        )
+        return TrainingData(
+            dataset, dataset, dataset, torch.zeros(5), torch.ones(5),
+            torch.tensor(0.0), torch.tensor(1.0),
+        )
+
     torch.manual_seed(13)
     features, closes = torch.randn(40, 5), torch.ones(40)
     windows = features.unfold(0, 2, 1).transpose(1, 2).reshape(-1, 10)
@@ -428,6 +450,42 @@ def verify_ridge() -> None:
                         torch.ones(5), torch.tensor(0.0), torch.tensor(1.0))
     torch.testing.assert_close(linear_model(data, 1e-8)(windows[:30]), targets[:30],
                                rtol=1e-5, atol=1e-5)
+
+    first = member((0.0, 0.0), (0.0, 0.0))
+    repeated = member((2.0,) * 6, (2.0,) * 6)
+    compact = member((2.0, 2.0), (2.0, 2.0))
+    expected_weight = torch.tensor((0.5, 0.0, 0.0, 0.0, 0.0))
+    for members in ((first, repeated), (first, compact),
+                    (first, repeated, first, repeated)):
+        pooled = stock_macro_linear_model(members, 1.0)
+        torch.testing.assert_close(pooled.weight, expected_weight)
+        torch.testing.assert_close(pooled.bias, torch.tensor(0.5))
+    slopes = stock_macro_linear_model((
+        member((-1.0, 1.0), (-1.0, 1.0)),
+        member((-1.0, 1.0) * 3, (-3.0, 3.0) * 3),
+    ), 1.0)
+    torch.testing.assert_close(
+        slopes.weight, torch.tensor((1.0, 0.0, 0.0, 0.0, 0.0)),
+    )
+    torch.testing.assert_close(slopes.bias, torch.tensor(0.0))
+
+    invalid = (
+        (),
+        (member((), ()),),
+        (first, member((0.0, 0.0, 0.0), (0.0, 0.0), 2)),
+        (first, member((math.inf,), (0.0,))),
+    )
+    for members in invalid:
+        reject(stock_macro_linear_model, members, 1.0)
+    reject(stock_macro_linear_model, (first, compact), 0.0)
+
+    singular = member((-1.0, 1.0), (-1.0, 1.0))
+    singular.train.features[:, 1] = singular.train.features[:, 0]
+    reject(linear_model, singular, 1e-300)
+    reject(
+        stock_macro_linear_model,
+        (member((-1e-20, 1e-20), (-1e20, 1e20)),), 1e-40,
+    )
 
 
 def verify_indexed_coordinates() -> None:
@@ -929,11 +987,13 @@ def verify_stock_macro_training() -> None:
     first = _stock_uniform_loader(members, 4, 32, 7, drop_last=True)
     second = _stock_uniform_loader(members, 4, 32, 7, drop_last=True)
     assert len(first) == len(second) == 8
-    assert [
-        batch[1].tolist() for batch in first
-    ] == [
-        batch[1].tolist() for batch in second
-    ]
+    assert tuple(first.sampler) == tuple(second.sampler)
+    with patch(
+        "tools.experiment.torch.multinomial", wraps=torch.multinomial,
+    ) as draws:
+        sampler = _stock_uniform_loader(members, 4, 65_537, 7).sampler
+        assert sum(1 for _ in sampler) == 65_537
+        assert [call.args[1] for call in draws.call_args_list] == [65_536, 1]
     conditioned = _panel_members(members, conditioned=True)
     torch.testing.assert_close(
         _stock_uniform_weights(conditioned), weights,
@@ -984,30 +1044,65 @@ def verify_stock_macro_training() -> None:
     sweep = Sweep(
         (selected,), ("panel_transformer",), (7,), 1, 0.2, 3, 2, 4,
     )
+    orders, epoch_orders = {}, {}
+    for model_name in ("panel_transformer", "mlp"):
+        with patch("tools.experiment.fit_updates") as updates:
+            updates.return_value = object()
+            model, fit = _fit_shared_updates(
+                model_name, selected, members, sweep, 7, 2,
+                torch.device("cpu"), validation_indices=(0,),
+            )
+            assert fit is updates.return_value
+            assert isinstance(model, FlatMLP) == (model_name == "mlp")
+            loader = updates.call_args.args[1]
+            assert len(loader) == 6
+            assert updates.call_args.args[3:5] == (3, 2)
+            assert updates.call_args.args[2]() == _macro_validation_loss(
+                model, members[:1], 4, torch.device("cpu"),
+            )
+            orders[model_name] = tuple(loader.sampler)
+        with patch("tools.experiment.fit_model") as epochs:
+            epochs.return_value = (object(), (object(), object(), object()))
+            model, fit, loaders = _fit_shared_epochs(
+                model_name, selected, members, sweep, 7,
+                torch.device("cpu"), validation_indices=(0,),
+            )
+            assert fit is epochs.return_value[0] and \
+                loaders == epochs.return_value[1]
+            assert isinstance(model, FlatMLP) == (model_name == "mlp")
+            options = epochs.call_args.kwargs
+            assert len(options["train_loader"].sampler) == 8
+            assert options["validation_loss"]() == _macro_validation_loss(
+                model, members[:1], 4, torch.device("cpu"),
+            )
+            epoch_orders[model_name] = tuple(options["train_loader"].sampler)
+    assert orders["panel_transformer"] == orders["mlp"]
+    assert epoch_orders["panel_transformer"] == epoch_orders["mlp"]
+
+    for model_name, indices in (
+        ("transformer", (0,)), ("mlp", ()), ("mlp", (True,)),
+        ("mlp", (0, 0)), ("mlp", (2,)),
+    ):
+        try:
+            _fit_shared_updates(
+                model_name, selected, members, sweep, 7, 2,
+                torch.device("cpu"), validation_indices=indices,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid shared fitting request was accepted")
     with patch("tools.experiment.fit_updates") as updates:
-        updates.return_value = object()
-        _, fit = _fit_panel_updates(
-            "panel_transformer", selected, members, sweep, 7, 2,
-            torch.device("cpu"),
-        )
-        assert fit is updates.return_value
-        assert len(updates.call_args.args[1]) == 6
-        assert updates.call_args.args[3:5] == (3, 2)
-        assert updates.call_args.args[2]() == _macro_validation_loss(
-            updates.call_args.args[0], members, 4, torch.device("cpu"),
-        )
-    with patch("tools.experiment.fit_model") as epochs:
-        epochs.return_value = (object(), (object(), object(), object()))
-        _, fit, loaders = _fit_panel_epochs(
-            "panel_transformer", selected, members, sweep, 7,
-            torch.device("cpu"),
-        )
-        assert fit is epochs.return_value[0] and loaders == epochs.return_value[1]
-        options = epochs.call_args.kwargs
-        assert len(options["train_loader"].sampler) == 8
-        assert options["validation_loss"]() == _macro_validation_loss(
-            epochs.call_args.args[0], members, 4, torch.device("cpu"),
-        )
+        try:
+            _fit_shared_updates(
+                "mlp", selected, (members[0], missing_validation),
+                sweep, 7, 2, torch.device("cpu"), validation_indices=(1,),
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("empty shared validation was accepted")
+        updates.assert_not_called()
 
 
 def verify_panel_orchestration() -> None:

@@ -24,7 +24,7 @@ try:
     import torch
     from torch import nn
     from torch.utils.data import (
-        ConcatDataset, DataLoader, Dataset, WeightedRandomSampler,
+        ConcatDataset, DataLoader, Dataset, Sampler,
     )
 except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
@@ -57,6 +57,7 @@ PANEL_MODELS = ("panel_transformer", "conditioned_panel_transformer")
 PANEL_MODEL_SET = frozenset(PANEL_MODELS)
 TRANSFORMERS = frozenset(("transformer", *PANEL_MODELS))
 NEURAL = TRANSFORMERS | {"mlp"}
+SHARED_NEURAL = PANEL_MODEL_SET | {"mlp"}
 LOCAL_MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
 MODELS = (*LOCAL_MODELS, *PANEL_MODELS)
 RETURN_METRICS = ("return_mse", "return_mae", "direction_accuracy")
@@ -64,6 +65,7 @@ EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "zero_return_baseline_mae")
 SERIES_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_FLAT_FEATURES = 2_048
 MAX_MLP_PARAMETERS = 8_388_608
+_SAMPLER_CHUNK = 65_536
 
 
 class _SeriesDataset(Dataset):
@@ -376,15 +378,71 @@ def _matrix(dataset: Windows) -> tuple[torch.Tensor, torch.Tensor]:
             dataset.targets[start:end].double())
 
 
+def _solve_affine(
+    value_mean: torch.Tensor, target_mean: torch.Tensor,
+    gram: torch.Tensor, cross: torch.Tensor, ridge: float,
+) -> Affine:
+    if any(not torch.isfinite(item).all()
+           for item in (value_mean, target_mean, gram, cross)):
+        raise ValueError("affine moments must be finite")
+    gram.diagonal().add_(_number(ridge, "ridge", 0.0, True))
+    try:
+        weight = torch.linalg.solve(gram, cross)
+    except RuntimeError as error:
+        raise ValueError("ridge moments do not produce a stable solve") from error
+    bias = target_mean - value_mean @ weight
+    converted = weight.float(), bias.float()
+    if any(not torch.isfinite(item).all()
+           for item in (weight, bias, *converted)):
+        raise ValueError("ridge parameters must remain finite binary32")
+    return Affine(*converted)
+
+
 def linear_model(data: TrainingData, ridge: float) -> Affine:
     values, targets = _matrix(data.train)
     value_mean, target_mean = values.mean(0), targets.mean()
     centered = values - value_mean
-    gram = centered.T @ centered
-    gram.diagonal().add_(ridge)
-    weight = torch.linalg.solve(gram, centered.T @ (targets - target_mean))
-    bias = target_mean - value_mean @ weight
-    return Affine(weight.float(), bias.float())
+    return _solve_affine(
+        value_mean, target_mean, centered.T @ centered,
+        centered.T @ (targets - target_mean), ridge,
+    )
+
+
+def stock_macro_linear_model(
+    members: Sequence[TrainingData], ridge: float,
+) -> Affine:
+    """Fit ridge to the equal-stock mean of scaled training losses."""
+    if not members or any(
+        not isinstance(member, TrainingData) or
+        not isinstance(member.train, Windows) or not len(member.train)
+        for member in members
+    ):
+        raise ValueError("stock-macro ridge requires nonempty training series")
+    value_means, target_means = [], []
+    gram = cross = None
+    width = None
+    for member in members:
+        values, targets = _matrix(member.train)
+        if (width is not None and values.shape[1] != width) or \
+           not torch.isfinite(values).all() or not torch.isfinite(targets).all():
+            raise ValueError("stock-macro ridge matrices are incompatible")
+        width = values.shape[1]
+        value_mean, target_mean = values.mean(0), targets.mean()
+        centered = values - value_mean
+        covariance = centered.T @ centered / len(targets)
+        relation = centered.T @ (targets - target_mean) / len(targets)
+        gram = covariance if gram is None else gram.add_(covariance)
+        cross = relation if cross is None else cross.add_(relation)
+        value_means.append(value_mean)
+        target_means.append(target_mean)
+    means, targets = torch.stack(value_means), torch.stack(target_means)
+    value_mean, target_mean = means.mean(0), targets.mean()
+    centered, count = means - value_mean, len(members)
+    gram.div_(count).addmm_(centered.T, centered, alpha=1.0 / count)
+    cross.div_(count).addmv_(
+        centered.T, targets - target_mean, alpha=1.0 / count,
+    )
+    return _solve_affine(value_mean, target_mean, gram, cross, ridge)
 
 
 def _boundary(
@@ -599,6 +657,24 @@ def _panel_data(
     ))
 
 
+class _ChunkedWeightedSampler(Sampler[int]):
+    """Draw weighted indices without materializing the full update budget."""
+
+    def __init__(self, weights: torch.Tensor, samples: int, seed: int) -> None:
+        self.weights, self.samples = weights, samples
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __len__(self) -> int:
+        return self.samples
+
+    def __iter__(self) -> Iterator[int]:
+        for start in range(0, self.samples, _SAMPLER_CHUNK):
+            yield from torch.multinomial(
+                self.weights, min(_SAMPLER_CHUNK, self.samples - start),
+                True, generator=self.generator,
+            ).tolist()
+
+
 def _stock_uniform_weights(members: Sequence[DataSplits]) -> torch.Tensor:
     """Give every stock one unit of total sampling weight."""
     lengths = tuple(len(member.train) for member in members)
@@ -625,9 +701,8 @@ def _stock_uniform_loader(
             ConcatDataset(datasets), batch_size, shuffle=True,
             generator=generator,
         )
-    sampler = WeightedRandomSampler(
-        _stock_uniform_weights(members), samples, True,
-        generator=generator,
+    sampler = _ChunkedWeightedSampler(
+        _stock_uniform_weights(members), samples, seed,
     )
     return DataLoader(
         ConcatDataset(datasets),
@@ -649,16 +724,32 @@ def _macro_validation_loss(
     )
 
 
-def _fit_panel_updates(
+def _validation_members(
+    members: Sequence[DataSplits], indices: Sequence[int],
+) -> tuple[DataSplits, ...]:
+    selected = tuple(indices)
+    if not selected or len(set(selected)) != len(selected) or any(
+        type(index) is not int or not 0 <= index < len(members)
+        for index in selected
+    ):
+        raise ValueError("shared validation indices are invalid")
+    result = tuple(members[index] for index in selected)
+    if any(not len(member.validation) for member in result):
+        raise ValueError("shared validation requires nonempty series")
+    return result
+
+
+def _fit_shared_updates(
     model_name: str, candidate: Candidate, members: Sequence[TrainingData],
     sweep: Sweep, seed: int, updates_per_checkpoint: int,
-    device: torch.device,
+    device: torch.device, *, validation_indices: Sequence[int],
 ) -> tuple[nn.Module, UpdateFit]:
     """Fit one shared model with stock-macro sampling and a fixed budget."""
-    if model_name not in PANEL_MODEL_SET:
-        raise ValueError("fixed-update fitting requires a panel model")
+    if model_name not in SHARED_NEURAL:
+        raise ValueError("stock-macro fitting requires a shared model")
     conditioned = model_name == "conditioned_panel_transformer"
     splits = _panel_members(members, conditioned)
+    validation = _validation_members(splits, validation_indices)
     torch.manual_seed(seed)
     model = _neural_model(model_name, candidate, len(splits)).to(device)
     loader = _stock_uniform_loader(
@@ -669,7 +760,7 @@ def _fit_panel_updates(
     fit = fit_updates(
         model, loader,
         lambda: _macro_validation_loss(
-            model, splits, sweep.batch_size, device,
+            model, validation, sweep.batch_size, device,
         ),
         sweep.epochs, updates_per_checkpoint, candidate.learning_rate,
         candidate.weight_decay, device,
@@ -677,16 +768,18 @@ def _fit_panel_updates(
     return model, fit
 
 
-def _fit_panel_epochs(
+def _fit_shared_epochs(
     model_name: str, candidate: Candidate, members: Sequence[TrainingData],
-    sweep: Sweep, seed: int, device: torch.device,
+    sweep: Sweep, seed: int, device: torch.device, *,
+    validation_indices: Sequence[int],
 ) -> tuple[nn.Module, Fit, tuple[DataLoader, ...]]:
     """Fit the secondary fixed-epoch curve with the same stock-macro objective."""
-    if model_name not in PANEL_MODEL_SET:
-        raise ValueError("fixed-epoch fitting requires a panel model")
+    if model_name not in SHARED_NEURAL:
+        raise ValueError("stock-macro fitting requires a shared model")
     splits = _panel_members(
         members, model_name == "conditioned_panel_transformer",
     )
+    validation = _validation_members(splits, validation_indices)
     pooled = DataSplits(*(
         ConcatDataset([getattr(member, name) for member in splits])
         for name in ("train", "validation", "test")
@@ -702,7 +795,7 @@ def _fit_panel_epochs(
         candidate.learning_rate, candidate.weight_decay, seed, device,
         train_loader=loader,
         validation_loss=lambda: _macro_validation_loss(
-            model, splits, sweep.batch_size, device,
+            model, validation, sweep.batch_size, device,
         ),
     )
     return model, fit, loaders
