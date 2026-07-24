@@ -32,6 +32,44 @@ Bar = tuple[int, float, float, float, float, float]
 Requester = Callable[[str], Mapping[str, object]]
 
 
+def request_gate(
+    requests_per_minute: int,
+    *,
+    clock: Callable[[], float] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> Callable[[], None]:
+    """Return a monotonic gate for physical request starts."""
+    if type(requests_per_minute) is not int or \
+       not 0 <= requests_per_minute <= 60:
+        raise ValueError("requests_per_minute must be an integer from 0 to 60")
+    if requests_per_minute == 0:
+        return lambda: None
+    current_time = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleeper is None else sleeper
+    interval, next_start, last_time = 61.0 / requests_per_minute, None, None
+
+    def read_time() -> float:
+        nonlocal last_time
+        now = current_time()
+        if not math.isfinite(now) or \
+           last_time is not None and now < last_time:
+            raise ValueError("request clock must be finite and monotonic")
+        last_time = now
+        return now
+
+    def gate() -> None:
+        nonlocal next_start
+        now = read_time()
+        if next_start is not None and next_start > now:
+            sleep(next_start - now)
+            now = read_time()
+            if now < next_start:
+                raise ValueError("request sleeper returned before its deadline")
+        next_start = now + interval
+
+    return gate
+
+
 def api_key(path: Path) -> str:
     """Read the key from the process first, then a local environment file."""
     value = os.environ.get("MASSIVE_API_KEY", "")
@@ -68,10 +106,16 @@ def authorized_url(url: str, key: str) -> str:
                        urlencode(query), parts.fragment))
 
 
-def request_json(url: str) -> Mapping[str, object]:
+def request_json(
+    url: str,
+    *,
+    before_request: Callable[[], None] | None = None,
+) -> Mapping[str, object]:
     for attempt in range(5):
         try:
             request = Request(url, headers={"User-Agent": "compose-mini/1"})
+            if before_request is not None:
+                before_request()
             with urlopen(request, timeout=60) as response:
                 payload = json.load(response)
         except HTTPError as error:

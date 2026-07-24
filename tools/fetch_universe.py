@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.fetch_massive import (
     API_HOST, TICKER, Requester, aggregate_url, api_key, authorized_url,
-    fetch_bars, regular_bars, request_json, write_csv,
+    fetch_bars, regular_bars, request_gate, request_json, write_csv,
 )
 from tools.files import file_sha256, freeze_inputs, write_json
 
@@ -222,7 +222,10 @@ def fetch_universe(
     report_path: Path,
     *,
     key: str | None = None,
-    requester: Requester = request_json,
+    requester: Requester | None = None,
+    requests_per_minute: int = 0,
+    clock: Callable[[], float] | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> dict[str, object]:
     output_dir, report_path = _validate_initial_targets(
         output_dir, report_path,
@@ -242,6 +245,22 @@ def fetch_universe(
         )
         _recheck_targets(output_dir, report_path, csv_paths)
 
+        gate = request_gate(
+            requests_per_minute, clock=clock, sleeper=sleeper,
+        )
+        if requests_per_minute == 0:
+            transport = request_json if requester is None else requester
+        elif requester is None:
+            transport = lambda url: request_json(
+                url, before_request=gate,
+            )
+        else:
+            direct = requester
+
+            def transport(url: str) -> Mapping[str, object]:
+                gate()
+                return direct(url)
+
         secret = api_key(ROOT / ".env") if key is None else key
         if not secret or any(character.isspace() for character in secret):
             raise ValueError("MASSIVE_API_KEY is missing or invalid")
@@ -249,14 +268,14 @@ def fetch_universe(
         records = []
         for item, path in zip(manifest.series, csv_paths, strict=True):
             reference = _reference(
-                item.ticker, manifest.eligibility_date, secret, requester,
+                item.ticker, manifest.eligibility_date, secret, transport,
             )
             aggregate = aggregate_url(
                 item.ticker, manifest.start, manifest.end,
                 manifest.interval_minutes, manifest.adjusted,
             )
             aggregate_contract = _contract(aggregate)
-            source = fetch_bars(aggregate, secret, item.ticker, requester)
+            source = fetch_bars(aggregate, secret, item.ticker, transport)
             bars, sessions = regular_bars(source, manifest.interval_minutes)
             write_csv(path, bars)
             rows = len(read_csv(path)) // FEATURE_COUNT
@@ -312,13 +331,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--requests-per-minute", type=int, default=0)
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     try:
-        report = fetch_universe(args.manifest, args.output_dir, args.report)
+        report = fetch_universe(
+            args.manifest, args.output_dir, args.report,
+            requests_per_minute=args.requests_per_minute,
+        )
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
     print(json.dumps(report, sort_keys=True))

@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, parse_qs, unquote, urlsplit
 from unittest.mock import patch
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
@@ -20,12 +21,29 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.fetch_massive import (
     aggregate_url, api_key, authorized_url, fetch_bars, regular_bars,
-    request_json, write_csv,
+    request_gate, request_json, write_csv,
 )
 from tools.fetch_universe import (
-    SeriesSpec, UniverseManifest, fetch_universe, reference_url,
+    SeriesSpec, UniverseManifest, fetch_universe, parse_args as universe_args,
+    reference_url,
 )
 from tools.files import file_sha256, write_json
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def timestamp(value: str) -> int:
@@ -52,6 +70,67 @@ def raises(
         if isinstance(kind, tuple) else kind.__name__
     )
     raise AssertionError(f"{names} was not raised")
+
+
+def test_request_gate() -> None:
+    clock = FakeClock()
+    gate = request_gate(5, clock=clock, sleeper=clock.sleep)
+    starts = []
+    for work in (4.0, 0.0, 0.0, 0.0):
+        gate()
+        starts.append(clock())
+        clock.advance(work)
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(starts, (0.0, 12.2, 24.4, 36.6),
+                                    strict=True)
+    )
+    assert math.isclose(clock.sleeps[0], 8.2)
+
+    failed = FakeClock()
+    consumed = request_gate(5, clock=failed, sleeper=failed.sleep)
+
+    def transport_failure() -> None:
+        consumed()
+        raise OSError("offline failure")
+
+    raises(OSError, transport_failure)
+    consumed()
+    assert math.isclose(failed(), 12.2)
+
+    def reached(*_args: object) -> object:
+        raise AssertionError("zero-rate gate read the clock or sleeper")
+
+    request_gate(0, clock=reached, sleeper=reached)()
+    for invalid in (True, False, -1, 1.0, "5", None, 61):
+        error = raises(ValueError, request_gate, invalid)
+        assert "fake-secret" not in str(error)
+    raises(TypeError, gate, "fake-secret")
+
+    for invalid_time in (math.nan, math.inf, -math.inf):
+        invalid_clock = request_gate(
+            5, clock=lambda value=invalid_time: value,
+        )
+        error = raises(ValueError, invalid_clock)
+        assert "fake-secret" not in str(error)
+
+    backward = FakeClock()
+    guarded = request_gate(5, clock=backward, sleeper=backward.sleep)
+    guarded()
+    backward.advance(-1.0)
+    error = raises(ValueError, guarded)
+    assert "fake-secret" not in str(error)
+
+    for fraction in (0.0, 0.5):
+        short = FakeClock()
+
+        def undersleep(seconds: float, share: float = fraction) -> None:
+            short.advance(seconds * share)
+
+        guarded = request_gate(5, clock=short, sleeper=undersleep)
+        guarded()
+        error = raises(ValueError, guarded)
+        assert "fake-secret" not in str(error)
 
 
 def manifest_value() -> dict[str, object]:
@@ -312,6 +391,30 @@ def test_target_rejections(directory: Path) -> None:
     assert not os.path.lexists(collision_report)
 
 
+def test_rate_validation(directory: Path) -> None:
+    manifest = directory / "rate-manifest.json"
+    write_manifest(manifest)
+
+    def reached(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("credential, clock, sleeper, or request reached")
+
+    for index, rate in enumerate((True, False, -1, 1.0, "5", None, 61)):
+        output = directory / f"rate-output-{index}"
+        report = directory / f"rate-report-{index}.json"
+        with patch("tools.fetch_universe.api_key", side_effect=reached):
+            raises(
+                ValueError, fetch_universe, manifest, output, report,
+                requests_per_minute=rate, clock=reached, sleeper=reached,
+                requester=reached,
+            )
+        assert not os.path.lexists(output) and not os.path.lexists(report)
+
+    assert universe_args(["manifest", "output", "report"]).requests_per_minute == 0
+    assert universe_args([
+        "manifest", "output", "report", "--requests-per-minute", "5",
+    ]).requests_per_minute == 5
+
+
 def fake_requester(requested: list[str],
                    on_request: object | None = None) -> object:
     def request(url: str) -> dict[str, object]:
@@ -345,6 +448,8 @@ def test_universe_fetch(directory: Path) -> None:
     resolved_output = output.resolve(strict=False)
     resolved_report = report_path.resolve(strict=False)
     requested: list[str] = []
+    starts: list[float] = []
+    clock = FakeClock()
     events: list[tuple[str, Path]] = []
     real_read = UniverseManifest.read.__func__
 
@@ -376,7 +481,10 @@ def test_universe_fetch(directory: Path) -> None:
          patch("tools.fetch_universe.write_json", side_effect=checked_write):
         report = fetch_universe(
             manifest_path, output, report_path, key="fake-secret",
-            requester=fake_requester(requested),
+            requester=fake_requester(
+                requested, lambda _url: starts.append(clock()),
+            ),
+            requests_per_minute=5, clock=clock, sleeper=clock.sleep,
         )
 
     assert set(report) == {
@@ -451,9 +559,71 @@ def test_universe_fetch(directory: Path) -> None:
         ) == reference["query"]
 
     assert len(requested) == 4
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(starts, (0.0, 12.2, 24.4, 36.6),
+                                    strict=True)
+    )
     rendered = json.dumps(report)
     assert all(secret not in rendered
                for secret in ("apiKey", "MASSIVE_API_KEY", "fake-secret"))
+
+
+def test_universe_pagination_gate(directory: Path) -> None:
+    manifest = directory / "pagination-manifest.json"
+    output = directory / "pagination-output"
+    report_path = directory / "pagination-report.json"
+    write_manifest(manifest)
+    clock = FakeClock()
+    starts: list[float] = []
+    paths: list[str] = []
+
+    def request(url: str) -> dict[str, object]:
+        starts.append(clock())
+        parts = urlsplit(url)
+        paths.append(parts.path)
+        if parts.path.startswith("/v3/reference/tickers/"):
+            ticker = unquote(parts.path.rsplit("/", 1)[1])
+            return {
+                "status": "OK",
+                "results": {
+                    "ticker": ticker, "active": True, "market": "stocks",
+                    "locale": "us", "type": "CS", "currency_name": "usd",
+                },
+            }
+        ticker = unquote(parts.path.split("/ticker/", 1)[1].split("/", 1)[0])
+        paginated = parts.path.endswith("/page")
+        result = aggregate(
+            "2024-07-22T14:00:00+00:00" if paginated
+            else "2024-07-22T13:30:00+00:00",
+            101.0 if paginated else 100.0,
+        )
+        response: dict[str, object] = {
+            "status": "OK", "ticker": ticker, "results": [result],
+        }
+        if ticker == "AAPL" and not paginated:
+            response["next_url"] = (
+                "https://api.massive.com/v2/aggs/ticker/AAPL/page?cursor=next"
+            )
+        return response
+
+    report = fetch_universe(
+        manifest, output, report_path, key="fake-secret", requester=request,
+        requests_per_minute=5, clock=clock, sleeper=clock.sleep,
+    )
+    assert paths == [
+        "/v3/reference/tickers/AAPL",
+        "/v2/aggs/ticker/AAPL/range/30/minute/2024-07-22/2026-07-21",
+        "/v2/aggs/ticker/AAPL/page",
+        "/v3/reference/tickers/MSFT",
+        "/v2/aggs/ticker/MSFT/range/30/minute/2024-07-22/2026-07-21",
+    ]
+    assert all(
+        math.isclose(actual, index * 12.2)
+        for index, actual in enumerate(starts)
+    )
+    assert report["series"][0]["csv"]["source_rows"] == 2
+    assert "fake-secret" not in json.dumps(report)
 
 
 def test_reference_identity(directory: Path) -> None:
@@ -601,18 +771,32 @@ def test_existing_downloader(directory: Path) -> None:
     headers["Retry-After"] = "0"
     responses = iter((HTTPError("https://api.massive.com", 429, "rate limited",
                                 headers, BytesIO()),
-                      BytesIO(b'{"status":"OK"}')))
+                      BytesIO(b'{"status":"OK"}'),
+                      BytesIO(b'{"status":"OK","page":2}')))
+    clock = FakeClock()
+    gate = request_gate(5, clock=clock, sleeper=clock.sleep)
+    starts: list[float] = []
 
     def urlopen_once(*_args: object, **_kwargs: object) -> BytesIO:
+        starts.append(clock())
         response = next(responses)
         if isinstance(response, HTTPError):
             raise response
         return response
 
     with patch("tools.fetch_massive.urlopen", side_effect=urlopen_once), \
-         patch("tools.fetch_massive.time.sleep") as sleep:
-        assert request_json("https://api.massive.com") == {"status": "OK"}
+         patch("tools.fetch_massive.time.sleep", side_effect=clock.sleep) as sleep:
+        assert request_json(
+            "https://api.massive.com", before_request=gate,
+        ) == {"status": "OK"}
+        assert request_json(
+            "https://api.massive.com/page", before_request=gate,
+        ) == {"status": "OK", "page": 2}
         sleep.assert_called_once_with(1.0)
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(starts, (0.0, 12.2, 24.4), strict=True)
+    )
 
     path = directory / "bars.csv"
     write_csv(path, bars)
@@ -623,10 +807,13 @@ def test_existing_downloader(directory: Path) -> None:
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="compose-mini-massive-") as name:
         directory = Path(name)
+        test_request_gate()
         test_existing_downloader(directory)
         test_manifest_contract(directory)
         test_target_rejections(directory)
+        test_rate_validation(directory)
         test_universe_fetch(directory)
+        test_universe_pagination_gate(directory)
         test_reference_identity(directory)
         test_mutations(directory)
     print("Massive downloader and universe tests passed")

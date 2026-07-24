@@ -120,6 +120,19 @@ python tools/fetch_massive.py AAPL 2024-07-22 2026-07-21 \
   data/aapl-30m.csv --minutes 30
 ```
 
+For a frozen universe, pace the shared reference-and-aggregate request budget:
+
+```sh
+python tools/fetch_universe.py universes/liquid-common-11.json \
+  data/liquid-common-11 data/liquid-common-11-fetch-report.json \
+  --requests-per-minute 5
+```
+
+The output directory and report path must both be new.
+Five requests per minute matches the current Stocks Basic limit. Paid
+unlimited tiers may use the unpaced default, `0`; pacing does not guarantee
+that the provider will complete a fetch.
+
 The downloader follows pagination, keeps regular-session bars, verifies that
 each observed session starts at 09:30 US Eastern with no internal interval
 gaps, converts timestamps to canonical UTC, and atomically writes the runtime's
