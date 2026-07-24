@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+PANEL_SERIES = ("B", "A", "C")
 
 try:
     import torch
@@ -23,9 +24,10 @@ except ModuleNotFoundError as error:
     raise SystemExit("experiment tests require PyTorch") from error
 
 from tools.experiment import (
-    Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
-    _candidate_data, _fit_neural, _label_available, _model_fingerprint,
-    _panel_data, _panel_selected_epochs, _run_experiment, _selected_epochs,
+    PANEL_MODEL_SET, Candidate, ConstantReturn, RollingMean,
+    SeriesTransformer, Sweep, _authorize_test, _candidate_data, _fit_neural,
+    _label_available, _model_fingerprint, _panel_data,
+    _panel_selected_epochs, _run_experiment, _selected_epochs, _SeriesDataset,
     _verify_test_state, expected_runs, holdout_split, linear_model,
     purged_split, run_experiment, select_candidates, walk_forward_splits,
     write_predictions, write_report,
@@ -144,7 +146,7 @@ def panel_fixture(
     (ROOT / baseline_ledger).write_text("{}\n", encoding="ascii")
     paths = []
     declarations = []
-    for index, name in enumerate(("A", "B", "C"), 1):
+    for index, name in enumerate(PANEL_SERIES, 1):
         path = relative / f"{name}.csv"
         write_csv(ROOT / path, 72, int(mismatched and name == "B"))
         scale_csv(ROOT / path, float(index))
@@ -193,7 +195,10 @@ def panel_fixture(
         },
         "expected_equivalent_runs": expected_runs(sweep, 3),
         "expected_panel_fits":
-            len(sweep.seeds) * (len(sweep.candidates) * sweep.folds + 1),
+            len(PANEL_MODEL_SET.intersection(sweep.models)) *
+            len(sweep.seeds) * (
+                len(sweep.candidates) * sweep.folds + 1
+            ),
         "outputs": {
             "experiment_report": f"{run_dir}/experiment.json",
             "calibration_ledger": f"{run_dir}/calibration.jsonl",
@@ -786,6 +791,51 @@ def verify_test_state(csv: Path) -> None:
         test_evaluate.assert_not_called()
 
 
+def verify_series_conditioning() -> None:
+    features = torch.arange(30, dtype=torch.float32).view(6, 5)
+    targets = torch.arange(4, dtype=torch.float32)
+    references = targets + 10
+    outcomes = targets + 20
+    first = Windows(features, targets, references, outcomes, 3, 0, 2)
+    second = Windows(features, targets, references, outcomes, 3, 2, 2)
+    last_zero = _SeriesDataset(first, 0)[len(first) - 1]
+    first_one = _SeriesDataset(second, 1)[0]
+    for wrapped, source, series_id in (
+        (last_zero, first[len(first) - 1], 0),
+        (first_one, second[0], 1),
+    ):
+        values, *rest = source
+        assert wrapped[0][1] == series_id
+        assert torch.equal(wrapped[0][0], values)
+        assert all(torch.equal(left, right)
+                   for left, right in zip(wrapped[1:], rest, strict=True))
+
+    selected = candidate("conditioned", 3)
+    assert selected.config().in_dim == 5
+    torch.manual_seed(7)
+    base = ForecastTransformer(selected.config())
+    conditioned = SeriesTransformer(selected.config(), 3)
+    conditioned.model.load_state_dict(base.state_dict())
+    embeddings = [
+        module for module in conditioned.modules()
+        if isinstance(module, torch.nn.Embedding)
+    ]
+    assert len(embeddings) == 1
+    assert embeddings[0].weight.shape == (3, selected.model_dim)
+    assert torch.count_nonzero(embeddings[0].weight) == 0
+
+    values = torch.arange(30, dtype=torch.float32).view(2, 3, 5) / 10
+    series_ids = torch.tensor((0, 1))
+    plain = base(values)
+    initial = conditioned(values, series_ids)
+    assert torch.equal(initial, plain)
+    with torch.no_grad():
+        embeddings[0].weight[1].fill_(1)
+    changed = conditioned(values, series_ids)
+    assert torch.equal(changed[0], plain[0])
+    assert not torch.equal(changed[1], plain[1])
+
+
 def verify_panel_orchestration() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-source-tree-", dir=ROOT,
@@ -806,18 +856,26 @@ def verify_panel_orchestration() -> None:
 
     selected = candidate("panel", 3)
     sweep = Sweep(
-        (selected,), ("panel_transformer",), (7, 19, 31, 43, 61),
+        (selected,),
+        ("panel_transformer", "conditioned_panel_transformer"),
+        (7, 19, 31, 43, 61),
         2, 0.1, 1, 1, 16,
     )
     fixed = replace(
         sweep,
         models=(
             "transformer", "linear", "mlp", "rolling_mean", "last_close",
-            "panel_transformer",
+            "panel_transformer", "conditioned_panel_transformer",
         ),
     )
-    assert expected_runs(fixed, 3) == 162
-    assert expected_runs(sweep, 3) == 45
+    local = replace(sweep, models=fixed.models[:5])
+    assert expected_runs(local, 3) == 117
+    for model_name in ("panel_transformer", "conditioned_panel_transformer"):
+        assert expected_runs(
+            replace(local, models=(*local.models, model_name)), 3,
+        ) == 162
+    assert expected_runs(fixed, 3) == 207
+    assert expected_runs(sweep, 3) == 90
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-panel-default-", dir=ROOT,
     ) as directory:
@@ -826,39 +884,71 @@ def verify_panel_orchestration() -> None:
         assert Sweep.read(path).models == (
             "transformer", "linear", "mlp", "rolling_mean", "last_close",
         )
-    try:
-        run_experiment(
-            sweep, (("A", Path("missing.csv")),), torch.device("cpu"), 45,
-            evaluate_test=False, requested_models=frozenset(),
-        )
-    except ValueError as error:
-        assert "bound calibration-only execution" in str(error)
-    else:
-        raise AssertionError("manifestless panel execution was accepted")
-
-    with patch("tools.experiment.read_bars") as read, \
-         patch("tools.experiment._candidate_data") as prepared, \
-         patch("tools.experiment._fit_neural") as fitted:
+    for model_name in ("panel_transformer", "conditioned_panel_transformer"):
+        single = replace(sweep, models=(model_name,))
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-{model_name}-", dir=ROOT,
+        ) as directory, panel_fixture(Path(directory), single) as execution:
+            assert execution.attempt.expected_panel_fits == 15
         try:
-            _run_experiment(
-                sweep, (), torch.device("cpu"), 45, None, None, True,
-                None, frozenset(), None,
+            run_experiment(
+                single, ((PANEL_SERIES[0], Path("missing.csv")),),
+                torch.device("cpu"), 45, evaluate_test=False,
+                requested_models=frozenset(),
             )
         except ValueError as error:
             assert "bound calibration-only execution" in str(error)
         else:
-            raise AssertionError("test-mode panel execution was accepted")
-        read.assert_not_called()
-        prepared.assert_not_called()
-        fitted.assert_not_called()
-    try:
-        _authorize_test({
-            "sweep": {"models": ["panel_transformer"]},
-        }, ())
-    except ValueError as error:
-        assert "calibration-only" in str(error)
-    else:
-        raise AssertionError("panel test authorization was accepted")
+            raise AssertionError("manifestless panel execution was accepted")
+        with patch("tools.experiment.read_bars") as read, \
+             patch("tools.experiment._candidate_data") as prepared, \
+             patch("tools.experiment._fit_neural") as fitted:
+            try:
+                _run_experiment(
+                    single, (), torch.device("cpu"), 45, None, None, True,
+                    None, frozenset(), None,
+                )
+            except ValueError as error:
+                assert "bound calibration-only execution" in str(error)
+            else:
+                raise AssertionError("test-mode panel execution was accepted")
+            read.assert_not_called()
+            prepared.assert_not_called()
+            fitted.assert_not_called()
+        try:
+            _authorize_test({
+                "sweep": {"models": [model_name]},
+            }, ())
+        except ValueError as error:
+            assert "calibration-only" in str(error)
+        else:
+            raise AssertionError("panel test authorization was accepted")
+
+    legacy_mixed = replace(
+        sweep,
+        models=(sweep.models[0], local.models[0]),
+        seeds=sweep.seeds[:1],
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-legacy-panel-", dir=ROOT,
+    ) as directory, panel_fixture(
+        Path(directory), legacy_mixed,
+    ) as execution:
+        report = run_experiment(
+            legacy_mixed, execution.series, torch.device("cpu"),
+            expected_runs(legacy_mixed, len(execution.series)),
+            evaluate_test=False, requested_models=frozenset(),
+            panel_execution=execution,
+        )
+        assert [
+            (item["model"], item["series"], item["seed"])
+            for item in report["model_fingerprints"]
+        ] == [
+            (model, name, seed)
+            for model in sorted(legacy_mixed.models)
+            for name in sorted(name for name, _ in execution.series)
+            for seed in sorted(legacy_mixed.seeds)
+        ]
 
     timestamps = tuple(f"2026-01-01T00:00:{index:02d}Z" for index in range(10))
     _label_available(timestamps, 2, (5, 1), 1, 1)
@@ -871,27 +961,46 @@ def verify_panel_orchestration() -> None:
 
     epoch_records = [
         {
-            "model": "panel_transformer", "candidate": "panel",
+            "model": model_name, "candidate": "panel",
             "series": series, "fold": fold, "seed": 7,
             "best_epoch": 3 + fold,
         }
-        for series in ("A", "B", "C") for fold in range(2)
+        for model_name in ("panel_transformer", "conditioned_panel_transformer")
+        for series in PANEL_SERIES for fold in range(2)
     ]
-    assert _panel_selected_epochs(
-        epoch_records, "panel", ("A", "B", "C"), 7, 2,
-    ) == 3
+    for model_name in ("panel_transformer", "conditioned_panel_transformer"):
+        assert _panel_selected_epochs(
+            epoch_records, model_name, "panel", PANEL_SERIES, 7, 2,
+        ) == 3
+        other_model = [
+            record for record in epoch_records
+            if record["model"] != model_name
+        ]
+        try:
+            _panel_selected_epochs(
+                other_model, model_name, "panel", PANEL_SERIES, 7, 2,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("panel model accepted another model's epochs")
+    panel_records = [
+        record for record in epoch_records
+        if record["model"] == "panel_transformer"
+    ]
     for invalid in (
-        epoch_records[:-1],
-        [*epoch_records, epoch_records[0]],
+        panel_records[:-1],
+        [*panel_records, panel_records[0]],
         [
             record | {"best_epoch": 9}
             if record["series"] == "C" and record["fold"] == 1 else record
-            for record in epoch_records
+            for record in panel_records
         ],
     ):
         try:
             _panel_selected_epochs(
-                invalid, "panel", ("A", "B", "C"), 7, 2,
+                invalid, "panel_transformer", "panel",
+                PANEL_SERIES, 7, 2,
             )
         except ValueError:
             pass
@@ -902,6 +1011,9 @@ def verify_panel_orchestration() -> None:
         prefix="compose-mini-panel-", dir=ROOT,
     ) as directory:
         with panel_fixture(Path(directory), sweep) as execution:
+            series_order = tuple(name for name, _ in execution.series)
+            assert series_order == PANEL_SERIES
+            assert execution.attempt.expected_panel_fits == 30
             report_path = Path(
                 execution.attempt.outputs["experiment_report"],
             )
@@ -935,6 +1047,16 @@ def verify_panel_orchestration() -> None:
                 for _, frozen in execution.series
             ]
             pooled = _panel_data(members)
+            conditioned_pooled = _panel_data(members, conditioned=True)
+            start = 0
+            for series_id, (series_name, member) in enumerate(zip(
+                series_order, members, strict=True,
+            )):
+                values, observed_id = conditioned_pooled.train[start][0]
+                assert observed_id == series_id
+                assert series_order[observed_id] == series_name
+                assert torch.equal(values, member.train[0][0])
+                start += len(member.train)
             for name in ("train", "validation", "test"):
                 combined = getattr(pooled, name)
                 parts = [getattr(member, name) for member in members]
@@ -994,19 +1116,22 @@ def verify_panel_orchestration() -> None:
 
             with patch(
                 "tools.experiment._panel_selected_epochs",
-                side_effect=(1, ValueError("invalid later seed")),
+                side_effect=(
+                    *([1] * len(sweep.seeds)),
+                    ValueError("invalid later model"),
+                ),
             ), patch("tools.experiment.fit_epochs") as final_fit:
                 try:
                     run_experiment(
-                        sweep, execution.series, torch.device("cpu"), 45,
+                        sweep, execution.series, torch.device("cpu"), 90,
                         evaluate_test=False, requested_models=frozenset(),
                         panel_execution=execution,
                     )
                 except ValueError as error:
-                    assert "invalid later seed" in str(error)
+                    assert "invalid later model" in str(error)
                 else:
                     raise AssertionError(
-                        "invalid later seed fitted an earlier final model"
+                        "invalid later model fitted an earlier final model"
                     )
                 final_fit.assert_not_called()
 
@@ -1028,56 +1153,100 @@ def verify_panel_orchestration() -> None:
                 side_effect=fingerprint,
             ):
                 report = run_experiment(
-                    sweep, execution.series, torch.device("cpu"), 45,
+                    sweep, execution.series, torch.device("cpu"), 90,
                     calibration_prediction_records=ledger,
                     evaluate_test=False, requested_models=frozenset(),
                     panel_execution=execution,
                 )
-            assert validation_fit.call_count == 10
-            assert calibration_fit.call_count == 5
-            assert len(set(model_ids)) == 5
+            assert validation_fit.call_count == 20
+            assert calibration_fit.call_count == 10
+            assert len(set(model_ids)) == 10
             assert all(model_ids.count(model) == 3 for model in set(model_ids))
+            panel_models = (
+                "panel_transformer", "conditioned_panel_transformer",
+            )
             expected_validation = [
-                (series, fold, seed)
-                for series in ("A", "B", "C")
+                (model, series, fold, seed)
+                for model in panel_models
+                for series in series_order
                 for fold in range(2) for seed in sweep.seeds
             ]
             assert [
-                (record["series"], record["fold"], record["seed"])
+                (
+                    record["model"], record["series"],
+                    record["fold"], record["seed"],
+                )
                 for record in report["validation"]
             ] == expected_validation
             assert [
-                (record["series"], record["seed"])
+                (record["model"], record["series"], record["seed"])
                 for record in report["calibration"]
             ] == [
-                (series, seed)
-                for series in ("A", "B", "C") for seed in sweep.seeds
+                (model, series, seed)
+                for model in panel_models
+                for series in series_order for seed in sweep.seeds
             ]
-            for fold in range(2):
-                for seed in sweep.seeds:
-                    epochs = {
-                        record["best_epoch"] for record in report["validation"]
-                        if record["fold"] == fold and record["seed"] == seed
-                    }
-                    assert len(epochs) == 1
+            assert report["protocol"]["panel_conditioning"] == {
+                "model": "conditioned_panel_transformer",
+                "kind": "learned-series-embedding",
+                "series_order": list(series_order),
+                "initialization": "zeros",
+                "application": "additive-before-encoder",
+            }
+            for model in panel_models:
+                for fold in range(2):
+                    for seed in sweep.seeds:
+                        epochs = {
+                            record["best_epoch"]
+                            for record in report["validation"]
+                            if record["model"] == model and
+                            record["fold"] == fold and
+                            record["seed"] == seed
+                        }
+                        assert len(epochs) == 1
+            model_order = {
+                model: index for index, model in enumerate(panel_models)
+            }
+            series_index = {
+                series: index for index, series in enumerate(series_order)
+            }
             assert [
-                (record["series"], record["seed"], record["target_time"])
+                (
+                    record["model"], record["series"],
+                    record["seed"], record["target_time"],
+                )
                 for record in ledger
             ] == sorted(
                 (
-                    record["series"], record["seed"], record["target_time"]
-                )
-                for record in ledger
+                    (
+                        record["model"], record["series"],
+                        record["seed"], record["target_time"],
+                    )
+                    for record in ledger
+                ),
+                key=lambda item: (
+                    model_order[item[0]], series_index[item[1]],
+                    item[2], item[3],
+                ),
             )
+            assert [
+                (item["model"], item["series"], item["seed"])
+                for item in report["model_fingerprints"]
+            ] == [
+                (model, series, seed)
+                for model in panel_models
+                for series in series_order
+                for seed in sweep.seeds
+            ]
             for seed in sweep.seeds:
                 hashes = {
                     item["sha256"] for item in report["model_fingerprints"]
                     if item["seed"] == seed
                 }
-                assert len(hashes) == 3
+                assert len(hashes) == 6
             repeated_ledger: list[dict[str, object]] = []
             repeated = run_experiment(
-                sweep, execution.series, torch.device("cpu"), 45,
+                sweep, execution.series, torch.device("cpu"), 90,
                 calibration_prediction_records=repeated_ledger,
                 evaluate_test=False, requested_models=frozenset(),
                 panel_execution=execution,
@@ -1138,7 +1307,7 @@ def verify_panel_orchestration() -> None:
                 ) as execution:
                     if mutation.endswith("-after-freeze"):
                         run_experiment(
-                            sweep, execution.series, torch.device("cpu"), 45,
+                            sweep, execution.series, torch.device("cpu"), 90,
                             evaluate_test=False,
                             requested_models=frozenset(),
                             panel_execution=execution,
@@ -1158,7 +1327,7 @@ def verify_panel_orchestration() -> None:
     ) as execution, patch("tools.experiment._fit_neural") as fitted:
         try:
             run_experiment(
-                sweep, execution.series, torch.device("cpu"), 45,
+                sweep, execution.series, torch.device("cpu"), 90,
                 evaluate_test=False, requested_models=frozenset(),
                 panel_execution=execution,
             )
@@ -1176,6 +1345,7 @@ def main() -> None:
     assert holdout_split(20, 0.2) == (12, 4, 4)
     assert purged_split((12, 4, 4), 2) == (10, 2, 4)
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
+    verify_series_conditioning()
     verify_panel_orchestration()
     verify_selection_is_validation_only()
     verify_selected_epochs()

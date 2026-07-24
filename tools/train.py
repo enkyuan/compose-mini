@@ -139,8 +139,11 @@ class ForecastTransformer(nn.Module):
         nn.init.xavier_uniform_(self.embed_W)
         nn.init.normal_(self.head_W, std=config.model_dim ** -0.5)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
+    def forward(self, values: torch.Tensor,
+                context: torch.Tensor | None = None) -> torch.Tensor:
         hidden = values @ self.embed_W + self.position
+        if context is not None:
+            hidden = hidden + context.unsqueeze(1)
         for layer in self.layers:
             hidden = layer(hidden)
         return hidden[:, -1] @ self.head_W + self.head_b
@@ -192,12 +195,20 @@ class Fit:
     epochs_trained: int
 
 
+def _model_output(model: nn.Module,
+                  values: torch.Tensor | Sequence[torch.Tensor],
+                  device: torch.device) -> torch.Tensor:
+    inputs = (values,) if isinstance(values, torch.Tensor) else tuple(values)
+    return model(*(item.to(device) for item in inputs))
+
+
 def mean_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     total = 0.0
     with torch.no_grad():
         for features, targets, *_ in loader:
-            loss = F.mse_loss(model(features.to(device)), targets.to(device), reduction="sum")
+            loss = F.mse_loss(_model_output(model, features, device),
+                              targets.to(device), reduction="sum")
             total += loss.item()
     return total / len(loader.dataset)
 
@@ -207,14 +218,14 @@ def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Opt
     model.train()
     total = 0.0
     for features, targets, *_ in loader:
-        features, targets = features.to(device), targets.to(device)
+        targets = targets.to(device)
         optimizer.zero_grad(set_to_none=True)
-        loss = F.mse_loss(model(features), targets)
+        loss = F.mse_loss(_model_output(model, features, device), targets)
         if not torch.isfinite(loss):
             raise FloatingPointError("training produced a non-finite loss")
         loss.backward()
         optimizer.step()
-        total += loss.item() * len(features)
+        total += loss.item() * len(targets)
     return total / len(loader.dataset)
 
 
@@ -227,7 +238,8 @@ def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
     model.eval()
     with torch.no_grad():
         for features, targets, reference, actual in loader:
-            predicted_return = model(features.to(device)).cpu() * target_scale + target_mean
+            predicted_return = _model_output(model, features, device).cpu() * \
+                target_scale + target_mean
             actual_return = targets * target_scale + target_mean
             if predictions is not None:
                 predictions.extend(predicted_return.tolist())

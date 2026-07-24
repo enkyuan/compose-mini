@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 try:
     import torch
     from torch import nn
-    from torch.utils.data import ConcatDataset
+    from torch.utils.data import ConcatDataset, Dataset
 except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
 
@@ -47,16 +47,42 @@ from tools.train import (
     fit_model, mean_loss, prepare_rows,
 )
 
-TRANSFORMERS = frozenset(("transformer", "panel_transformer"))
-PANEL_MODELS = frozenset(("panel_transformer",))
+PANEL_MODELS = ("panel_transformer", "conditioned_panel_transformer")
+PANEL_MODEL_SET = frozenset(PANEL_MODELS)
+TRANSFORMERS = frozenset(("transformer", *PANEL_MODELS))
 NEURAL = TRANSFORMERS | {"mlp"}
 LOCAL_MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
-MODELS = (*LOCAL_MODELS, "panel_transformer")
+MODELS = (*LOCAL_MODELS, *PANEL_MODELS)
 RETURN_METRICS = ("return_mse", "return_mae", "direction_accuracy")
 EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "zero_return_baseline_mae")
 SERIES_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_FLAT_FEATURES = 2_048
 MAX_MLP_PARAMETERS = 8_388_608
+
+
+class _SeriesDataset(Dataset):
+    def __init__(self, dataset: Dataset, series_id: int) -> None:
+        self.dataset, self.series_id = dataset, series_id
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> tuple[object, ...]:
+        values, *rest = self.dataset[index]
+        return (values, self.series_id), *rest
+
+
+class SeriesTransformer(nn.Module):
+    def __init__(self, config: Config, series_count: int) -> None:
+        super().__init__()
+        self.model = ForecastTransformer(config)
+        self.series = nn.Embedding(series_count, config.model_dim)
+        nn.init.zeros_(self.series.weight)
+
+    def forward(
+        self, values: torch.Tensor, series_id: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model(values, self.series(series_id))
 
 
 def _torch_identity() -> TorchIdentity:
@@ -412,7 +438,10 @@ def _prediction_records(model: str, candidate: Candidate, series: str,
         }
 
 
-def _neural_model(model_name: str, candidate: Candidate) -> nn.Module:
+def _neural_model(model_name: str, candidate: Candidate,
+                  series_count: int = 0) -> nn.Module:
+    if model_name == "conditioned_panel_transformer":
+        return SeriesTransformer(candidate.config(), series_count)
     if model_name in TRANSFORMERS:
         return ForecastTransformer(candidate.config())
     if model_name == "mlp":
@@ -422,9 +451,10 @@ def _neural_model(model_name: str, candidate: Candidate) -> nn.Module:
 
 def _fit_neural(model_name: str, candidate: Candidate, data: DataSplits,
                 sweep: Sweep, seed: int,
-                device: torch.device) -> tuple[nn.Module, Fit, tuple[object, ...]]:
+                device: torch.device, series_count: int = 0,
+                ) -> tuple[nn.Module, Fit, tuple[object, ...]]:
     torch.manual_seed(seed)
-    model = _neural_model(model_name, candidate).to(device)
+    model = _neural_model(model_name, candidate, series_count).to(device)
     fit, loaders = fit_model(
         model, data, sweep.batch_size, sweep.epochs, sweep.patience,
         candidate.learning_rate, candidate.weight_decay, seed, device,
@@ -490,12 +520,12 @@ def _selected_epochs(records: Sequence[Mapping[str, object]], model: str,
 
 
 def _panel_selected_epochs(
-    records: Sequence[Mapping[str, object]], candidate: str,
-    series: Sequence[str], seed: int, folds: int,
+    records: Sequence[Mapping[str, object]], model_name: str,
+    candidate: str, series: Sequence[str], seed: int, folds: int,
 ) -> int:
     selected = [
         record for record in records
-        if record["model"] == "panel_transformer" and
+        if record["model"] == model_name and
         record["candidate"] == candidate and record["seed"] == seed
     ]
     epochs = []
@@ -511,11 +541,24 @@ def _panel_selected_epochs(
     return median_low(epochs)
 
 
-def _panel_data(members: Sequence[TrainingData]) -> DataSplits:
+def _conditioned(data: DataSplits, series_id: int) -> DataSplits:
+    return DataSplits(*(
+        _SeriesDataset(getattr(data, name), series_id)
+        for name in ("train", "validation", "test")
+    ))
+
+
+def _panel_data(
+    members: Sequence[TrainingData], conditioned: bool = False,
+) -> DataSplits:
     if not members:
         raise ValueError("panel data requires at least one series")
+    splits = [
+        _conditioned(member, series_id) if conditioned else member
+        for series_id, member in enumerate(members)
+    ]
     return DataSplits(*(
-        ConcatDataset([getattr(member, name) for member in members])
+        ConcatDataset([getattr(member, name) for member in splits])
         for name in ("train", "validation", "test")
     ))
 
@@ -688,7 +731,7 @@ def _calibration_contract(
 def _authorize_test(contract: Mapping[str, object],
                     policies: Sequence[Mapping[str, object]],
                     ) -> dict[str, Mapping[str, object]]:
-    if PANEL_MODELS.intersection(contract["sweep"]["models"]):
+    if PANEL_MODEL_SET.intersection(contract["sweep"]["models"]):
         raise ValueError("panel models are calibration-only")
     if not policies:
         raise ValueError("test evaluation requires a frozen policy")
@@ -770,7 +813,7 @@ def run_experiment(
     *, requested_models: frozenset[str],
     panel_execution: PanelExecution | None = None,
 ) -> dict[str, object]:
-    panel = bool(PANEL_MODELS.intersection(sweep.models))
+    panel = bool(PANEL_MODEL_SET.intersection(sweep.models))
     if panel and (evaluate_test or
                   not isinstance(panel_execution, PanelExecution)):
         raise ValueError("panel models require a bound calibration-only execution")
@@ -818,7 +861,8 @@ def _run_experiment(
     requested_models: frozenset[str],
     panel_execution: PanelExecution | None,
 ) -> dict[str, object]:
-    panel = bool(PANEL_MODELS.intersection(sweep.models))
+    panel_models = tuple(model for model in PANEL_MODELS if model in sweep.models)
+    panel = bool(panel_models)
     if panel and (evaluate_test or
                   not isinstance(panel_execution, PanelExecution)):
         raise ValueError("panel models require a bound calibration-only execution")
@@ -848,7 +892,7 @@ def _run_experiment(
         raise ValueError(f"experiment requires {runs} runs; "
                          f"--max-runs is {max_runs}")
     if panel_execution is not None:
-        physical = len(sweep.seeds) * (
+        physical = len(panel_models) * len(sweep.seeds) * (
             len(sweep.candidates) * sweep.folds + 1
         )
         if panel_execution.attempt.expected_equivalent_runs != runs or \
@@ -923,7 +967,7 @@ def _run_experiment(
                 if panel:
                     panel_fold_data[(candidate.name, name, fold)] = data, boundary
                 for model_name in sweep.models:
-                    if model_name in PANEL_MODELS:
+                    if model_name in PANEL_MODEL_SET:
                         continue
                     seeds = sweep.seeds if model_name in NEURAL else (None,)
                     for seed in seeds:
@@ -951,30 +995,45 @@ def _run_experiment(
     names = tuple(folds_by_series)
     if panel:
         panel_validation = []
-        for candidate in sweep.candidates:
-            for fold in range(sweep.folds):
-                members = [
-                    panel_fold_data[(candidate.name, name, fold)][0]
-                    for name in names
-                ]
-                pooled = _panel_data(members)
-                for seed in sweep.seeds:
-                    model, fit, _ = _fit_neural(
-                        "panel_transformer", candidate, pooled, sweep,
-                        seed, device,
-                    )
-                    for name, data in zip(names, members, strict=True):
-                        loader = data_loaders(data, sweep.batch_size, seed)[1]
-                        metrics = evaluate(
-                            model, loader, data.target_mean,
-                            data.target_scale, device,
+        for model_name in panel_models:
+            conditioned = model_name == "conditioned_panel_transformer"
+            for candidate in sweep.candidates:
+                for fold in range(sweep.folds):
+                    members = [
+                        panel_fold_data[(candidate.name, name, fold)][0]
+                        for name in names
+                    ]
+                    pooled = _panel_data(members, conditioned)
+                    for seed in sweep.seeds:
+                        model, fit, _ = _fit_neural(
+                            model_name, candidate, pooled, sweep, seed, device,
+                            len(names) if conditioned else 0,
                         )
-                        panel_validation.append(_validation_record(
-                            "panel_transformer", candidate, name, fold,
-                            panel_fold_data[(candidate.name, name, fold)][1],
-                            seed, len(data.validation),
-                            mean_loss(model, loader, device), metrics, fit,
-                        ))
+                        for series_id, (name, data) in enumerate(zip(
+                            names, members, strict=True,
+                        )):
+                            evaluation = (
+                                _conditioned(data, series_id)
+                                if conditioned else data
+                            )
+                            loader = data_loaders(
+                                evaluation, sweep.batch_size, seed,
+                            )[1]
+                            metrics = evaluate(
+                                model, loader, data.target_mean,
+                                data.target_scale, device,
+                            )
+                            panel_validation.append(_validation_record(
+                                model_name, candidate, name, fold,
+                                panel_fold_data[
+                                    (candidate.name, name, fold)
+                                ][1],
+                                seed, len(data.validation),
+                                mean_loss(model, loader, device), metrics, fit,
+                            ))
+        model_order = {
+            model: index for index, model in enumerate(panel_models)
+        }
         candidate_order = {
             candidate.name: index
             for index, candidate in enumerate(sweep.candidates)
@@ -982,6 +1041,7 @@ def _run_experiment(
         series_order = {name: index for index, name in enumerate(names)}
         seed_order = {seed: index for index, seed in enumerate(sweep.seeds)}
         panel_validation.sort(key=lambda record: (
+            model_order[str(record["model"])],
             candidate_order[str(record["candidate"])],
             series_order[str(record["series"])], int(record["fold"]),
             seed_order[int(record["seed"])],
@@ -995,7 +1055,7 @@ def _run_experiment(
     retained: dict[tuple[str, str, int | None], FinalModel] = {}
     final_data: dict[tuple[str, str], TrainingData] = {}
     for model_name in sweep.models:
-        if model_name in PANEL_MODELS:
+        if model_name in PANEL_MODEL_SET:
             continue
         candidate = candidates[str(selection[model_name]["candidate"])]
         for name, (frozen, timestamps, rows, _, split) in \
@@ -1057,79 +1117,123 @@ def _run_experiment(
                         "calibration", None,
                     ))
     if panel:
-        candidate = candidates[
-            str(selection["panel_transformer"]["candidate"])
-        ]
-        members = []
-        for name, (_, _, rows, _, split) in folds_by_series.items():
-            data_key = (name, candidate.name)
-            data = final_data.get(data_key)
-            if data is None:
-                data = _candidate_data(
-                    rows, candidate, split, max_history, sweep,
-                )
-                final_data[data_key] = data
-            members.append(data)
-        pooled = _panel_data(members)
-        panel_calibration = []
-        panel_predictions = []
+        panel_candidates = {
+            model_name: candidates[
+                str(selection[model_name]["candidate"])
+            ]
+            for model_name in panel_models
+        }
         selected_epochs = {
-            seed: _panel_selected_epochs(
-                validation, candidate.name, names, seed, sweep.folds,
+            (model_name, seed): _panel_selected_epochs(
+                validation, model_name, panel_candidates[model_name].name,
+                names, seed, sweep.folds,
             )
+            for model_name in panel_models
             for seed in sweep.seeds
         }
-        for seed, epochs in selected_epochs.items():
-            torch.manual_seed(seed)
-            model = _neural_model("panel_transformer", candidate).to(device)
-            fit_epochs(
-                model, pooled, sweep.batch_size, epochs,
-                candidate.learning_rate, candidate.weight_decay,
-                seed, device,
-            )
-            for name, data in zip(names, members, strict=True):
-                frozen, timestamps, _, _, split = folds_by_series[name]
-                loader = data_loaders(data, sweep.batch_size, seed)[1]
-                digest = _model_fingerprint(model, data, candidate)
-                fingerprints.append({
-                    "model": "panel_transformer", "series": name,
-                    "seed": seed, "epochs": epochs, "sha256": digest,
-                })
-                predictions = [] if calibration_prediction_records is not None \
-                    else None
-                metrics = evaluate(
-                    model, loader, data.target_mean, data.target_scale,
-                    device, predictions,
+        panel_calibration = []
+        panel_predictions = []
+        for model_name in panel_models:
+            candidate = panel_candidates[model_name]
+            conditioned = model_name == "conditioned_panel_transformer"
+            members = []
+            for name, (_, _, rows, _, split) in folds_by_series.items():
+                data_key = (name, candidate.name)
+                data = final_data.get(data_key)
+                if data is None:
+                    data = _candidate_data(
+                        rows, candidate, split, max_history, sweep,
+                    )
+                    final_data[data_key] = data
+                members.append(data)
+            pooled = _panel_data(members, conditioned)
+            for seed in sweep.seeds:
+                epochs = selected_epochs[(model_name, seed)]
+                torch.manual_seed(seed)
+                model = _neural_model(
+                    model_name, candidate,
+                    len(names) if conditioned else 0,
+                ).to(device)
+                fit_epochs(
+                    model, pooled, sweep.batch_size, epochs,
+                    candidate.learning_rate, candidate.weight_decay,
+                    seed, device,
                 )
-                record = _validation_record(
-                    "panel_transformer", candidate, name, None,
-                    _boundary(timestamps, target_offset, split, gap), seed,
-                    len(data.validation), mean_loss(model, loader, device),
-                    metrics, None,
-                )
-                record["epochs"] = epochs
-                panel_calibration.append(record)
-                if predictions is not None:
-                    panel_predictions.extend(_prediction_records(
-                        "panel_transformer", candidate, name, seed, data,
-                        timestamps, frozen.sha256, predictions,
-                        data.validation, "calibration", None,
-                    ))
+                for series_id, (name, data) in enumerate(zip(
+                    names, members, strict=True,
+                )):
+                    frozen, timestamps, _, _, split = folds_by_series[name]
+                    evaluation = (
+                        _conditioned(data, series_id)
+                        if conditioned else data
+                    )
+                    loader = data_loaders(
+                        evaluation, sweep.batch_size, seed,
+                    )[1]
+                    digest = _model_fingerprint(model, data, candidate)
+                    fingerprints.append({
+                        "model": model_name, "series": name,
+                        "seed": seed, "epochs": epochs, "sha256": digest,
+                    })
+                    predictions = (
+                        [] if calibration_prediction_records is not None
+                        else None
+                    )
+                    metrics = evaluate(
+                        model, loader, data.target_mean, data.target_scale,
+                        device, predictions,
+                    )
+                    record = _validation_record(
+                        model_name, candidate, name, None,
+                        _boundary(timestamps, target_offset, split, gap), seed,
+                        len(data.validation), mean_loss(model, loader, device),
+                        metrics, None,
+                    )
+                    record["epochs"] = epochs
+                    panel_calibration.append(record)
+                    if predictions is not None:
+                        panel_predictions.extend(_prediction_records(
+                            model_name, candidate, name, seed, data,
+                            timestamps, frozen.sha256, predictions,
+                            data.validation, "calibration", None,
+                        ))
         panel_calibration.sort(key=lambda record: (
+            model_order[str(record["model"])],
             series_order[str(record["series"])],
             seed_order[int(record["seed"])],
         ))
         calibration.extend(panel_calibration)
         if calibration_prediction_records is not None:
             panel_predictions.sort(key=lambda record: (
+                model_order[str(record["model"])],
                 series_order[str(record["series"])],
                 seed_order[int(record["seed"])], str(record["target_time"]),
             ))
             calibration_prediction_records.extend(panel_predictions)
-    fingerprints.sort(key=lambda item: (
-        item["model"], item["series"],
-        -1 if item["seed"] is None else item["seed"],
-    ))
+    if "conditioned_panel_transformer" not in panel_models:
+        fingerprints.sort(key=lambda item: (
+            item["model"], item["series"],
+            -1 if item["seed"] is None else item["seed"],
+        ))
+    else:
+        local_fingerprints = [
+            item for item in fingerprints
+            if item["model"] not in PANEL_MODEL_SET
+        ]
+        local_fingerprints.sort(key=lambda item: (
+            item["model"], item["series"],
+            -1 if item["seed"] is None else item["seed"],
+        ))
+        panel_fingerprints = [
+            item for item in fingerprints
+            if item["model"] in PANEL_MODEL_SET
+        ]
+        panel_fingerprints.sort(key=lambda item: (
+            model_order[str(item["model"])],
+            series_order[str(item["series"])],
+            seed_order[int(item["seed"])],
+        ))
+        fingerprints = [*local_fingerprints, *panel_fingerprints]
     contract = _calibration_contract(
         sweep, metadata, test_contract, selection, validation, calibration,
         fingerprints,
@@ -1224,6 +1328,14 @@ def _run_experiment(
         "test": test,
         "summary": summarize(test, sweep.models),
     }
+    if "conditioned_panel_transformer" in panel_models:
+        report["protocol"]["panel_conditioning"] = {
+            "model": "conditioned_panel_transformer",
+            "kind": "learned-series-embedding",
+            "series_order": list(names),
+            "initialization": "zeros",
+            "application": "additive-before-encoder",
+        }
     if panel_execution is not None:
         report.update(panel_execution.provenance())
         panel_execution.validate()
@@ -1301,7 +1413,7 @@ def _execute(
             panel_execution.verify()
 
     sweep = Sweep.read(sweep_input.snapshot)
-    if not args.calibration_only and PANEL_MODELS.intersection(sweep.models):
+    if not args.calibration_only and PANEL_MODEL_SET.intersection(sweep.models):
         raise ValueError("panel models are calibration-only")
     if args.horizon_bars is not None:
         sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
@@ -1405,7 +1517,7 @@ def main() -> None:
             raise ValueError("full experiments require unique frozen policies")
         torch.empty(0, device=device)
         discovered = Sweep.read(args.sweep)
-        panel = bool(PANEL_MODELS.intersection(discovered.models))
+        panel = bool(PANEL_MODEL_SET.intersection(discovered.models))
         if panel and not args.calibration_only:
             raise ValueError("panel models are calibration-only")
         if panel != all(panel_paths):

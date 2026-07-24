@@ -18,13 +18,16 @@ try:
 except ModuleNotFoundError as error:
     raise SystemExit("training tests require PyTorch") from error
 
+from torch.utils.data import DataLoader, Dataset
+
 from tools.artifact_v1 import Artifact, Config, write_artifact
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.float32 import ulp_distance
 from tools.reference import predict_windows
 from tools.train import (
     DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
-    fit_epochs, fit_model, parse_args, prepare_data, train as train_model,
+    evaluate, fit_epochs, fit_model, mean_loss, parse_args, prepare_data,
+    train as train_model, train_epoch,
 )
 
 
@@ -233,6 +236,42 @@ def verify_data_splits(csv: Path) -> None:
     assert changed.horizon_bars == 2
 
 
+def verify_conditioned_batches() -> None:
+    torch.manual_seed(17)
+    config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
+    model = ForecastTransformer(config)
+    batch = 4
+    values = torch.randn(batch, config.seq_len, config.in_dim)
+    assert model(values).shape == (batch,)
+
+    plain = model(values)
+    conditioned = model(values, torch.zeros(batch, config.model_dim))
+    assert torch.equal(plain, conditioned)
+
+    context = torch.zeros(batch, config.model_dim)
+    context[0, 0] = 1.0
+    changed = model(values, context)
+    assert not torch.equal(plain[:1], changed[:1])
+    assert torch.equal(plain[1:], changed[1:])
+
+    class ConditionedWindows(Dataset):
+        def __len__(self) -> int:
+            return batch
+
+        def __getitem__(self, index: int) -> tuple[object, ...]:
+            return ((values[index], context[index]), torch.zeros(()),
+                    torch.ones(()), torch.ones(()))
+
+    loader = DataLoader(ConditionedWindows(), batch_size=2)
+    device = torch.device("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    assert math.isfinite(mean_loss(model, loader, device))
+    assert math.isfinite(train_epoch(model, loader, optimizer, device))
+    assert all(math.isfinite(value) for value in evaluate(
+        model, loader, torch.zeros(()), torch.ones(()), device,
+    ).values())
+
+
 def main() -> None:
     binary = Path(sys.argv[1] if len(sys.argv) == 2 else ROOT / "bin/transformer").resolve()
     with tempfile.TemporaryDirectory(prefix="compose-mini-training-") as directory:
@@ -241,6 +280,7 @@ def main() -> None:
         verify_restoration(Path(directory) / "training.csv", Path(directory))
         verify_data_splits(Path(directory) / "training.csv")
         verify_fixed_epochs(Path(directory) / "training.csv")
+        verify_conditioned_batches()
     print("training and export tests passed "
           f"(fixture {distance} ULP, trained maximum {trained_distance} ULP)")
 
