@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
 from urllib.parse import quote
@@ -26,7 +27,10 @@ from tools.backtest import (
     read_forecasts, run_backtests, validate_policy,
 )
 from tools.data_v1 import EXECUTABLE_RETURN_TARGET
-from tools.fetch_universe import UniverseManifest
+from tools.fetch_massive import Bar, scan_regular_bars
+from tools.fetch_universe import (
+    FETCH_SCHEMA, GAP_POLICY, GAP_SCOPE, UniverseManifest,
+)
 from tools.files import (
     FrozenInput, freeze_inputs, require_disjoint, verify_frozen, write_json,
 )
@@ -266,15 +270,49 @@ def _manifest_names(manifest: UniverseManifest) -> tuple[str, ...]:
     return names
 
 
+def _gap_audit(
+    timestamps: Sequence[str], minutes: int,
+) -> tuple[int, dict[str, object]]:
+    observed: list[Bar] = [
+        (
+            int(datetime.strptime(
+                timestamp, "%Y-%m-%dT%H:%M:%SZ",
+            ).replace(tzinfo=timezone.utc).timestamp() * 1000),
+            1.0, 1.0, 1.0, 1.0, 0.0,
+        )
+        for timestamp in timestamps
+    ]
+    selected, sessions, gaps = scan_regular_bars(observed, minutes)
+    if len(selected) != len(observed):
+        raise ValueError("audited CSV contains non-regular bars")
+    return sessions, {
+        "scope": GAP_SCOPE,
+        "affected_sessions": len({gap["session"] for gap in gaps}),
+        "internal_gap_count": len(gaps),
+        "internal_missing_bins": sum(
+            int(gap["absent_bins"]) for gap in gaps
+        ),
+        "gaps": gaps,
+    }
+
+
 def validate_fetch(
     value: Mapping[str, object], manifest: UniverseManifest,
     manifest_input: FrozenInput, bars: Mapping[str, Bars],
 ) -> None:
-    expected_fields = {
+    legacy_fields = {
         "schema", "purpose", "declared_on", "eligibility_date", "start", "end",
         "interval_minutes", "adjusted", "session", "manifest", "series",
     }
-    if set(value) != expected_fields:
+    audited = "fetch_schema" in value
+    expected_fields = legacy_fields | (
+        {"fetch_schema", "gap_policy"} if audited else set()
+    )
+    if set(value) != expected_fields or audited and (
+        type(value["fetch_schema"]) is not int or \
+        value["fetch_schema"] != FETCH_SCHEMA or \
+        value["gap_policy"] != GAP_POLICY
+    ):
         raise ValueError("fetch report fields are invalid")
     metadata = {
         "schema": manifest.schema,
@@ -322,15 +360,30 @@ def validate_fetch(
         }
         csv = record["csv"]
         series_bars = bars[spec.ticker]
+        csv_fields = {
+            "path", "rows", "sessions", "source_rows", "sha256",
+        } | ({"gap_audit"} if audited else set())
         if record["reference"] != reference or record["aggregate"] != aggregate or \
-           not isinstance(csv, dict) or set(csv) != {
-               "path", "rows", "sessions", "source_rows", "sha256",
-           } or csv["path"] != series_bars.path or \
+           not isinstance(csv, dict) or set(csv) != csv_fields or \
+           csv["path"] != series_bars.path or \
            csv["sha256"] != series_bars.sha256 or \
            _integer(csv["rows"], "CSV rows", 1) != len(series_bars.timestamps) or \
            _integer(csv["sessions"], "CSV sessions", 1) > csv["rows"] or \
            _integer(csv["source_rows"], "CSV source rows", 1) < csv["rows"]:
             raise ValueError("fetch request or CSV contract is invalid")
+        if audited:
+            sessions, audit = _gap_audit(
+                series_bars.timestamps, manifest.interval_minutes,
+            )
+            supplied = json.dumps(
+                csv["gap_audit"], allow_nan=False,
+                separators=(",", ":"), sort_keys=True,
+            )
+            expected = json.dumps(
+                audit, allow_nan=False, separators=(",", ":"), sort_keys=True,
+            )
+            if csv["sessions"] != sessions or supplied != expected:
+                raise ValueError("fetch gap audit does not match its CSV")
 
 
 def _expected_empty_summary() -> dict[str, object]:

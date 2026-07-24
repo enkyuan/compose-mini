@@ -34,6 +34,7 @@ from tools import replay_calibration as replay_tool
 from tools.backtest import (
     Costs, experiment_fingerprint, load_bars, read_forecasts,
 )
+from tools.fetch_universe import fetch_universe
 from tools.files import file_sha256, write_json
 from tools.select_policy import select_policy
 
@@ -175,6 +176,85 @@ def write_csv(path: Path, stock: int) -> None:
             f"{timestamp},100,{high:.9g},{low:.9g},{close:.9g},{1000 + index}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def test_gap_audit_contract(directory: Path) -> None:
+    manifest_path = directory / "gap-manifest.json"
+    manifest = manifest_value()
+    manifest["series"] = [{"stratum": "generic", "ticker": "AAPL"}]
+    write_json(manifest_path, manifest)
+    values = (
+        ("2024-07-22T13:30:00+00:00", 100.0),
+        ("2024-07-22T14:30:00+00:00", 101.0),
+    )
+
+    def request(url: str) -> dict[str, object]:
+        if "/v3/reference/tickers/" in url:
+            return {
+                "status": "OK",
+                "results": {
+                    "ticker": "AAPL", "active": True, "market": "stocks",
+                    "locale": "us", "type": "CS", "currency_name": "usd",
+                },
+            }
+        return {
+            "status": "OK", "ticker": "AAPL",
+            "results": [
+                {
+                    "t": int(datetime.fromisoformat(timestamp).timestamp() * 1000),
+                    "o": close, "h": close, "l": close, "c": close, "v": 1.0,
+                }
+                for timestamp, close in values
+            ],
+        }
+
+    report = fetch_universe(
+        manifest_path, directory / "gap-csv", directory / "gap-fetch.json",
+        key="fake-secret", requester=request,
+    )
+    parsed = analysis.UniverseManifest.read(manifest_path)
+    manifest_input = analysis.FrozenInput(
+        manifest_path, manifest_path, file_sha256(manifest_path),
+    )
+    bars = {"AAPL": load_bars(Path(report["series"][0]["csv"]["path"]))}
+    analysis.validate_fetch(report, parsed, manifest_input, bars)
+
+    def rejected(change: Callable[[dict[str, object]], None]) -> None:
+        candidate = json.loads(json.dumps(report))
+        change(candidate)
+        try:
+            analysis.validate_fetch(candidate, parsed, manifest_input, bars)
+        except ValueError:
+            return
+        raise AssertionError("mutated gap audit was accepted")
+
+    for change in (
+        lambda value: value.update({"fetch_schema": 1}),
+        lambda value: value.update({"fetch_schema": 2.0}),
+        lambda value: value.update({"gap_policy": "strict"}),
+        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+            {"scope": "all-session-bins"}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+            {"affected_sessions": 0}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+            {"internal_gap_count": 0}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+            {"internal_gap_count": 1.0}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"].update(
+            {"internal_missing_bins": 0}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"]["gaps"][0].update(
+            {"absent_bins": 2}
+        ),
+        lambda value: value["series"][0]["csv"]["gap_audit"]["gaps"][0].update(
+            {"absent_bins": 1.0}
+        ),
+    ):
+        rejected(change)
 
 
 def request_contract(
@@ -1110,6 +1190,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-universe-analysis-",
     ) as directory:
+        test_gap_audit_contract(Path(directory))
         fixture = test_valid_reports(Path(directory))
         test_output_freshness(fixture)
         test_late_membership(fixture)

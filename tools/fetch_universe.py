@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch a frozen point-in-time stock universe into strict CSV files."""
+"""Fetch a frozen stock universe into audited observed-bar CSV files."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.fetch_massive import (
     API_HOST, TICKER, Requester, aggregate_url, api_key, authorized_url,
-    fetch_bars, regular_bars, request_gate, request_json, write_csv,
+    fetch_bars, request_gate, request_json, scan_regular_bars, write_csv,
 )
 from tools.files import file_sha256, freeze_inputs, write_json
 
@@ -28,6 +28,9 @@ MANIFEST_FIELDS = {
     "interval_minutes", "adjusted", "session", "series",
 }
 SERIES_FIELDS = {"ticker", "stratum"}
+FETCH_SCHEMA = 2
+GAP_POLICY = "retain-observed-bars"
+GAP_SCOPE = "internal-between-observed-bars"
 
 
 def _ticker_valid(value: object) -> bool:
@@ -276,7 +279,9 @@ def fetch_universe(
             )
             aggregate_contract = _contract(aggregate)
             source = fetch_bars(aggregate, secret, item.ticker, transport)
-            bars, sessions = regular_bars(source, manifest.interval_minutes)
+            bars, sessions, gaps = scan_regular_bars(
+                source, manifest.interval_minutes,
+            )
             write_csv(path, bars)
             rows = len(read_csv(path)) // FEATURE_COUNT
             if rows != len(bars):
@@ -291,11 +296,23 @@ def fetch_universe(
                     "rows": rows,
                     "sessions": sessions,
                     "source_rows": len(source),
+                    "gap_audit": {
+                        "scope": GAP_SCOPE,
+                        "affected_sessions": len({
+                            gap["session"] for gap in gaps
+                        }),
+                        "internal_gap_count": len(gaps),
+                        "internal_missing_bins": sum(
+                            int(gap["absent_bins"]) for gap in gaps
+                        ),
+                        "gaps": gaps,
+                    },
                     "sha256": file_sha256(path),
                 },
             })
 
         report: dict[str, object] = {
+            "fetch_schema": FETCH_SCHEMA,
             "schema": manifest.schema,
             "purpose": manifest.purpose,
             "declared_on": str(manifest.declared_on),
@@ -305,6 +322,7 @@ def fetch_universe(
             "interval_minutes": manifest.interval_minutes,
             "adjusted": manifest.adjusted,
             "session": manifest.session,
+            "gap_policy": GAP_POLICY,
             "manifest": {
                 "path": str(manifest_path),
                 "sha256": frozen.sha256,

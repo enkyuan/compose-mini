@@ -29,6 +29,7 @@ API_HOST = "api.massive.com"
 EASTERN = ZoneInfo("America/New_York")
 TICKER = re.compile(r"[A-Z0-9.-]{1,32}")
 Bar = tuple[int, float, float, float, float, float]
+Gap = dict[str, str | int]
 Requester = Callable[[str], Mapping[str, object]]
 
 
@@ -185,26 +186,54 @@ def fetch_bars(url: str, key: str, ticker: str,
     return bars
 
 
-def regular_bars(bars: Sequence[Bar], minutes: int) -> tuple[list[Bar], int]:
-    """Keep regular hours and reject internal gaps in each observed session."""
+def _timestamp(timestamp: int) -> str:
+    return datetime.fromtimestamp(
+        timestamp / 1000, timezone.utc,
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def scan_regular_bars(
+    bars: Sequence[Bar], minutes: int,
+) -> tuple[list[Bar], int, list[Gap]]:
+    """Return observed regular bars and a deterministic internal-gap audit."""
     sessions: dict[date, list[tuple[int, Bar]]] = {}
+    previous = -1
     for bar in bars:
         local = datetime.fromtimestamp(bar[0] / 1000, timezone.utc).astimezone(EASTERN)
         minute = local.hour * 60 + local.minute
         if local.weekday() < 5 and 570 <= minute < 960:
+            if bar[0] <= previous:
+                raise ValueError("Massive regular-session bars are not chronological")
+            previous = bar[0]
             if local.second or local.microsecond or (minute - 570) % minutes:
                 raise ValueError("Massive bar is not aligned to the requested interval")
             sessions.setdefault(local.date(), []).append((minute, bar))
     selected: list[Bar] = []
-    for session in sessions.values():
-        if session[0][0] != 570 or any(
-            right[0] - left[0] != minutes for left, right in zip(session, session[1:])
-        ):
+    gaps: list[Gap] = []
+    for day, session in sessions.items():
+        if session[0][0] != 570:
             raise ValueError("Massive regular session has an internal gap")
+        for left, right in zip(session, session[1:]):
+            distance = right[0] - left[0]
+            if distance > minutes:
+                gaps.append({
+                    "session": str(day),
+                    "left_timestamp": _timestamp(left[1][0]),
+                    "right_timestamp": _timestamp(right[1][0]),
+                    "absent_bins": distance // minutes - 1,
+                })
         selected.extend(bar for _, bar in session)
     if not selected:
         raise ValueError("Massive returned no regular-session bars")
-    return selected, len(sessions)
+    return selected, len(sessions), gaps
+
+
+def regular_bars(bars: Sequence[Bar], minutes: int) -> tuple[list[Bar], int]:
+    """Keep regular hours and reject internal gaps in each observed session."""
+    selected, sessions, gaps = scan_regular_bars(bars, minutes)
+    if gaps:
+        raise ValueError("Massive regular session has an internal gap")
+    return selected, sessions
 
 
 def write_csv(path: Path, bars: Sequence[Bar]) -> None:
@@ -215,8 +244,7 @@ def write_csv(path: Path, bars: Sequence[Bar]) -> None:
             writer = csv.writer(file, lineterminator="\n")
             writer.writerow(CSV_HEADER.split(","))
             for timestamp, *values in bars:
-                instant = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
-                writer.writerow((instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                writer.writerow((_timestamp(timestamp),
                                  *(format(value, ".9g") for value in values)))
             file.flush()
             os.fsync(file.fileno())

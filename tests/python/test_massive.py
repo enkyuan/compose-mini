@@ -23,10 +23,10 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.data_v1 import FEATURE_COUNT, read_csv
+from tools.data_v1 import FEATURE_COUNT, read_bars, read_csv
 from tools.fetch_massive import (
     aggregate_url, api_key, authorized_url, fetch_bars, regular_bars,
-    request_gate, request_json, write_csv,
+    request_gate, request_json, scan_regular_bars, write_csv,
 )
 from tools.fetch_universe import (
     SeriesSpec, UniverseManifest, fetch_universe, parse_args as universe_args,
@@ -2373,9 +2373,11 @@ def test_universe_fetch(directory: Path) -> None:
         )
 
     assert set(report) == {
-        "schema", "purpose", "declared_on", "eligibility_date", "start", "end",
-        "interval_minutes", "adjusted", "session", "manifest", "series",
+        "fetch_schema", "schema", "purpose", "declared_on",
+        "eligibility_date", "start", "end", "interval_minutes", "adjusted",
+        "session", "gap_policy", "manifest", "series",
     }
+    assert report["fetch_schema"] == 2
     assert report["manifest"] == {
         "path": str(manifest_path),
         "sha256": hashlib.sha256(frozen_bytes).hexdigest(),
@@ -2409,6 +2411,11 @@ def test_universe_fetch(directory: Path) -> None:
         assert csv == {
             "path": str(resolved_output / f"{ticker.lower()}-30m.csv"),
             "rows": 1, "sessions": 1, "source_rows": 1,
+            "gap_audit": {
+                "scope": "internal-between-observed-bars",
+                "affected_sessions": 0, "internal_gap_count": 0,
+                "internal_missing_bins": 0, "gaps": [],
+            },
             "sha256": file_sha256(path),
         }
         assert len(read_csv(path)) == FEATURE_COUNT
@@ -2452,6 +2459,99 @@ def test_universe_fetch(directory: Path) -> None:
     rendered = json.dumps(report)
     assert all(secret not in rendered
                for secret in ("apiKey", "MASSIVE_API_KEY", "fake-secret"))
+
+
+def test_observed_bar_gaps(directory: Path) -> None:
+    manifest = directory / "gap-manifest.json"
+    value = manifest_value()
+    value["series"] = [{"ticker": "AAPL", "stratum": "generic"}]
+    write_manifest(manifest, value)
+    results = [
+        aggregate("2024-07-22T13:00:00+00:00", 99.0),
+        aggregate("2024-07-22T13:30:00+00:00", 100.0),
+        aggregate("2024-07-22T14:30:00+00:00", 101.0),
+        aggregate("2024-07-22T16:00:00+00:00", 102.0),
+        aggregate("2024-07-22T20:00:00+00:00", 999.0),
+        aggregate("2024-07-23T13:30:00+00:00", 103.0),
+        aggregate("2024-07-23T15:00:00+00:00", 104.0),
+    ]
+    source = fetch_bars(
+        aggregate_url("AAPL", date(2024, 7, 22), date(2024, 7, 23), 30, True),
+        "fake-secret", "AAPL",
+        lambda _url: {"status": "OK", "ticker": "AAPL", "results": results},
+    )
+    raises(ValueError, regular_bars, source, 30)
+    bars, sessions, gaps = scan_regular_bars(source, 30)
+    assert len(bars) == 5 and sessions == 2
+    assert gaps == [
+        {
+            "session": "2024-07-22",
+            "left_timestamp": "2024-07-22T13:30:00Z",
+            "right_timestamp": "2024-07-22T14:30:00Z",
+            "absent_bins": 1,
+        },
+        {
+            "session": "2024-07-22",
+            "left_timestamp": "2024-07-22T14:30:00Z",
+            "right_timestamp": "2024-07-22T16:00:00Z",
+            "absent_bins": 2,
+        },
+        {
+            "session": "2024-07-23",
+            "left_timestamp": "2024-07-23T13:30:00Z",
+            "right_timestamp": "2024-07-23T15:00:00Z",
+            "absent_bins": 2,
+        },
+    ]
+    misaligned = list(bars)
+    misaligned[1] = (
+        timestamp("2024-07-22T14:45:00+00:00"), *misaligned[1][1:],
+    )
+    for invalid in (
+        misaligned, [bars[0], bars[0]], [bars[1], bars[0]],
+        [bars[3], bars[0]],
+    ):
+        raises(ValueError, scan_regular_bars, invalid, 30)
+
+    output = directory / "gap-output"
+    report_path = directory / "gap-report.json"
+
+    def request(url: str) -> dict[str, object]:
+        if urlsplit(url).path.startswith("/v3/reference/tickers/"):
+            return {
+                "status": "OK",
+                "results": {
+                    "ticker": "AAPL", "active": True, "market": "stocks",
+                    "locale": "us", "type": "CS", "currency_name": "usd",
+                },
+            }
+        return {"status": "OK", "ticker": "AAPL", "results": results}
+
+    report = fetch_universe(
+        manifest, output, report_path, key="fake-secret", requester=request,
+    )
+    assert report["fetch_schema"] == 2
+    assert report["gap_policy"] == "retain-observed-bars"
+    csv = report["series"][0]["csv"]
+    assert csv["gap_audit"] == {
+        "scope": "internal-between-observed-bars",
+        "affected_sessions": 2,
+        "internal_gap_count": 3,
+        "internal_missing_bins": 5,
+        "gaps": gaps,
+    }
+    timestamps_, values = read_bars(Path(csv["path"]))
+    assert timestamps_ == (
+        "2024-07-22T13:30:00Z", "2024-07-22T14:30:00Z",
+        "2024-07-22T16:00:00Z",
+        "2024-07-23T13:30:00Z", "2024-07-23T15:00:00Z",
+    )
+    expected = tuple(
+        value
+        for close in (100.0, 101.0, 102.0, 103.0, 104.0)
+        for value in (close - 0.25, close + 0.5, close - 0.5, close, 1000.0)
+    )
+    assert tuple(values) == expected
 
 
 def test_universe_pagination_gate(directory: Path) -> None:
@@ -2710,6 +2810,7 @@ def main() -> None:
         test_target_rejections(directory)
         test_rate_validation(directory)
         test_universe_fetch(directory)
+        test_observed_bar_gaps(directory)
         test_universe_pagination_gate(directory)
         test_reference_identity(directory)
         test_mutations(directory)
