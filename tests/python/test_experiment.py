@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify walk-forward selection, aligned targets, baselines, and JSON reports."""
 
+from array import array
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -28,7 +29,7 @@ from tools.experiment import (
     SeriesTransformer, Sweep, _authorize_test, _boundary, _candidate_data,
     _fit_neural, _fit_shared_epochs, _fit_shared_updates, _label_available,
     _macro_validation_loss, _matrix, _model_fingerprint, _panel_data,
-    _panel_members, _panel_selected_epochs, _prediction_records,
+    _panel_members, _panel_selected_epochs, _prediction_records, _prepare_packed,
     _run_experiment, _selected_epochs, _SeriesDataset, _stock_uniform_loader,
     _stock_uniform_weights, _verify_test_state, expected_runs, holdout_split,
     linear_model, purged_split, run_experiment, select_candidates,
@@ -49,6 +50,7 @@ from tools.panel_contract import (
     TorchIdentity, executable_binding, freeze_panel_execution, source_tree,
 )
 from tools.session_samples import SampleRows
+from tools.universe_contract import PackedRows, common_calendar, pack_rows
 
 
 def close_value(index: int) -> float:
@@ -555,6 +557,81 @@ def verify_indexed_coordinates() -> None:
         raise AssertionError("indexed predictions reached the row backtester")
     assert {"tools/session_calendar.py", "tools/session_samples.py"} <= \
         set(SOURCE_PATHS)
+
+
+def verify_packed_development_data() -> None:
+    timestamps = tuple(f"t{index}" for index in range(12))
+    samples = tuple(
+        SampleRows(index + 2, index + 3, index + 5, index + 2)
+        for index in range(6)
+    )
+    packed = pack_rows(
+        samples, common_calendar(20, 2, 0.2, 2).folds[0], 3, 3, 3,
+    )
+    assert packed.counts == (2, 2)
+    assert tuple(row.as_of_ordinal for row in packed.rows) == (2, 3, 6, 7)
+
+    values = array("f")
+    for index in range(len(timestamps)):
+        close = close_value(index)
+        values.extend((
+            close - 0.1 - 0.01 * (index % 2), close + 0.4,
+            close - 0.5, close, 1_000.0 + 11.0 * index + index % 5,
+        ))
+    selected = candidate("packed", 3)
+    sweep = Sweep(
+        (selected,), ("last_close",), (7,), 2, 0.2, 1, 1, 2,
+        3, 3, EXECUTABLE_RETURN_TARGET,
+    )
+    data = _prepare_packed(values, selected, packed, 3, sweep)
+    assert tuple(map(len, (data.train, data.validation, data.test))) == (2, 2, 0)
+    assert (data.train.start, data.validation.start, data.test.start) == (0, 2, 4)
+    assert _boundary(
+        timestamps, 0, (*packed.counts, 0), 0, sample_rows=packed.rows,
+    ) == {
+        "train": ["t5", "t6"],
+        "validation": ["t9", "t10"],
+        "test": [],
+    }
+    _label_available(
+        timestamps, 0, (*packed.counts, 0), 0, 3,
+        sample_rows=packed.rows,
+    )
+
+    try:
+        _candidate_data(
+            values, selected, (*packed.counts, 0), 3, sweep,
+            sample_rows=packed.rows,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("indexed rows bypassed the configured embargo")
+
+    adjacent = PackedRows(tuple(
+        SampleRows(index + 2, index + 3, index + 3, index + 2)
+        for index in range(4)
+    ), (2, 2))
+    try:
+        _prepare_packed(
+            values, selected, adjacent, 3,
+            replace(sweep, target_horizon_bars=1),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("packed rows bypassed the alignment embargo")
+
+    for invalid in (
+        replace(packed, counts=(2, 1)),
+        replace(packed, counts=(4, 0)),
+        replace(packed, counts=(*packed.counts, 0)),
+    ):
+        try:
+            _prepare_packed(values, selected, invalid, 3, sweep)
+        except ValueError:
+            continue
+        raise AssertionError("invalid packed development rows were accepted")
 
 
 def verify_model_fingerprint(data: TrainingData) -> None:
@@ -1698,6 +1775,7 @@ def main() -> None:
     verify_selected_epochs()
     verify_ridge()
     verify_indexed_coordinates()
+    verify_packed_development_data()
     verify_stationary_features()
     sweep = Sweep(
         (candidate("short", 3), candidate("stationary", 5, "stationary-v1")),

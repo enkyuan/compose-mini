@@ -52,6 +52,7 @@ from tools.train import (
     TrainingData, UpdateFit, Windows, data_loaders, evaluate, feature_lookback,
     fit_epochs, fit_model, fit_updates, mean_loss, prepare_rows,
 )
+from tools.universe_contract import PackedRows
 
 PANEL_MODELS = ("panel_transformer", "conditioned_panel_transformer")
 PANEL_MODEL_SET = frozenset(PANEL_MODELS)
@@ -341,13 +342,18 @@ def _label_available(
         for count in split:
             starts.append(offset)
             offset += count + gap
+        segments = tuple(
+            (start, count) for start, count in zip(
+                starts, split, strict=True,
+            ) if count
+        )
         if offset - gap > len(sample_rows) or any(
             sample_rows[start + count - 1].target >
             sample_rows[next_start].as_of or
             sample_rows[start + count - 1].as_of_ordinal + horizon >
             sample_rows[next_start].as_of_ordinal
-            for start, count, next_start in zip(
-                starts, split, starts[1:], strict=False,
+            for (start, count), (next_start, _) in zip(
+                segments, segments[1:], strict=False,
             )
         ):
             raise ValueError(
@@ -455,12 +461,14 @@ def _boundary(
         starts.append(offset)
         offset += count + gap
     return {
-        name: [
-            timestamps[sample_rows[start].target],
-            timestamps[sample_rows[start + count - 1].target],
-        ] if sample_rows is not None else [
-            timestamps[start], timestamps[start + count - 1],
-        ]
+        name: [] if not count else (
+            [
+                timestamps[sample_rows[start].target],
+                timestamps[sample_rows[start + count - 1].target],
+            ] if sample_rows is not None else [
+                timestamps[start], timestamps[start + count - 1],
+            ]
+        )
         for name, start, count in zip(
             ("train", "validation", "test"), starts, split, strict=False,
         )
@@ -471,20 +479,41 @@ def _candidate_data(rows: array, candidate: Candidate,
                     split: tuple[int, int, int],
                     max_history: int, sweep: Sweep, *,
                     sample_rows: Sequence[SampleRows] | None = None,
+                    prepurged: bool = False,
                     ) -> TrainingData:
     history = candidate.seq_len + feature_lookback(candidate.feature_set)
+    if prepurged and sample_rows is None:
+        raise ValueError("prepurged data requires indexed samples")
     return prepare_rows(
         rows, candidate.config(), 0.7, 0.15, split=split,
         sample_start=(
+            0 if sample_rows is not None else
             max_history - history + sweep.alignment_horizon_bars -
             sweep.target_horizon_bars
-            if sample_rows is None else 0
         ),
         feature_set=candidate.feature_set,
         horizon_bars=sweep.target_horizon_bars,
-        split_gap=sweep.alignment_horizon_bars - 1,
+        split_gap=0 if prepurged else sweep.alignment_horizon_bars - 1,
         target_kind=sweep.target_kind,
         sample_rows=sample_rows,
+        allow_empty_later=prepurged,
+    )
+
+
+def _prepare_packed(rows: array, candidate: Candidate, packed: PackedRows,
+                    max_history: int, sweep: Sweep) -> TrainingData:
+    """Prepare embargoed development rows without exposing a test block."""
+    if not isinstance(packed, PackedRows) or len(packed.counts) != 2 or \
+       any(type(count) is not int or count < 1 for count in packed.counts) or \
+       sum(packed.counts) != len(packed.rows):
+        raise ValueError("packed rows must cover only train and validation")
+    boundary = packed.counts[0]
+    if packed.rows[boundary - 1].as_of_ordinal + \
+       sweep.alignment_horizon_bars > packed.rows[boundary].as_of_ordinal:
+        raise ValueError("packed rows do not preserve the alignment embargo")
+    return _candidate_data(
+        rows, candidate, (*packed.counts, 0), max_history, sweep,
+        sample_rows=packed.rows, prepurged=True,
     )
 
 
