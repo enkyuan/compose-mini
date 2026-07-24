@@ -166,12 +166,16 @@ class Windows(Dataset):
 
 
 @dataclass(frozen=True)
-class TrainingData:
+class DataSplits:
+    train: Dataset
+    validation: Dataset
+    test: Dataset
+
+
+@dataclass(frozen=True)
+class TrainingData(DataSplits):
     """Own one leakage-safe chronological split and its fitted scalers."""
 
-    train: Windows
-    validation: Windows
-    test: Windows
     feature_mean: torch.Tensor
     feature_scale: torch.Tensor
     target_mean: torch.Tensor
@@ -359,7 +363,7 @@ def prepare_rows(rows: array, config: Config, train_fraction: float,
     )
 
 
-def data_loaders(data: TrainingData, batch_size: int,
+def data_loaders(data: DataSplits, batch_size: int,
                  seed: int) -> tuple[DataLoader, DataLoader, DataLoader]:
     generator = torch.Generator().manual_seed(seed)
     return (
@@ -369,7 +373,7 @@ def data_loaders(data: TrainingData, batch_size: int,
     )
 
 
-def fit_epochs(model: nn.Module, data: TrainingData, batch_size: int,
+def fit_epochs(model: nn.Module, data: DataSplits, batch_size: int,
                epochs: int, learning_rate: float, weight_decay: float,
                seed: int, device: torch.device
                ) -> tuple[DataLoader, ...]:
@@ -384,7 +388,7 @@ def fit_epochs(model: nn.Module, data: TrainingData, batch_size: int,
     return loaders
 
 
-def fit_model(model: nn.Module, data: TrainingData, batch_size: int,
+def fit_model(model: nn.Module, data: DataSplits, batch_size: int,
               epochs: int, patience: int, learning_rate: float,
               weight_decay: float, seed: int, device: torch.device,
               log_epochs: bool = False) -> tuple[Fit, tuple[DataLoader, ...]]:

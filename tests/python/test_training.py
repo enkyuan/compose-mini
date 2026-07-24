@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-test PyTorch training, weight export, and C-runtime compatibility."""
 
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import json
 import math
@@ -22,8 +23,8 @@ from tools.data_v1 import FEATURE_COUNT, read_csv
 from tools.float32 import ulp_distance
 from tools.reference import predict_windows
 from tools.train import (
-    ForecastTransformer, export_weights, fit_epochs, parse_args,
-    prepare_data, train as train_model,
+    DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
+    fit_epochs, fit_model, parse_args, prepare_data, train as train_model,
 )
 
 
@@ -161,6 +162,7 @@ def verify_restoration(csv: Path, directory: Path) -> None:
 def verify_fixed_epochs(csv: Path) -> None:
     config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
     data = prepare_data(csv, config, 0.6, 0.2)
+    splits = DataSplits(data.train, data.validation, data.test)
 
     class UnreadLoader:
         def __iter__(self) -> object:
@@ -171,7 +173,7 @@ def verify_fixed_epochs(csv: Path) -> None:
     with patch("tools.train.data_loaders", return_value=sentinel_loaders), \
          patch("tools.train.train_epoch", return_value=0.0) as train_epoch:
         returned = fit_epochs(
-            ForecastTransformer(config), data, 8, 3, 3e-4, 1e-4, 7,
+            ForecastTransformer(config), splits, 8, 3, 3e-4, 1e-4, 7,
             torch.device("cpu"),
         )
     assert returned == sentinel_loaders
@@ -181,10 +183,54 @@ def verify_fixed_epochs(csv: Path) -> None:
 
     model = ForecastTransformer(config)
     loaders = fit_epochs(
-        model, data, 8, 2, 3e-4, 1e-4, 7, torch.device("cpu"),
+        model, splits, 8, 2, 3e-4, 1e-4, 7, torch.device("cpu"),
     )
     assert len(loaders) == 3
     assert all(torch.isfinite(value).all() for value in model.state_dict().values())
+
+
+def verify_data_splits(csv: Path) -> None:
+    config = Config(model_dim=4, num_heads=2, ff_dim=6, num_layers=1, seq_len=3)
+    data = prepare_data(csv, config, 0.6, 0.2)
+    splits = DataSplits(data.train, data.validation, data.test)
+    try:
+        splits.train = splits.test
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("DataSplits must be frozen")
+    loaders = data_loaders(splits, 8, 7)
+    assert tuple(loader.dataset for loader in loaders) == (
+        splits.train, splits.validation, splits.test,
+    )
+
+    epoch = 0
+
+    def step(model, *_args) -> float:
+        nonlocal epoch
+        epoch += 1
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.fill_(epoch)
+        return float(epoch)
+
+    model = ForecastTransformer(config)
+    with patch("tools.train.train_epoch", step), \
+         patch("tools.train.mean_loss", side_effect=(1.0, 2.0)):
+        fit, _ = fit_model(
+            model, splits, 8, 2, 1, 3e-4, 1e-4, 7, torch.device("cpu"),
+        )
+    assert fit.best_epoch == 1
+    assert all(torch.all(parameter == 1.0) for parameter in model.parameters())
+
+    positional = TrainingData(
+        data.train, data.validation, data.test, data.feature_mean,
+        data.feature_scale, data.target_mean, data.target_scale,
+        data.feature_set, data.horizon_bars, data.target_kind,
+    )
+    changed = replace(positional, horizon_bars=2)
+    assert changed.train is positional.train
+    assert changed.horizon_bars == 2
 
 
 def main() -> None:
@@ -193,6 +239,7 @@ def main() -> None:
         distance = verify_export(binary, Path(directory))
         trained_distance = verify_training(binary, Path(directory))
         verify_restoration(Path(directory) / "training.csv", Path(directory))
+        verify_data_splits(Path(directory) / "training.csv")
         verify_fixed_epochs(Path(directory) / "training.csv")
     print("training and export tests passed "
           f"(fixture {distance} ULP, trained maximum {trained_distance} ULP)")
