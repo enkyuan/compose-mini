@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import date
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
+from zoneinfo import ZoneInfo
 import json
 import os
 
 ROOT = Path(__file__).resolve().parents[1]
+EASTERN = ZoneInfo("America/New_York")
 DEFAULT_CALENDAR = (
     ROOT / "universes/us-equities-core-2024-07-22_2026-07-21.json"
 )
@@ -17,6 +20,13 @@ FIELDS = {
     "schema", "purpose", "venues", "timezone", "start", "end",
     "open_minute", "close_minute", "closed_dates", "early_closes", "sources",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class SessionBin:
+    session: date
+    minute: int
+    timestamp: str
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -49,6 +59,15 @@ class SessionCalendar:
     venues: tuple[str, ...]
     closed_dates: tuple[date, ...]
     early_closes: tuple[tuple[date, int], ...]
+    _closed: frozenset[date] = field(init=False, repr=False, compare=False)
+    _early: Mapping[date, int] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Index immutable source tuples once; grids query every calendar date.
+        object.__setattr__(self, "_closed", frozenset(self.closed_dates))
+        object.__setattr__(
+            self, "_early", MappingProxyType(dict(self.early_closes)),
+        )
 
     @classmethod
     def read(cls, path: Path) -> SessionCalendar:
@@ -107,9 +126,41 @@ class SessionCalendar:
         """Return local core-session bounds, or None for a closed date."""
         if not self.start <= day <= self.end:
             raise ValueError("date is outside the session calendar")
-        if day.weekday() >= 5 or day in self.closed_dates:
+        if day.weekday() >= 5 or day in self._closed:
             return None
-        return self.open_minute, next(
-            (close for session, close in self.early_closes if session == day),
-            self.close_minute,
-        )
+        return self.open_minute, self._early.get(day, self.close_minute)
+
+
+def expected_bins(
+    calendar: SessionCalendar, start: date, end: date, minutes: int,
+) -> Iterator[SessionBin]:
+    """Yield canonical starts from one inclusive frozen-calendar range."""
+    if type(start) is not date or type(end) is not date or \
+       type(minutes) is not int or not 1 <= minutes <= 59 or start > end or \
+       start < calendar.start or end > calendar.end:
+        raise ValueError("invalid expected-session grid")
+    def bins() -> Iterator[SessionBin]:
+        day = start
+        while day <= end:
+            if day.weekday() < 5 and day not in calendar._closed:
+                close = calendar._early.get(day, calendar.close_minute)
+                for minute in range(
+                    calendar.open_minute, close - minutes + 1, minutes,
+                ):
+                    yield SessionBin(
+                        day, minute, session_timestamp(day, minute),
+                    )
+            day += timedelta(days=1)
+
+    return bins()
+
+
+def session_timestamp(day: date, minute: int) -> str:
+    """Convert one local session boundary to canonical UTC."""
+    if type(day) is not date or type(minute) is not int or \
+       not 0 <= minute <= 24 * 60:
+        raise ValueError("invalid session boundary")
+    local = datetime(
+        day.year, day.month, day.day, tzinfo=EASTERN,
+    ) + timedelta(minutes=minute)
+    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

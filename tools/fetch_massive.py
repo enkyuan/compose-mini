@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
 import argparse
 import csv
 import json
@@ -24,10 +23,12 @@ sys.path.insert(0, str(ROOT))
 
 from tools.data_v1 import CSV_HEADER, read_csv
 from tools.float32 import f32
-from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
+from tools.session_calendar import (
+    DEFAULT_CALENDAR, EASTERN, SessionCalendar, expected_bins as session_bins,
+    session_timestamp,
+)
 
 API_HOST = "api.massive.com"
-EASTERN = ZoneInfo("America/New_York")
 TICKER = re.compile(r"[A-Z0-9.-]{1,32}")
 INTERNAL_GAP_SCOPE = "internal-between-observed-bars"
 SESSION_GAP_SCOPE = "all-expected-session-bins"
@@ -201,13 +202,6 @@ def _local(timestamp: int) -> datetime:
     ).astimezone(EASTERN)
 
 
-def _grid_timestamp(day: date, minute: int) -> str:
-    local = datetime(
-        day.year, day.month, day.day, tzinfo=EASTERN,
-    ) + timedelta(minutes=minute)
-    return _timestamp(int(local.timestamp() * 1000))
-
-
 def scan_regular_bars(
     bars: Sequence[Bar], minutes: int,
     calendar: SessionCalendar | None = None,
@@ -260,62 +254,53 @@ def session_grid_audit(
     end: date,
 ) -> dict[str, object]:
     """Compare observed starts with every expected exchange-session start."""
-    if type(minutes) is not int or not 1 <= minutes <= 59 or start > end or \
-       start < calendar.start or end > calendar.end:
-        raise ValueError("invalid session-grid bounds")
+    expected: dict[date, list[int]] = {}
+    by_timestamp = {}
+    for item in session_bins(calendar, start, end, minutes):
+        expected.setdefault(item.session, []).append(item.minute)
+        by_timestamp[item.timestamp] = item
     observed: dict[date, set[int]] = {}
     for bar in bars:
-        local = _local(bar[0])
-        day = local.date()
-        bounds = calendar.session(day) if start <= day <= end else None
-        minute = local.hour * 60 + local.minute
-        if bounds is None or local.second or local.microsecond or \
-           not bounds[0] <= minute or minute + minutes > bounds[1] or \
-           (minute - bounds[0]) % minutes:
+        item = by_timestamp.get(_timestamp(bar[0])) if not bar[0] % 60_000 \
+            else None
+        if item is None:
             raise ValueError("observed bar is outside the requested session grid")
-        starts = observed.setdefault(day, set())
-        if minute in starts:
+        starts = observed.setdefault(item.session, set())
+        if item.minute in starts:
             raise ValueError("observed session-grid starts are not unique")
-        starts.add(minute)
+        starts.add(item.minute)
 
     expected_sessions = affected_sessions = expected_bins = missing_bins = 0
     missing_sessions: list[str] = []
     ranges: list[dict[str, str | int]] = []
-    day = start
-    while day <= end:
-        bounds = calendar.session(day)
-        if bounds is not None:
-            expected = range(bounds[0], bounds[1] - minutes + 1, minutes)
-            if not expected:
-                day += timedelta(days=1)
+    for day, starts in expected.items():
+        expected_sessions += 1
+        missing = [
+            minute for minute in starts
+            if minute not in observed.get(day, ())
+        ]
+        expected_bins += len(starts)
+        if not missing:
+            continue
+        affected_sessions += 1
+        missing_bins += len(missing)
+        if day not in observed:
+            missing_sessions.append(str(day))
+        first = previous = missing[0]
+        for minute in (*missing[1:], None):
+            if minute is not None and minute == previous + minutes:
+                previous = minute
                 continue
-            expected_sessions += 1
-            missing = [
-                minute for minute in expected
-                if minute not in observed.get(day, ())
-            ]
-            expected_bins += len(expected)
-            if missing:
-                affected_sessions += 1
-                missing_bins += len(missing)
-                if day not in observed:
-                    missing_sessions.append(str(day))
-                first = previous = missing[0]
-                for minute in (*missing[1:], None):
-                    if minute is not None and minute == previous + minutes:
-                        previous = minute
-                        continue
-                    ranges.append({
-                        "session": str(day),
-                        "start_timestamp": _grid_timestamp(day, first),
-                        "end_timestamp": _grid_timestamp(
-                            day, previous + minutes,
-                        ),
-                        "absent_bins": (previous - first) // minutes + 1,
-                    })
-                    if minute is not None:
-                        first = previous = minute
-        day += timedelta(days=1)
+            ranges.append({
+                "session": str(day),
+                "start_timestamp": session_timestamp(day, first),
+                "end_timestamp": session_timestamp(
+                    day, previous + minutes,
+                ),
+                "absent_bins": (previous - first) // minutes + 1,
+            })
+            if minute is not None:
+                first = previous = minute
     return {
         "scope": SESSION_GAP_SCOPE,
         "expected_sessions": expected_sessions,
