@@ -21,8 +21,8 @@ GitButler.
 
 ## Constraints
 
-- Modify only `tools/select_universe.py`, `tools/fetch_universe.py`, and
-  `tests/python/test_massive.py`.
+- Modify only `tools/files.py`, `tools/select_universe.py`,
+  `tools/fetch_universe.py`, and `tests/python/test_massive.py`.
 - Preserve unrelated `Makefile` and `docs/training.md` changes.
 - Keep generated outputs, credentials, datasets, and models ignored and
   uncommitted.
@@ -35,11 +35,17 @@ GitButler.
   the final report. An empty daily archive whose date appears there is a
   raw-nonempty response filtered to zero rows; one absent from that list is a
   truly empty provider response.
+- Archive well-formed provider ticker text exactly, but admit only canonical
+  runtime tickers into references and formation rows. Do not normalize or
+  alias unsupported symbols: Massive currently returns the mixed-case
+  `ECGw` record from a dated `type=CS` query.
 - Publish only into a path that did not exist when the command started. A
-  failure before completion may leave an ignored partial directory, but never
-  `selection.json`; retry with a new directory. The package is committed only
-  after the marker is exact, all private temporary files are gone, exact
-  membership is restored, and the root directory is synced.
+  failure before completion may leave an ignored partial directory; retry with
+  a new directory. Normal rollback removes `selection.json`, while definitive
+  rollback I/O failure preserves it as explicitly reported ambiguous evidence.
+  The package is committed only after the marker is exact, all private
+  temporary files are gone, exact membership is restored, and the root
+  directory is synced.
 - Create one reviewed, signed, local checkpoint:
   `feat(data): emit nested universe manifests`. Do not push or land it.
 
@@ -348,22 +354,54 @@ gets one logical gate.
   - require `selection.json` absent;
   - rehash every source and manifest;
   - reassert every cohort prefix and semantic hash.
-- [ ] Publish `selection.json` through the pinned root descriptor. If
-  `write_json_exclusive()` raises after linking because its private temporary
-  unlink failed, identify only the exact `.selection.json.<32 hex>.tmp`
-  residue through the pinned descriptor and retry that unlink. Do not accept
-  any other extra entry.
-- [ ] After the link, require exact marker bytes, no temporary residue, exact
-  root/child membership, and all previously recorded identities and hashes.
-  Then `fsync()` the root. This successful sync is the commit point.
-- [ ] On any post-link validation, cleanup, or sync failure, unlink the marker
-  through the pinned root descriptor, sync that removal, and raise. Tests must
-  exercise this cleanup path. Return the report only after the full commit
-  point succeeds.
+- [ ] Publish `selection.json` through the pinned root descriptor with an
+  atomic no-replace rename that consumes the private temporary name. Reconcile
+  an ambiguous syscall error from the writer-bound inode: accept only an
+  absent source plus the exact destination inode with link count one. Preserve
+  the temporary on every definite failure.
+- [ ] After the rename, require exact marker bytes, no temporary residue,
+  exact root/child membership, and all previously recorded identities and
+  hashes. Then `fsync()` the root. This successful sync is the commit point.
+- [ ] On any post-link validation, cleanup, or sync failure, quarantine the
+  marker through the pinned root descriptor, sync that rename, and raise.
+  Tests must exercise this cleanup path. Return the report only after the full
+  commit point succeeds.
 - [ ] Close all descriptors in `finally`.
 
 Never recursively clean a failed package. This preserves failure evidence and
 avoids deleting an unrelated path if a parent was substituted.
+
+### Completion-marker integrity addendum
+
+Adversarial review expands this task to `tools/files.py` only for the shared
+exclusive writer; `tools/fetch_universe.py` remains unchanged by this addendum.
+The writer must bind its private name to the `(st_dev, st_ino)` captured from
+the descriptor it created, expose that binding to the selector, and recheck it
+before publication. The selector must not infer ownership by scanning the
+directory in `before_link`.
+
+Successful publication uses Darwin `renameatx_np(RENAME_EXCL)` or Linux
+`renameat2(RENAME_NOREPLACE)` and fails closed when neither primitive is
+available. It never falls back to an overwrite-capable rename or to
+link-then-unlink. A definite failure retains the private temporary as evidence;
+an ambiguous error succeeds only when the source is absent and the destination
+is the writer-bound regular inode with link count one.
+
+Public rollback uses the same no-replace primitive to move `selection.json`
+into a fresh, pinned quarantine directory before inspecting it. An owned
+marker remains quarantined in a failed package; a foreign marker is restored
+with another no-replace rename and never unlinked. Normal rollback removes the
+publisher-owned public completion name. If both rollback attempts fail without
+moving it, the command raises `universe marker rollback failed` and preserves
+all evidence, including the public marker; no filesystem protocol can promise
+namespace reversal after definitive I/O failure. A failed or interrupted
+command therefore never makes marker existence sufficient: consumers also
+require full package validation and a successful producing command.
+
+Add RED cases that replace the writer's private name before `before_link` and
+replace the public marker immediately before rollback. GREEN requires both
+foreign inodes and their bytes to survive, no foreign entry to be accepted as
+the completion marker, and every existing publication test to remain green.
 
 ### Offline integration tests
 
@@ -385,12 +423,14 @@ source closure, source archive, manifest, output file identity, directory
 identity, or undeclared permanent membership. Every case must fail without a
 `selection.json`.
 
-Also simulate an exception after the marker hard link and a root-sync failure.
-A post-link private-temp cleanup error succeeds only if the exact private
-residue can be removed and the complete commit point passes. A residue-cleanup,
-sync, or validation failure uses the pinned-marker cleanup path and leaves no
-marker. Also simulate parent-sync failure after root creation and require a
-markerless partial directory.
+Also simulate an exception after marker publication and a root-sync failure.
+An injected ambiguous rename error succeeds only when the exact writer-bound
+inode committed; a definite rename failure preserves its private temporary and
+leaves no completion marker. Sync or validation failure uses the pinned-marker
+quarantine path. Test both normal removal and definitive double-rollback
+failure, which raises explicitly and preserves the owned marker as ambiguous
+failure evidence. Also simulate parent-sync failure after root creation and
+require a markerless partial directory.
 
 Also reject an existing directory or file, symlinks including broken links,
 lexically normalized aliases, input aliases, and substituted output parents.

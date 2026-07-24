@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, localcontext
 from email.message import Message
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import (
@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -31,11 +32,17 @@ from tools.fetch_universe import (
     SeriesSpec, UniverseManifest, fetch_universe, parse_args as universe_args,
     reference_url,
 )
-from tools.files import file_sha256, write_json
+from tools.files import (
+    ExclusiveTemp, file_sha256, rename_noreplace, write_json,
+    write_json_exclusive,
+)
 from tools.select_universe import (
     Candidate, DailyRow, Reference, SelectionPolicy, SourceArchive,
-    SourceBundle, daily_summary_url, fetch_sources, reference_universe_url,
-    select_candidates,
+    SourceBundle, _candidate_value, _canonical_sha256, _decimal_text,
+    _manifest_value, _member_value, _source_archive_value,
+    _source_binding_value, _transport, daily_summary_url, fetch_sources,
+    main as selection_main, parse_args as selection_args,
+    reference_universe_url, select_candidates, select_universe,
 )
 
 
@@ -430,6 +437,7 @@ def test_universe_sources() -> None:
                     "status": "OK",
                     "results": [
                         source_reference("AAPL"),
+                        source_reference("ECGw"),
                         source_reference("MSFT"),
                     ],
                     "next_url": next_page,
@@ -450,8 +458,8 @@ def test_universe_sources() -> None:
         if day == filtered_day:
             return {
                 "status": "OK",
-                "resultsCount": 1,
-                "results": [{"T": "ZZZZ"}],
+                "resultsCount": 2,
+                "results": [{"T": "ECGw"}, {"T": "ZZZZ"}],
             }
         return {
             "status": "OK",
@@ -471,6 +479,7 @@ def test_universe_sources() -> None:
     assert tuple(item.ticker for item in bundle.references) == (
         "AAPL", "MSFT", "SPY",
     )
+    assert bundle.archives[0].records[1]["ticker"] == "ECGw"
     assert bundle.references[2].share_class_figi is None
     assert len(bundle.sessions) == len(formation_days) - 1
     assert empty_day not in {day for day, _ in bundle.sessions}
@@ -571,6 +580,13 @@ def test_universe_source_rejections() -> None:
         {"status": "OK", "results": {}},
         {"status": "OK", "results": []},
         {"status": "OK", "results": [{}]},
+        *(
+            {
+                "status": "OK",
+                "results": [source_reference(ticker)],
+            }
+            for ticker in ("/", "@@@", "\0")
+        ),
         {
             "status": "OK",
             "results": [source_reference("AAPL") | {"active": 1}],
@@ -629,6 +645,10 @@ def test_universe_source_rejections() -> None:
         {"status": "ERROR", "results": []},
         {"status": "OK", "results": {}},
         {"status": "OK", "results": [{}]},
+        *(
+            {"status": "OK", "results": [{"T": ticker}]}
+            for ticker in ("/", "@@@", "\0")
+        ),
         {
             "status": "OK",
             "results": [source_daily("AAPL"), source_daily("AAPL")],
@@ -680,6 +700,1251 @@ def test_universe_source_rejections() -> None:
         "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks"
         "/2024-10-31?adjusted=false&include_otc=false"
     )
+
+
+def test_universe_values() -> None:
+    policy = SelectionPolicy.read(
+        ROOT / "universes/liquid-common-ladder.example.json",
+    )
+    selected = Candidate(
+        selection_reference("AAPL", "SCAAPL"),
+        60,
+        Decimal("0.9500"),
+        Decimal("5.000"),
+        Decimal("25000000.000"),
+        (),
+        liquidity_rank=0,
+        stratum=1,
+        within_stratum_rank=0,
+        master_rank=0,
+    )
+    assert _candidate_value(selected, "AAPL") == {
+        "ticker": "AAPL",
+        "active": True,
+        "market": "stocks",
+        "locale": "us",
+        "type": "CS",
+        "currency_name": "usd",
+        "primary_exchange": "XNYS",
+        "composite_figi": "BBGAAPL",
+        "share_class_figi": "SCAAPL",
+        "observed": 60,
+        "coverage": "0.95",
+        "median_close_usd": "5",
+        "median_dollar_volume_usd": "25000000",
+        "rejection_reasons": [],
+        "decision": "selected",
+        "share_class_representative": "AAPL",
+        "liquidity_rank": 0,
+        "stratum": 1,
+        "within_stratum_rank": 0,
+        "master_rank": 0,
+    }
+    eligible = replace(selected, master_rank=None)
+    assert _candidate_value(
+        eligible, "AAPL",
+    )["decision"] == "eligible-not-selected"
+    duplicate = replace(
+        selected,
+        reference=selection_reference("AAPL.A", "SCAAPL"),
+        rejection_reasons=("duplicate-share-class-figi",),
+        liquidity_rank=None,
+        stratum=None,
+        within_stratum_rank=None,
+        master_rank=None,
+    )
+    duplicate_value = _candidate_value(duplicate, "AAPL")
+    assert duplicate_value["decision"] == "rejected"
+    assert duplicate_value["share_class_representative"] == "AAPL"
+    rejected = replace(
+        duplicate, rejection_reasons=("inactive",),
+    )
+    assert _candidate_value(
+        rejected, None,
+    )["share_class_representative"] is None
+
+    member = _member_value(selected)
+    second = _member_value(replace(
+        selected,
+        reference=selection_reference("MSFT", "SCMSFT"),
+        liquidity_rank=1,
+        stratum=2,
+        within_stratum_rank=0,
+        master_rank=1,
+    ))
+    assert member == {
+        "ticker": "AAPL",
+        "composite_figi": "BBGAAPL",
+        "share_class_figi": "SCAAPL",
+        "stratum": 1,
+    }
+    members = [member, second]
+    assert [item["ticker"] for item in members[:1]] == ["AAPL"]
+    assert [item["ticker"] for item in members[:2]] == ["AAPL", "MSFT"]
+    manifest = _manifest_value(policy, members)
+    assert manifest == {
+        "schema": 1,
+        "purpose": policy.purpose,
+        "declared_on": "2026-07-24",
+        "eligibility_date": "2024-10-31",
+        "start": "2024-11-01",
+        "end": "2026-07-21",
+        "interval_minutes": 30,
+        "adjusted": True,
+        "session": "regular",
+        "series": [
+            {"stratum": "liquidity-1", "ticker": "AAPL"},
+            {"stratum": "liquidity-2", "ticker": "MSFT"},
+        ],
+    }
+    for size in (1, 2):
+        assert _manifest_value(
+            policy, members[:size],
+        )["series"] == manifest["series"][:size]
+
+    semantic = {"members": members, "size": 2}
+    reordered = {"size": 2, "members": members}
+    expected = hashlib.sha256(
+        (
+            json.dumps(
+                semantic, allow_nan=False, indent=2, sort_keys=True,
+            ) + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _canonical_sha256(semantic) == expected
+    assert _canonical_sha256(reordered) == expected
+    assert _decimal_text(Decimal("-0.000")) == "0"
+    assert _decimal_text(Decimal("1.2300")) == "1.23"
+    assert _decimal_text(Decimal("1E+3")) == "1000"
+    for nonfinite in (
+        math.nan, math.inf, -math.inf, Decimal("NaN"),
+        Decimal("Infinity"), Decimal("-Infinity"),
+    ):
+        raises((TypeError, ValueError), _canonical_sha256, [nonfinite])
+    for nonfinite in (
+        Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ):
+        raises(ValueError, _decimal_text, nonfinite)
+        raises(
+            ValueError, _candidate_value,
+            replace(selected, coverage=nonfinite), "AAPL",
+        )
+
+    request = {"path": "/v3/reference/tickers", "query": {}}
+    reference = SourceArchive(
+        "tickers-0001", request, ({"ticker": "AAPL"},),
+    )
+    provider_empty = SourceArchive(
+        "daily-2024-08-01", {"path": "/daily/2024-08-01", "query": {}}, (),
+    )
+    filtered_empty = SourceArchive(
+        "daily-2024-08-02", {"path": "/daily/2024-08-02", "query": {}}, (),
+    )
+    assert _source_archive_value(reference) == {
+        "schema": 1,
+        "request": request,
+        "records": [{"ticker": "AAPL"}],
+    }
+    sessions = frozenset({"2024-08-02"})
+    assert _source_binding_value(
+        reference, sessions, "a" * 64,
+    ) == {
+        "name": "tickers-0001",
+        "path": "sources/tickers-0001.json",
+        "sha256": "a" * 64,
+        "records": 1,
+        "formation_session": None,
+    }
+    assert _source_binding_value(
+        provider_empty, sessions, "b" * 64,
+    )["formation_session"] is False
+    filtered_binding = _source_binding_value(
+        filtered_empty, sessions, "c" * 64,
+    )
+    assert set(filtered_binding) == {
+        "name", "path", "sha256", "records", "formation_session",
+    }
+    assert filtered_binding["records"] == 0
+    assert filtered_binding["formation_session"] is True
+
+
+def test_exclusive_writer(directory: Path) -> None:
+    rename_dir = directory / "exclusive-rename"
+    rename_dir.mkdir()
+    source = rename_dir / "source"
+    target = rename_dir / "target"
+    source.write_text("source\n", encoding="ascii")
+    descriptor = os.open(rename_dir, os.O_RDONLY)
+    try:
+        rename_noreplace(descriptor, source.name, descriptor, target.name)
+        assert not source.exists() and target.read_text(
+            encoding="ascii",
+        ) == "source\n"
+        source.write_text("second\n", encoding="ascii")
+        raises(
+            FileExistsError,
+            rename_noreplace,
+            descriptor,
+            source.name,
+            descriptor,
+            target.name,
+        )
+    finally:
+        os.close(descriptor)
+    assert source.read_text(encoding="ascii") == "second\n"
+    assert target.read_text(encoding="ascii") == "source\n"
+
+    open_failure = directory / "exclusive-open-failure"
+    opened: list[int] = []
+    real_open = os.open
+
+    def fail_private_open(
+        path: object, *args: object, **kwargs: object,
+    ) -> int:
+        if kwargs.get("dir_fd") is not None:
+            raise OSError("private open failed")
+        descriptor = real_open(path, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    with patch(
+        "tools.files.os.open", side_effect=fail_private_open,
+    ):
+        raises(
+            OSError, write_json_exclusive, open_failure / "value.json",
+            {"value": 1},
+        )
+    assert len(opened) == 1
+    raises(OSError, os.fstat, opened[0])
+
+    stat_failure = directory / "exclusive-stat-failure"
+    opened.clear()
+
+    def record_open(
+        path: object, *args: object, **kwargs: object,
+    ) -> int:
+        descriptor = real_open(path, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    with patch(
+        "tools.files.os.open", side_effect=record_open,
+    ), patch("tools.files.os.fstat", side_effect=OSError("stat failed")):
+        raises(
+            OSError, write_json_exclusive, stat_failure / "value.json",
+            {"value": 1},
+        )
+    assert len(opened) == 2
+    for descriptor in opened:
+        raises(OSError, os.fstat, descriptor)
+    assert len(list(stat_failure.glob(".value.json.*.tmp"))) == 1
+
+    close_failure = directory / "exclusive-close-failure"
+    opened.clear()
+    real_close = os.close
+    failed_close = False
+
+    def fail_private_close(descriptor: int) -> None:
+        nonlocal failed_close
+        if len(opened) == 2 and descriptor == opened[1] and \
+           not failed_close:
+            failed_close = True
+            raise OSError("private close failed")
+        real_close(descriptor)
+
+    with patch(
+        "tools.files.os.open", side_effect=record_open,
+    ), patch("tools.files.os.close", side_effect=fail_private_close):
+        raises(
+            OSError, write_json_exclusive, close_failure / "value.json",
+            {"value": 1},
+        )
+    assert failed_close and len(opened) == 2
+    raises(OSError, os.fstat, opened[0])
+    os.fstat(opened[1])
+    real_close(opened[1])
+
+
+def publication_policy(path: Path) -> bytes:
+    value = selection_policy_value() | {
+        "formation_start": "2024-10-31",
+        "minimum_coverage": "1",
+        "minimum_formation_sessions": 1,
+        "minimum_median_close_usd": "1",
+        "minimum_median_dollar_volume_usd": "1",
+    }
+    write_selection_policy(path, value)
+    return path.read_bytes()
+
+
+def publication_requester(
+    requested: list[str] | None = None,
+) -> object:
+    references = [source_reference(f"S{index:03d}") for index in range(60)]
+    daily = [source_daily(f"S{index:03d}", index + 10) for index in range(60)]
+
+    def request(url: str) -> dict[str, object]:
+        if requested is not None:
+            requested.append(url)
+        results = (
+            references
+            if urlsplit(url).path == "/v3/reference/tickers"
+            else daily
+        )
+        return {
+            "status": "OK",
+            "results": results,
+            "resultsCount": len(results),
+        }
+
+    return request
+
+
+def test_selection_transport() -> None:
+    starts: list[str] = []
+
+    def gate_factory(rate: int) -> object:
+        assert rate == 5
+        return lambda: starts.append("gate")
+
+    def retried(
+        _url: str, *, before_request: object | None = None,
+    ) -> dict[str, object]:
+        assert before_request is not None
+        before_request()  # type: ignore[operator]
+        before_request()  # type: ignore[operator]
+        return {}
+
+    with patch(
+        "tools.select_universe.request_gate", side_effect=gate_factory,
+    ), patch("tools.select_universe.request_json", side_effect=retried):
+        requester, before_request = _transport(None, 5)
+        before_request()
+        assert requester("https://api.massive.com") == {}
+    assert starts == ["gate", "gate"]
+
+    starts.clear()
+    injected = lambda _url: {}
+    with patch(
+        "tools.select_universe.request_gate", side_effect=gate_factory,
+    ):
+        requester, before_request = _transport(injected, 5)
+        before_request()
+        assert requester("https://api.massive.com") == {}
+    assert requester is injected and starts == ["gate"]
+    raises(ValueError, _transport, None, -1)
+
+
+def test_select_universe_publication(directory: Path) -> None:
+    policy_path = directory / "publish-policy.json"
+    policy_bytes = publication_policy(policy_path)
+    output = directory / "published-selection"
+    requested: list[str] = []
+    writes: list[str] = []
+
+    def recorded_write(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        write_json_exclusive(
+            path, value, directory_fd,
+            before_link,  # type: ignore[arg-type]
+            before_link_with_temp=before_link_with_temp,  # type: ignore[arg-type]
+        )
+        writes.append(path.name)
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=recorded_write,
+    ):
+        report = select_universe(
+            policy_path, output, key="fake-secret",
+            requester=publication_requester(requested),
+        )
+
+    marker = output / "selection.json"
+    assert json.loads(marker.read_bytes()) == report
+    assert marker.read_bytes() == (
+        json.dumps(
+            report, allow_nan=False, indent=2, sort_keys=True,
+        ).encode() + b"\n"
+    )
+    assert writes[-1] == "selection.json"
+    assert set(report) == {
+        "schema", "purpose", "declared_on", "anchor_date",
+        "formation_start", "formation_end", "start", "end",
+        "primary_cohort_size", "policy", "source_closure", "sources",
+        "formation_sessions", "candidates", "master", "master_sha256",
+        "cohorts",
+    }
+    assert report["policy"] == {
+        "path": policy_path.resolve().as_posix(),
+        "sha256": hashlib.sha256(policy_bytes).hexdigest(),
+    }
+    assert report["source_closure"] == [
+        {
+            "path": name,
+            "sha256": file_sha256(ROOT / name),
+        }
+        for name in (
+            "tools/select_universe.py",
+            "tools/fetch_massive.py",
+            "tools/files.py",
+        )
+    ]
+    assert report["formation_sessions"] == ["2024-10-31"]
+    assert set(path.name for path in output.iterdir()) == {
+        "sources", "manifests", "selection.json",
+    }
+
+    source_values = report["sources"]
+    assert isinstance(source_values, list)
+    assert [item["name"] for item in source_values] == [
+        "tickers-0001", "daily-2024-10-31",
+    ]
+    assert [item["formation_session"] for item in source_values] == [
+        None, True,
+    ]
+    assert {
+        item["path"] for item in source_values
+    } == {
+        "sources/tickers-0001.json",
+        "sources/daily-2024-10-31.json",
+    }
+    for item in source_values:
+        path = output / item["path"]
+        value = json.loads(path.read_bytes())
+        assert set(value) == {"schema", "request", "records"}
+        assert item["records"] == len(value["records"])
+        assert item["sha256"] == file_sha256(path)
+
+    master = report["master"]
+    candidates = report["candidates"]
+    assert isinstance(master, list) and len(master) == 55
+    assert isinstance(candidates, list) and len(candidates) == 60
+    assert all(set(member) == {
+        "ticker", "composite_figi", "share_class_figi", "stratum",
+    } for member in master)
+    assert all(set(candidate) == {
+        "ticker", "active", "market", "locale", "type", "currency_name",
+        "primary_exchange", "composite_figi", "share_class_figi",
+        "observed", "coverage", "median_close_usd",
+        "median_dollar_volume_usd", "rejection_reasons", "decision",
+        "share_class_representative", "liquidity_rank", "stratum",
+        "within_stratum_rank", "master_rank",
+    } for candidate in candidates)
+    assert sum(
+        candidate["decision"] == "selected" for candidate in candidates
+    ) == 55
+    assert sum(
+        candidate["decision"] == "eligible-not-selected"
+        for candidate in candidates
+    ) == 5
+    assert report["master_sha256"] == _canonical_sha256(master)
+
+    cohorts = report["cohorts"]
+    assert isinstance(cohorts, dict)
+    assert tuple(cohorts) == ("11", "22", "33", "55")
+    for size_text, cohort in cohorts.items():
+        size = int(size_text)
+        members = cohort["members"]
+        manifest_path = output / cohort["manifest"]
+        assert set(cohort) == {
+            "size", "primary", "members", "members_sha256", "manifest",
+            "manifest_sha256",
+        }
+        assert cohort["size"] == size
+        assert cohort["primary"] is (size == 55)
+        assert members == master[:size]
+        assert cohort["members_sha256"] == _canonical_sha256(members)
+        assert cohort["manifest"] == (
+            f"manifests/liquid-common-{size}.json"
+        )
+        assert cohort["manifest_sha256"] == file_sha256(manifest_path)
+        parsed = UniverseManifest.read(manifest_path)
+        assert parsed.eligibility_date == date(2024, 10, 31)
+        assert parsed.start == date(2024, 11, 1)
+        assert [item.ticker for item in parsed.series] == [
+            item["ticker"] for item in members
+        ]
+
+    assert len(requested) == 2
+    for url in requested:
+        assert parse_qs(urlsplit(url).query)["apiKey"] == ["fake-secret"]
+    for path in output.rglob("*"):
+        if path.is_file():
+            rendered = path.read_text(encoding="utf-8")
+            assert all(value not in rendered for value in (
+                "apiKey", "fake-secret", "NaN", "Infinity",
+            ))
+
+
+def mutate_final_write(
+    action: object,
+) -> object:
+    def write(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        callback = before_link_with_temp
+        if path.name == "selection.json":
+            assert callback is not None
+            original = callback
+
+            def changed(binding: ExclusiveTemp) -> None:
+                action()  # type: ignore[operator]
+                original(binding)  # type: ignore[operator]
+
+            callback = changed
+        write_json_exclusive(
+            path, value, directory_fd, before_link,  # type: ignore[arg-type]
+            before_link_with_temp=callback,  # type: ignore[arg-type]
+        )
+
+    return write
+
+
+def test_selection_publication_mutations(directory: Path) -> None:
+    actions = (
+        (
+            "policy",
+            lambda policy, _output: policy.write_text(
+                '{"mutated":true}\n', encoding="ascii",
+            ),
+        ),
+        (
+            "source",
+            lambda _policy, output: (
+                output / "sources/tickers-0001.json"
+            ).write_text('{"mutated":true}\n', encoding="ascii"),
+        ),
+        (
+            "manifest",
+            lambda _policy, output: (
+                output / "manifests/liquid-common-11.json"
+            ).write_text('{"mutated":true}\n', encoding="ascii"),
+        ),
+        (
+            "identity",
+            lambda _policy, output: replace_file(
+                output / "sources/tickers-0001.json",
+            ),
+        ),
+        (
+            "directory",
+            lambda _policy, output: replace_directory(
+                output, "sources",
+            ),
+        ),
+        (
+            "membership",
+            lambda _policy, output: (
+                output / "undeclared"
+            ).write_text("extra\n", encoding="ascii"),
+        ),
+    )
+    for name, action in actions:
+        policy = directory / f"selection-{name}-mutation-policy.json"
+        output = directory / f"selection-{name}-mutation-output"
+        publication_policy(policy)
+        with patch(
+            "tools.select_universe.write_json_exclusive",
+            side_effect=mutate_final_write(
+                lambda item=action: item(policy, output),
+            ),
+        ):
+            raises(
+                (OSError, ValueError), select_universe,
+                policy, output, key="fake-secret",
+                requester=publication_requester(),
+            )
+        assert output.is_dir()
+        assert not os.path.lexists(output / "selection.json")
+
+    closure_root = directory / "mutable-closure"
+    closure_tools = closure_root / "tools"
+    closure_tools.mkdir(parents=True)
+    sources = tuple(
+        closure_tools / name
+        for name in ("select_universe.py", "fetch_massive.py", "files.py")
+    )
+    for path in sources:
+        path.write_text(f"# {path.name}\n", encoding="ascii")
+    policy = directory / "closure-mutation-policy.json"
+    output = directory / "closure-mutation-output"
+    publication_policy(policy)
+    with patch("tools.select_universe.ROOT", closure_root), \
+         patch("tools.select_universe.SOURCE_PATHS", sources), \
+         patch(
+             "tools.select_universe.write_json_exclusive",
+             side_effect=mutate_final_write(
+                 lambda: sources[1].write_text(
+                     "# changed\n", encoding="ascii",
+                 ),
+             ),
+         ):
+        raises(
+            (OSError, ValueError), select_universe,
+            policy, output, key="fake-secret",
+            requester=publication_requester(),
+        )
+    assert output.is_dir()
+    assert not os.path.lexists(output / "selection.json")
+
+
+def replace_file(path: Path) -> None:
+    contents = path.read_bytes()
+    path.unlink()
+    path.write_bytes(contents)
+
+
+def replace_directory(root: Path, name: str) -> None:
+    original = root / name
+    original.rename(root / f"{name}-replaced")
+    original.mkdir()
+
+
+def test_selection_target_rejections(directory: Path) -> None:
+    policy = directory / "target-policy.json"
+    publication_policy(policy)
+    reached_calls: list[str] = []
+
+    def reached(url: str) -> object:
+        reached_calls.append(url)
+        raise AssertionError("request reached for invalid output")
+
+    existing_file = directory / "existing-selection-file"
+    existing_file.write_text("occupied\n", encoding="ascii")
+    existing_directory = directory / "existing-selection-directory"
+    existing_directory.mkdir()
+    target = directory / "selection-target"
+    target.mkdir()
+    valid_link = directory / "selection-link"
+    valid_link.symlink_to(target, target_is_directory=True)
+    broken_link = directory / "selection-broken-link"
+    broken_link.symlink_to(directory / "missing-selection-target")
+    normalized = directory / "normalized-selection"
+    normalized.mkdir()
+    parent_target = directory / "parent-target"
+    parent_target.mkdir()
+    parent_link = directory / "parent-link"
+    parent_link.symlink_to(parent_target, target_is_directory=True)
+    rejected = (
+        existing_file,
+        existing_directory,
+        valid_link,
+        broken_link,
+        directory / "missing-parent" / ".." / normalized.name,
+        policy,
+        parent_link / "child",
+        directory / "absent-parent" / "child",
+    )
+    for output in rejected:
+        before = len(reached_calls)
+        raises(
+            (OSError, ValueError), select_universe,
+            policy, output, key="fake-secret", requester=reached,
+        )
+        assert len(reached_calls) == before
+
+    linked_policy = directory / "linked-target-policy.json"
+    linked_policy.symlink_to(policy)
+    before = len(reached_calls)
+    raises(
+        ValueError, select_universe,
+        linked_policy, directory / "linked-policy-output",
+        key="fake-secret", requester=reached,
+    )
+    aliased_policy = directory / "aliased-target-policy.json"
+    os.link(ROOT / "tools/files.py", aliased_policy)
+    raises(
+        ValueError, select_universe,
+        aliased_policy, directory / "aliased-policy-output",
+        key="fake-secret", requester=reached,
+    )
+    assert len(reached_calls) == before
+
+    network_output = directory / "network-failure-output"
+    raises(
+        ValueError, select_universe, policy, network_output,
+        key="fake-secret",
+        requester=lambda _url: (_ for _ in ()).throw(OSError("offline")),
+    )
+    assert not os.path.lexists(network_output)
+
+    selection_output = directory / "selection-failure-output"
+
+    def too_small(url: str) -> dict[str, object]:
+        result = (
+            [source_reference("AAPL")]
+            if urlsplit(url).path == "/v3/reference/tickers"
+            else [source_daily("AAPL")]
+        )
+        return {
+            "status": "OK", "results": result, "resultsCount": 1,
+        }
+
+    raises(
+        ValueError, select_universe, policy, selection_output,
+        key="fake-secret", requester=too_small,
+    )
+    assert not os.path.lexists(selection_output)
+
+    original_parent = directory / "substituted-parent"
+    original_parent.mkdir()
+    renamed_parent = directory / "substituted-parent-original"
+    output = original_parent / "selection"
+    changed = False
+    requester = publication_requester()
+
+    def substitute(url: str) -> object:
+        nonlocal changed
+        if not changed:
+            original_parent.rename(renamed_parent)
+            original_parent.mkdir()
+            changed = True
+        return requester(url)  # type: ignore[operator]
+
+    raises(
+        (OSError, ValueError), select_universe,
+        policy, output, key="fake-secret", requester=substitute,
+    )
+    assert changed
+    assert not os.path.lexists(output)
+    assert not os.path.lexists(renamed_parent / output.name)
+
+
+def test_selection_commit_failures(directory: Path) -> None:
+    policy = directory / "commit-policy.json"
+    publication_policy(policy)
+
+    parent_failure = directory / "parent-sync-output"
+    parent_identity = os.stat(directory)
+    real_fsync = os.fsync
+    real_rename = rename_noreplace
+
+    def fail_parent_sync(descriptor: int) -> None:
+        identity = os.fstat(descriptor)
+        if (identity.st_dev, identity.st_ino) == (
+            parent_identity.st_dev, parent_identity.st_ino,
+        ):
+            raise OSError("parent sync failed")
+        real_fsync(descriptor)
+
+    with patch("tools.select_universe.os.fsync", side_effect=fail_parent_sync):
+        raises(
+            OSError, select_universe, policy, parent_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert parent_failure.is_dir()
+    assert not os.path.lexists(parent_failure / "selection.json")
+
+    linked_failure = directory / "after-link-output"
+
+    def fail_after_link(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        write_json_exclusive(
+            path, value, directory_fd,
+            before_link,  # type: ignore[arg-type]
+            before_link_with_temp=before_link_with_temp,  # type: ignore[arg-type]
+        )
+        if path.name == "selection.json":
+            raise OSError("after link")
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=fail_after_link,
+    ):
+        raises(
+            OSError, select_universe, policy, linked_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert not os.path.lexists(linked_failure / "selection.json")
+
+    rollback_unavailable = directory / "rollback-unavailable-output"
+
+    def fail_rollback(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        if source == target == "selection.json" and \
+           source_fd != target_fd:
+            raise OSError("rollback unavailable")
+        real_rename(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=fail_after_link,
+    ), patch(
+        "tools.select_universe.rename_noreplace",
+        side_effect=fail_rollback,
+    ):
+        error = raises(
+            OSError, select_universe, policy, rollback_unavailable,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert str(error) == "universe marker rollback failed"
+    assert error.__cause__ is not None
+    assert str(error.__cause__) == "rollback unavailable"
+    assert error.__cause__.__context__ is not None
+    assert str(error.__cause__.__context__) == "after link"
+    assert json.loads(
+        (rollback_unavailable / "selection.json").read_bytes(),
+    )["schema"] == 1
+    assert len(list(rollback_unavailable.glob(
+        ".selection-rollback.*",
+    ))) == 2
+
+    foreign_failure = directory / "foreign-marker-output"
+    foreign_marker = foreign_failure / "selection.json"
+    foreign_bytes = b'{"owner":"foreign"}\n'
+    foreign_identity: tuple[int, int] | None = None
+
+    def inject_foreign_marker(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        callback = before_link_with_temp
+        if path.name == "selection.json":
+            assert callback is not None
+            original = callback
+
+            def occupy_marker(binding: ExclusiveTemp) -> None:
+                nonlocal foreign_identity
+                original(binding)  # type: ignore[operator]
+                foreign_marker.write_bytes(foreign_bytes)
+                identity = foreign_marker.stat()
+                foreign_identity = identity.st_dev, identity.st_ino
+
+            callback = occupy_marker
+        write_json_exclusive(
+            path, value, directory_fd, before_link,  # type: ignore[arg-type]
+            before_link_with_temp=callback,  # type: ignore[arg-type]
+        )
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=inject_foreign_marker,
+    ):
+        raises(
+            OSError, select_universe, policy, foreign_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    identity = foreign_marker.stat()
+    assert foreign_marker.read_bytes() == foreign_bytes
+    assert (identity.st_dev, identity.st_ino) == foreign_identity
+
+    pre_callback_failure = directory / "pre-callback-temp-output"
+    pre_callback_bytes = b"foreign pre-callback marker\n"
+    pre_callback_name: str | None = None
+    pre_callback_identity: tuple[int, int] | None = None
+    real_unlink = os.unlink
+
+    def replace_before_callback(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        callback = before_link_with_temp
+        if path.name == "selection.json":
+            assert callback is not None and directory_fd is not None
+            original = callback
+
+            def replace(binding: ExclusiveTemp) -> None:
+                nonlocal pre_callback_name, pre_callback_identity
+                names = [
+                    name for name in os.listdir(directory_fd)
+                    if name.startswith(".selection.json.")
+                ]
+                assert len(names) == 1
+                pre_callback_name = names[0]
+                real_unlink(pre_callback_name, dir_fd=directory_fd)
+                descriptor = os.open(
+                    pre_callback_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.write(descriptor, pre_callback_bytes)
+                    metadata = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                pre_callback_identity = metadata.st_dev, metadata.st_ino
+                original(binding)  # type: ignore[operator]
+
+            callback = replace
+        write_json_exclusive(
+            path, value, directory_fd, before_link,  # type: ignore[arg-type]
+            before_link_with_temp=callback,  # type: ignore[arg-type]
+        )
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=replace_before_callback,
+    ):
+        raises(
+            (OSError, ValueError), select_universe, policy,
+            pre_callback_failure, key="fake-secret",
+            requester=publication_requester(),
+        )
+    assert pre_callback_name is not None
+    pre_callback_marker = pre_callback_failure / pre_callback_name
+    metadata = pre_callback_marker.stat()
+    assert pre_callback_marker.read_bytes() == pre_callback_bytes
+    assert (metadata.st_dev, metadata.st_ino) == pre_callback_identity
+    assert not os.path.lexists(pre_callback_failure / "selection.json")
+
+    rollback_failure = directory / "rollback-race-output"
+    rollback_bytes = b'{"owner":"rollback-race"}\n'
+    rollback_identity: tuple[int, int] | None = None
+    raced = False
+
+    def replace_during_rollback(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        nonlocal raced, rollback_identity
+        if source == target == "selection.json" and not raced and \
+           source_fd != target_fd:
+            raced = True
+            real_unlink(source, dir_fd=source_fd)
+            descriptor = os.open(
+                source, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600, dir_fd=source_fd,
+            )
+            try:
+                os.write(descriptor, rollback_bytes)
+                metadata = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            rollback_identity = metadata.st_dev, metadata.st_ino
+        real_rename(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=fail_after_link,
+    ), patch(
+        "tools.select_universe.rename_noreplace",
+        side_effect=replace_during_rollback,
+    ):
+        raises(
+            OSError, select_universe, policy, rollback_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    rollback_marker = rollback_failure / "selection.json"
+    metadata = rollback_marker.stat()
+    assert raced and rollback_marker.read_bytes() == rollback_bytes
+    assert (metadata.st_dev, metadata.st_ino) == rollback_identity
+
+    foreign_private_failure = directory / "foreign-private-output"
+    foreign_private_bytes = b"foreign private marker\n"
+    foreign_private_name: str | None = None
+    foreign_private_identity: tuple[int, int] | None = None
+
+    def replace_at_commit(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        nonlocal foreign_private_name, foreign_private_identity
+        if target == "selection.json" and foreign_private_name is None:
+            real_unlink(source, dir_fd=source_fd)
+            descriptor = os.open(
+                source, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600, dir_fd=source_fd,
+            )
+            try:
+                os.write(descriptor, foreign_private_bytes)
+                identity = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            foreign_private_name = source
+            foreign_private_identity = identity.st_dev, identity.st_ino
+        real_rename(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.files.rename_noreplace",
+        side_effect=replace_at_commit,
+    ):
+        raises(
+            OSError, select_universe, policy, foreign_private_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert foreign_private_name is not None
+    foreign_private = foreign_private_failure / "selection.json"
+    identity = foreign_private.stat()
+    assert foreign_private.read_bytes() == foreign_private_bytes
+    assert (identity.st_dev, identity.st_ino) == foreign_private_identity
+
+    interrupted_failure = directory / "interrupted-output"
+
+    def interrupt_after_link(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        write_json_exclusive(
+            path, value, directory_fd,
+            before_link,  # type: ignore[arg-type]
+            before_link_with_temp=before_link_with_temp,  # type: ignore[arg-type]
+        )
+        if path.name == "selection.json":
+            raise KeyboardInterrupt
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=interrupt_after_link,
+    ):
+        raises(
+            KeyboardInterrupt, select_universe, policy,
+            interrupted_failure, key="fake-secret",
+            requester=publication_requester(),
+        )
+    assert not os.path.lexists(
+        interrupted_failure / "selection.json"
+    )
+
+    ambiguous_success = directory / "ambiguous-success-output"
+
+    def commit_then_report_error(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        real_rename(source_fd, source, target_fd, target)
+        if target == "selection.json":
+            raise OSError("ambiguous commit result")
+
+    with patch(
+        "tools.files.rename_noreplace",
+        side_effect=commit_then_report_error,
+    ):
+        report = select_universe(
+            policy, ambiguous_success, key="fake-secret",
+            requester=publication_requester(),
+        )
+    assert json.loads(
+        (ambiguous_success / "selection.json").read_bytes(),
+    ) == report
+    assert not any(
+        path.name.startswith(".selection.json.")
+        for path in ambiguous_success.iterdir()
+    )
+
+    commit_failure = directory / "commit-failure-output"
+
+    def fail_commit(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        if target == "selection.json":
+            raise OSError("commit failed")
+        real_rename(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.files.rename_noreplace",
+        side_effect=fail_commit,
+    ):
+        raises(
+            OSError, select_universe, policy, commit_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert not os.path.lexists(commit_failure / "selection.json")
+    temporary = [
+        path for path in commit_failure.iterdir()
+        if path.name.startswith(".selection.json.")
+    ]
+    assert len(temporary) == 1
+    assert json.loads(temporary[0].read_bytes())["schema"] == 1
+
+    collision_failure = directory / "rollback-target-collision-output"
+    collision_bytes = b"unrelated rollback entry\n"
+    collision_identity: tuple[int, int] | None = None
+
+    def occupy_rollback_target(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        nonlocal collision_identity
+        if source == target == "selection.json" and \
+           source_fd != target_fd and collision_identity is None:
+            descriptor = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600, dir_fd=target_fd,
+            )
+            try:
+                os.write(descriptor, collision_bytes)
+                metadata = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            collision_identity = metadata.st_dev, metadata.st_ino
+        real_rename(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.files.rename_noreplace",
+        side_effect=fail_commit,
+    ), patch(
+        "tools.select_universe.rename_noreplace",
+        side_effect=occupy_rollback_target,
+    ):
+        raises(
+            OSError, select_universe, policy, collision_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert collision_identity is not None
+    assert not os.path.lexists(collision_failure / "selection.json")
+    collision = list(
+        collision_failure.glob(
+            ".selection-rollback.*/selection.json",
+        )
+    )
+    assert len(collision) == 1
+    metadata = collision[0].stat()
+    assert collision[0].read_bytes() == collision_bytes
+    assert (metadata.st_dev, metadata.st_ino) == collision_identity
+
+    sync_failure = directory / "root-sync-output"
+
+    def fail_commit_sync(descriptor: int) -> None:
+        marker = sync_failure / "selection.json"
+        identity = os.fstat(descriptor)
+        if marker.exists():
+            root = os.stat(sync_failure)
+            if (identity.st_dev, identity.st_ino) == (
+                root.st_dev, root.st_ino,
+            ):
+                raise OSError("root commit sync failed")
+        real_fsync(descriptor)
+
+    with patch(
+        "tools.select_universe.os.fsync", side_effect=fail_commit_sync,
+    ):
+        raises(
+            OSError, select_universe, policy, sync_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert not os.path.lexists(sync_failure / "selection.json")
+
+    validation_failure = directory / "post-link-validation-output"
+
+    def mutate_after_link(
+        path: Path,
+        value: dict[str, object],
+        directory_fd: int | None = None,
+        before_link: object | None = None,
+        *,
+        before_link_with_temp: object | None = None,
+    ) -> None:
+        write_json_exclusive(
+            path, value, directory_fd,
+            before_link,  # type: ignore[arg-type]
+            before_link_with_temp=before_link_with_temp,  # type: ignore[arg-type]
+        )
+        if path.name == "selection.json":
+            (validation_failure / "extra").write_text(
+                "extra\n", encoding="ascii",
+            )
+
+    with patch(
+        "tools.select_universe.write_json_exclusive",
+        side_effect=mutate_after_link,
+    ):
+        raises(
+            (OSError, ValueError), select_universe,
+            policy, validation_failure,
+            key="fake-secret", requester=publication_requester(),
+        )
+    assert not os.path.lexists(validation_failure / "selection.json")
+
+
+def test_selection_cli(directory: Path) -> None:
+    arguments = selection_args(["policy.json", "output"])
+    assert arguments.policy == Path("policy.json")
+    assert arguments.output_dir == Path("output")
+    assert arguments.requests_per_minute == 0
+    assert selection_args([
+        "policy.json", "output", "--requests-per-minute", "5",
+    ]).requests_per_minute == 5
+
+    with patch.object(
+        sys, "argv", ["select_universe.py", "policy.json", "output"],
+    ), patch(
+        "tools.select_universe.select_universe",
+        return_value={"z": 1, "a": 2},
+    ), patch("sys.stdout", new_callable=StringIO) as stdout:
+        selection_main()
+    assert stdout.getvalue() == '{"a": 2, "z": 1}\n'
+
+    for error in (
+        ValueError("fake-secret"),
+        OSError("fake-secret"),
+    ):
+        with patch.object(
+            sys, "argv", ["select_universe.py", "policy.json", "output"],
+        ), patch(
+            "tools.select_universe.select_universe", side_effect=error,
+        ):
+            failure = raises(SystemExit, selection_main)
+        assert str(failure) == "universe selection failed"
+        assert "fake-secret" not in str(failure)
+    with patch.object(
+        sys, "argv", ["select_universe.py", "policy.json", "output"],
+    ), patch(
+        "tools.select_universe.select_universe",
+        side_effect=RuntimeError("not caught"),
+    ):
+        raises(RuntimeError, selection_main)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/select_universe.py"),
+            "--help",
+        ],
+        cwd=directory,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "POLICY OUTPUT_DIR" in completed.stdout
+    assert "ModuleNotFoundError" not in completed.stderr
 
 
 def test_request_gate() -> None:
@@ -785,13 +2050,24 @@ def assert_manifest_error(path: Path) -> None:
 def test_manifest_contract(directory: Path) -> None:
     path = directory / "manifest.json"
     write_manifest(path)
+    original = path.read_bytes()
     manifest = UniverseManifest.read(path)
+    assert path.read_bytes() == original
     assert manifest == UniverseManifest(
         1, "Offline universe test", date(2026, 7, 23), date(2024, 7, 22),
         date(2024, 7, 22), date(2026, 7, 21), 30, True, "regular",
         (SeriesSpec("AAPL", "generic"), SeriesSpec("MSFT", "generic")),
     )
     assert manifest.series[0].stratum == manifest.series[1].stratum
+
+    value = manifest_value()
+    value["eligibility_date"] = "2024-07-21"
+    write_manifest(path, value)
+    assert UniverseManifest.read(path).eligibility_date == date(2024, 7, 21)
+
+    value["eligibility_date"] = "2024-07-23"
+    write_manifest(path, value)
+    assert_manifest_error(path)
 
     top = set(manifest_value())
     for field in top:
@@ -832,7 +2108,6 @@ def test_manifest_contract(directory: Path) -> None:
     invalid = (
         ("schema", True), ("schema", 2), ("purpose", ""), ("purpose", " "),
         ("declared_on", "2024-07-21"), ("declared_on", "not-a-date"),
-        ("eligibility_date", "2024-07-21"), ("start", "2024-07-23"),
         ("end", "2024-07-21"), ("interval_minutes", 0),
         ("interval_minutes", 60), ("interval_minutes", True),
         ("interval_minutes", 30.0), ("adjusted", 1),
@@ -1422,6 +2697,14 @@ def main() -> None:
         test_pure_selection()
         test_universe_sources()
         test_universe_source_rejections()
+        test_universe_values()
+        test_exclusive_writer(directory)
+        test_selection_transport()
+        test_select_universe_publication(directory)
+        test_selection_publication_mutations(directory)
+        test_selection_target_rejections(directory)
+        test_selection_commit_failures(directory)
+        test_selection_cli(directory)
         test_existing_downloader(directory)
         test_manifest_contract(directory)
         test_target_rejections(directory)

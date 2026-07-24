@@ -9,12 +9,25 @@ from datetime import date, timedelta
 from decimal import Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import argparse
 import hashlib
 import json
 import os
+import re
+import secrets
+import stat
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from tools.fetch_massive import (
-    API_HOST, TICKER, Requester, authorized_url,
+    API_HOST, TICKER, Requester, api_key, authorized_url, request_gate,
+    request_json,
+)
+from tools.files import (
+    ExclusiveTemp, freeze_inputs, require_disjoint, verify_frozen,
+    rename_may_have_committed, rename_noreplace, write_json_exclusive,
 )
 
 POLICY_FIELDS = {
@@ -25,6 +38,12 @@ POLICY_FIELDS = {
     "minimum_median_close_usd", "minimum_median_dollar_volume_usd",
 }
 EXCHANGES = {"XNAS", "XNYS", "XASE"}
+SOURCE_PATHS = (
+    ROOT / "tools/select_universe.py",
+    ROOT / "tools/fetch_massive.py",
+    ROOT / "tools/files.py",
+)
+PRIVATE_MARKER = re.compile(r"\.selection\.json\.[0-9a-f]{32}\.tmp")
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -213,10 +232,131 @@ class SelectionPolicy:
         )
 
 
+def _decimal_text(value: Decimal) -> str:
+    if not value.is_finite():
+        raise ValueError("selection value must be finite")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if value == 0 else text
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value, allow_nan=False, indent=2, sort_keys=True,
+        ).encode("utf-8") + b"\n"
+    )
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _member_value(candidate: Candidate) -> dict[str, object]:
+    reference = candidate.reference
+    return {
+        "ticker": reference.ticker,
+        "composite_figi": reference.composite_figi,
+        "share_class_figi": reference.share_class_figi,
+        "stratum": candidate.stratum,
+    }
+
+
+def _candidate_value(
+    candidate: Candidate,
+    representative_ticker: str | None,
+) -> dict[str, object]:
+    reference = candidate.reference
+    return {
+        "ticker": reference.ticker,
+        "active": reference.active,
+        "market": reference.market,
+        "locale": reference.locale,
+        "type": reference.type,
+        "currency_name": reference.currency_name,
+        "primary_exchange": reference.primary_exchange,
+        "composite_figi": reference.composite_figi,
+        "share_class_figi": reference.share_class_figi,
+        "observed": candidate.observed,
+        "coverage": _decimal_text(candidate.coverage),
+        "median_close_usd": _decimal_text(candidate.median_close),
+        "median_dollar_volume_usd": _decimal_text(
+            candidate.median_dollar_volume,
+        ),
+        "rejection_reasons": list(candidate.rejection_reasons),
+        "decision": (
+            "rejected" if candidate.rejection_reasons else
+            "selected" if candidate.master_rank is not None else
+            "eligible-not-selected"
+        ),
+        "share_class_representative": representative_ticker,
+        "liquidity_rank": candidate.liquidity_rank,
+        "stratum": candidate.stratum,
+        "within_stratum_rank": candidate.within_stratum_rank,
+        "master_rank": candidate.master_rank,
+    }
+
+
+def _manifest_value(
+    policy: SelectionPolicy,
+    members: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema": policy.schema,
+        "purpose": policy.purpose,
+        "declared_on": str(policy.declared_on),
+        "eligibility_date": str(policy.anchor_date),
+        "start": str(policy.start),
+        "end": str(policy.end),
+        "interval_minutes": policy.interval_minutes,
+        "adjusted": policy.adjusted,
+        "session": policy.session,
+        "series": [
+            {
+                "stratum": f"liquidity-{member['stratum']}",
+                "ticker": member["ticker"],
+            }
+            for member in members
+        ],
+    }
+
+
+def _source_archive_value(archive: SourceArchive) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "request": archive.request,
+        "records": list(archive.records),
+    }
+
+
+def _source_binding_value(
+    archive: SourceArchive,
+    formation_sessions: frozenset[str],
+    sha256: str,
+) -> dict[str, object]:
+    session = archive.name.removeprefix("daily-")
+    return {
+        "name": archive.name,
+        "path": f"sources/{archive.name}.json",
+        "sha256": sha256,
+        "records": len(archive.records),
+        "formation_session": (
+            session in formation_sessions
+            if session != archive.name else None
+        ),
+    }
+
+
 def _ticker_valid(value: object) -> bool:
     return isinstance(value, str) and TICKER.fullmatch(value) is not None and any(
         character.isascii() and character.isalnum() for character in value
     )
+
+
+def _provider_ticker_valid(value: object) -> bool:
+    return isinstance(value, str) and value.isascii() and \
+        _ticker_valid(value.upper())
 
 
 REFERENCE_FIELDS = (
@@ -330,8 +470,10 @@ def _decimal_record(value: object, name: str) -> tuple[str, Decimal]:
 
 def _reference_record(
     value: object,
-) -> tuple[dict[str, object], Reference]:
-    if not isinstance(value, Mapping) or not _ticker_valid(value.get("ticker")):
+) -> tuple[dict[str, object], Reference | None]:
+    if not isinstance(value, Mapping) or not _provider_ticker_valid(
+        value.get("ticker")
+    ):
         raise ValueError("Massive returned an invalid reference record")
     ticker = value["ticker"]
     active = value.get("active")
@@ -345,7 +487,10 @@ def _reference_record(
         "active": active,
         **dict(zip(REFERENCE_FIELDS[2:], strings, strict=True)),
     }
-    return record, Reference(*(record[name] for name in REFERENCE_FIELDS))
+    return record, (
+        Reference(*(record[name] for name in REFERENCE_FIELDS))
+        if _ticker_valid(ticker) else None
+    )
 
 
 def _daily_record(
@@ -393,13 +538,16 @@ def fetch_sources(
         records = []
         for value in results:
             record, reference = _reference_record(value)
-            if reference.ticker <= previous:
+            ticker = record["ticker"]
+            assert isinstance(ticker, str)
+            if ticker <= previous:
                 raise ValueError(
                     "Massive reference tickers are not strictly increasing"
                 )
-            previous = reference.ticker
+            previous = ticker
             records.append(record)
-            references.append(reference)
+            if reference is not None:
+                references.append(reference)
         archives.append(SourceArchive(
             f"tickers-{page:04d}", contract, tuple(records),
         ))
@@ -423,7 +571,7 @@ def fetch_sources(
             raw_tickers = []
             retained = []
             for value in results:
-                if not isinstance(value, Mapping) or not _ticker_valid(
+                if not isinstance(value, Mapping) or not _provider_ticker_valid(
                     value.get("T")
                 ):
                     raise ValueError("Massive returned an invalid daily record")
@@ -667,3 +815,639 @@ def _select_candidates(
         tuple(candidates[ticker] for ticker in tickers),
         tuple(master),
     )
+
+
+def _transport(
+    requester: Requester | None,
+    requests_per_minute: int,
+) -> tuple[Requester, Callable[[], None]]:
+    gate = request_gate(requests_per_minute)
+    if requester is None:
+        return (
+            lambda url: request_json(url, before_request=gate),
+            lambda: None,
+        )
+    return requester, gate
+
+
+def _regular_identity(path: Path) -> tuple[int, int]:
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("universe source must be a regular file") from error
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError("universe source must be a regular file")
+    return value.st_dev, value.st_ino
+
+
+def _input(path: Path) -> tuple[Path, tuple[int, int]]:
+    if not os.path.lexists(path) or path.is_symlink():
+        raise ValueError("universe source must be a regular file")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("universe source path is invalid") from error
+    return resolved, _regular_identity(resolved)
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("universe output directory changed")
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def _path_directory_identity(path: Path) -> tuple[int, int, int]:
+    try:
+        return _directory_identity(os.stat(path, follow_symlinks=False))
+    except OSError as error:
+        raise ValueError("universe output parent must be a directory") from error
+
+
+def _open_directory(path: Path) -> tuple[int, tuple[int, int, int]]:
+    expected = _path_directory_identity(path)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise ValueError("universe output parent must be a directory") from error
+    try:
+        actual = _directory_identity(os.fstat(descriptor))
+        if actual != expected:
+            raise ValueError("universe output parent changed")
+        return descriptor, actual
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_child_directory(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, tuple[int, int, int]]:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        actual = _directory_identity(os.fstat(descriptor))
+        named = _directory_identity(os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False,
+        ))
+        if actual != named:
+            raise ValueError("universe output directory changed")
+        return descriptor, actual
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _member_identity(
+    directory_fd: int,
+    name: str,
+) -> tuple[int, int, int, int]:
+    return _file_identity(os.stat(
+        name, dir_fd=directory_fd, follow_symlinks=False,
+    ))
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
+        raise ValueError("universe package member changed")
+    return (
+        value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode),
+        value.st_nlink,
+    )
+
+
+def _open_member(
+    directory_fd: int,
+    name: str,
+    expected: tuple[int, int, int, int],
+) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        if _file_identity(os.fstat(descriptor)) != expected:
+            raise ValueError("universe package member changed")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _hash_member(
+    directory_fd: int,
+    name: str,
+    expected: tuple[int, int, int, int],
+) -> str:
+    descriptor = _open_member(directory_fd, name, expected)
+    try:
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1 << 20):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    if _member_identity(directory_fd, name) != expected:
+        raise ValueError("universe package member changed")
+    return digest.hexdigest()
+
+
+def _member_bytes(
+    directory_fd: int,
+    name: str,
+    expected: tuple[int, int, int, int],
+) -> bytes:
+    descriptor = _open_member(directory_fd, name, expected)
+    try:
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    if _member_identity(directory_fd, name) != expected:
+        raise ValueError("universe package member changed")
+    return b"".join(chunks)
+
+
+def _check_directory(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: tuple[int, int, int],
+) -> None:
+    if _directory_identity(os.fstat(descriptor)) != expected or \
+       _directory_identity(os.stat(
+           name, dir_fd=parent_fd, follow_symlinks=False,
+       )) != expected:
+        raise ValueError("universe output directory changed")
+
+
+def _exists_at(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _report_path(path: Path) -> str:
+    root = ROOT.resolve()
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _source_path(path: Path) -> str:
+    try:
+        return path.relative_to(ROOT.resolve()).as_posix()
+    except ValueError as error:
+        raise ValueError("source closure must be under the project root") from error
+
+
+def _output_target(
+    output_dir: Path,
+    inputs: Sequence[Path],
+) -> tuple[Path, Path]:
+    original = Path(output_dir)
+    normalized = Path(os.path.abspath(original))
+    try:
+        resolved = normalized.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("universe output path is invalid") from error
+    for path in dict.fromkeys((original, normalized, resolved)):
+        if os.path.lexists(path):
+            raise ValueError("universe output must not already exist")
+    try:
+        for path in (normalized, resolved):
+            require_disjoint(inputs, (path, path / "selection.json"))
+    except (OSError, RuntimeError) as error:
+        raise ValueError("universe output path is invalid") from error
+    _path_directory_identity(normalized.parent)
+    return normalized, normalized.parent
+
+
+def _marker_state(
+    root_fd: int,
+    name: str,
+) -> tuple[tuple[int, int], int] | None:
+    try:
+        value = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(value.st_mode):
+        return None
+    return (value.st_dev, value.st_ino), value.st_nlink
+
+
+def _named_state(
+    directory_fd: int,
+    name: str,
+) -> tuple[tuple[int, int], int, int] | None:
+    try:
+        value = os.stat(
+            name, dir_fd=directory_fd, follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    return (
+        (value.st_dev, value.st_ino),
+        stat.S_IFMT(value.st_mode),
+        value.st_nlink,
+    )
+
+
+def _owns_marker(
+    root_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    links: tuple[int, ...],
+) -> bool:
+    state = _marker_state(root_fd, name)
+    return state is not None and state[0] == identity and state[1] in links
+
+
+def _quarantine_marker(
+    root_fd: int,
+    identity: tuple[int, int],
+) -> bool:
+    failure: OSError | None = None
+    for _ in range(2):
+        directory = f".selection-rollback.{secrets.token_hex(16)}"
+        os.mkdir(directory, 0o700, dir_fd=root_fd)
+        quarantine_fd, _ = _open_child_directory(root_fd, directory)
+        try:
+            attempt_failure: OSError | None = None
+            try:
+                rename_noreplace(
+                    root_fd, "selection.json",
+                    quarantine_fd, "selection.json",
+                )
+            except OSError as error:
+                failure = error
+                attempt_failure = error
+            source = _named_state(root_fd, "selection.json")
+            target = _named_state(quarantine_fd, "selection.json")
+            if source is not None:
+                os.fsync(quarantine_fd)
+                os.fsync(root_fd)
+                continue
+            if target is None:
+                os.fsync(quarantine_fd)
+                os.fsync(root_fd)
+                return False
+            if not rename_may_have_committed(attempt_failure):
+                os.fsync(quarantine_fd)
+                os.fsync(root_fd)
+                return False
+            owned = target[0] == identity and \
+                target[1] == stat.S_IFREG and target[2] in (1, 2)
+            if not owned:
+                restore_failure: OSError | None = None
+                try:
+                    rename_noreplace(
+                        quarantine_fd, "selection.json",
+                        root_fd, "selection.json",
+                    )
+                except OSError as error:
+                    restore_failure = error
+                if _named_state(quarantine_fd, "selection.json") is not None or \
+                   _named_state(root_fd, "selection.json") != target:
+                    raise OSError(
+                        "universe marker rollback collided"
+                    ) from restore_failure
+            os.fsync(quarantine_fd)
+            os.fsync(root_fd)
+            return owned
+        finally:
+            os.close(quarantine_fd)
+    raise OSError("universe marker rollback failed") from failure
+
+
+def select_universe(
+    policy_path: Path,
+    output_dir: Path,
+    *,
+    key: str | None = None,
+    requester: Requester | None = None,
+    requests_per_minute: int = 0,
+) -> dict[str, object]:
+    resolved = tuple(_input(path) for path in (policy_path, *SOURCE_PATHS))
+    inputs = tuple(path for path, _ in resolved)
+    identities = tuple(identity for _, identity in resolved)
+    if len(set(identities)) != len(identities):
+        raise ValueError("universe sources must be distinct")
+    output, parent = _output_target(output_dir, inputs)
+    parent_fd, parent_identity = _open_directory(parent)
+    descriptors = [parent_fd]
+    try:
+        with freeze_inputs(inputs) as frozen:
+            policy = SelectionPolicy.read(frozen[0].snapshot)
+            transport, before_request = _transport(
+                requester, requests_per_minute,
+            )
+            bundle = fetch_sources(
+                policy,
+                api_key(ROOT / ".env") if key is None else key,
+                transport,
+                before_request,
+            )
+            selection = select_candidates(
+                policy, bundle.references, bundle.sessions,
+            )
+            verify_frozen(frozen)
+            if any(
+                _regular_identity(path) != identity
+                for path, identity in zip(inputs, identities, strict=True)
+            ) or _path_directory_identity(parent) != parent_identity:
+                raise ValueError("universe inputs changed")
+
+            source_names = tuple(f"{archive.name}.json" for archive in bundle.archives)
+            if len(set(source_names)) != len(source_names) or any(
+                Path(name).name != name for name in source_names
+            ):
+                raise ValueError("universe source archive names are invalid")
+            source_values = tuple(
+                _source_archive_value(archive) for archive in bundle.archives
+            )
+            representatives = {
+                candidate.reference.share_class_figi:
+                candidate.reference.ticker
+                for candidate in selection.candidates
+                if not candidate.rejection_reasons
+            }
+            candidates = [
+                _candidate_value(
+                    candidate,
+                    (
+                        representatives.get(
+                            candidate.reference.share_class_figi,
+                        )
+                        if not candidate.rejection_reasons or
+                        candidate.rejection_reasons ==
+                        ("duplicate-share-class-figi",)
+                        else None
+                    ),
+                )
+                for candidate in selection.candidates
+            ]
+            master = [_member_value(candidate) for candidate in selection.master]
+            manifest_values = {
+                str(size): _manifest_value(policy, master[:size])
+                for size in policy.cohort_sizes
+            }
+
+            os.mkdir(output.name, 0o700, dir_fd=parent_fd)
+            root_fd, root_identity = _open_child_directory(
+                parent_fd, output.name,
+            )
+            descriptors.append(root_fd)
+            os.fsync(parent_fd)
+            child_fds: dict[str, int] = {}
+            child_identities: dict[str, tuple[int, int, int]] = {}
+            for name in ("sources", "manifests"):
+                os.mkdir(name, 0o700, dir_fd=root_fd)
+                descriptor, identity = _open_child_directory(root_fd, name)
+                descriptors.append(descriptor)
+                child_fds[name], child_identities[name] = descriptor, identity
+
+            source_records: dict[
+                str, tuple[tuple[int, int, int, int], str]
+            ] = {}
+            sources = []
+            sessions = frozenset(str(day) for day, _ in bundle.sessions)
+            for archive, name, value in zip(
+                bundle.archives, source_names, source_values, strict=True,
+            ):
+                write_json_exclusive(
+                    Path(name), value, child_fds["sources"],
+                )
+                identity = _member_identity(child_fds["sources"], name)
+                digest = _hash_member(
+                    child_fds["sources"], name, identity,
+                )
+                source_records[name] = identity, digest
+                sources.append(
+                    _source_binding_value(archive, sessions, digest)
+                )
+
+            manifest_records: dict[
+                str, tuple[tuple[int, int, int, int], str]
+            ] = {}
+            cohorts: dict[str, object] = {}
+            for size, size_text in zip(
+                policy.cohort_sizes, manifest_values, strict=True,
+            ):
+                name = f"liquid-common-{size}.json"
+                write_json_exclusive(
+                    Path(name), manifest_values[size_text],
+                    child_fds["manifests"],
+                )
+                identity = _member_identity(child_fds["manifests"], name)
+                digest = _hash_member(
+                    child_fds["manifests"], name, identity,
+                )
+                manifest_records[name] = identity, digest
+                members = master[:size]
+                cohorts[size_text] = {
+                    "size": size,
+                    "primary": size == policy.primary_cohort_size,
+                    "members": members,
+                    "members_sha256": _canonical_sha256(members),
+                    "manifest": f"manifests/{name}",
+                    "manifest_sha256": digest,
+                }
+
+            for descriptor in (
+                child_fds["sources"], child_fds["manifests"], root_fd,
+            ):
+                os.fsync(descriptor)
+
+            report: dict[str, object] = {
+                "schema": policy.schema,
+                "purpose": policy.purpose,
+                "declared_on": str(policy.declared_on),
+                "anchor_date": str(policy.anchor_date),
+                "formation_start": str(policy.formation_start),
+                "formation_end": str(policy.formation_end),
+                "start": str(policy.start),
+                "end": str(policy.end),
+                "primary_cohort_size": policy.primary_cohort_size,
+                "policy": {
+                    "path": _report_path(inputs[0]),
+                    "sha256": frozen[0].sha256,
+                },
+                "source_closure": [
+                    {
+                        "path": _source_path(item.source),
+                        "sha256": item.sha256,
+                    }
+                    for item in frozen[1:]
+                ],
+                "sources": sources,
+                "formation_sessions": [
+                    str(day) for day, _ in bundle.sessions
+                ],
+                "candidates": candidates,
+                "master": master,
+                "master_sha256": _canonical_sha256(master),
+                "cohorts": cohorts,
+            }
+            marker_identity: tuple[int, int] | None = None
+
+            def validate(
+                *, marker: bool, private: bool = False,
+            ) -> set[str]:
+                verify_frozen(frozen)
+                if any(
+                    _regular_identity(path) != identity
+                    for path, identity in zip(
+                        inputs, identities, strict=True,
+                    )
+                ) or _path_directory_identity(parent) != parent_identity:
+                    raise ValueError("universe inputs changed")
+                _check_directory(
+                    parent_fd, output.name, root_fd, root_identity,
+                )
+                for name in ("sources", "manifests"):
+                    _check_directory(
+                        root_fd, name, child_fds[name],
+                        child_identities[name],
+                    )
+                if set(os.listdir(child_fds["sources"])) != set(source_records) or \
+                   set(os.listdir(child_fds["manifests"])) != set(
+                       manifest_records
+                   ):
+                    raise ValueError("universe package membership changed")
+                for directory_fd, records in (
+                    (child_fds["sources"], source_records),
+                    (child_fds["manifests"], manifest_records),
+                ):
+                    for name, (identity, digest) in records.items():
+                        if _member_identity(directory_fd, name) != identity or \
+                           _hash_member(
+                               directory_fd, name, identity,
+                           ) != digest:
+                            raise ValueError("universe package member changed")
+                entries = set(os.listdir(root_fd))
+                temporary = {
+                    name for name in entries
+                    if PRIVATE_MARKER.fullmatch(name)
+                }
+                expected = {"sources", "manifests"}
+                if marker:
+                    expected.add("selection.json")
+                if private:
+                    if len(temporary) != 1:
+                        raise ValueError(
+                            "universe package membership changed"
+                        )
+                elif temporary:
+                    raise ValueError("universe package membership changed")
+                if entries - temporary != expected or \
+                   _exists_at(root_fd, "selection.json") is not marker:
+                    raise ValueError("universe package membership changed")
+                if report["master"] != master or \
+                   report["master_sha256"] != _canonical_sha256(master):
+                    raise ValueError("universe master binding changed")
+                for size, size_text in zip(
+                    policy.cohort_sizes, cohorts, strict=True,
+                ):
+                    cohort = cohorts[size_text]
+                    members = master[:size]
+                    if not isinstance(cohort, Mapping) or \
+                       cohort["members"] != members or \
+                       cohort["members_sha256"] != _canonical_sha256(
+                           members
+                       ) or cohort["manifest_sha256"] != manifest_records[
+                           f"liquid-common-{size}.json"
+                       ][1]:
+                        raise ValueError("universe cohort binding changed")
+                if marker:
+                    if marker_identity is None or not _owns_marker(
+                        root_fd, "selection.json", marker_identity, (1,),
+                    ):
+                        raise ValueError(
+                            "universe completion marker changed"
+                        )
+                    identity = _member_identity(root_fd, "selection.json")
+                    if _member_bytes(
+                        root_fd, "selection.json", identity,
+                    ) != _canonical_bytes(report):
+                        raise ValueError("universe completion marker changed")
+                return temporary
+
+            def before_link(binding: ExclusiveTemp) -> None:
+                nonlocal marker_identity
+                marker_identity = binding.identity
+                temporary = validate(marker=False, private=True)
+                if temporary != {binding.name} or \
+                   not PRIVATE_MARKER.fullmatch(binding.name) or \
+                   not _owns_marker(
+                       root_fd, binding.name, binding.identity, (1,),
+                   ):
+                    raise ValueError("universe completion marker changed")
+
+            def cleanup_marker() -> None:
+                if marker_identity is None:
+                    return
+                _quarantine_marker(root_fd, marker_identity)
+
+            try:
+                write_json_exclusive(
+                    Path("selection.json"), report, root_fd,
+                    before_link_with_temp=before_link,
+                )
+            except BaseException:
+                cleanup_marker()
+                raise
+
+            try:
+                validate(marker=True)
+                os.fsync(root_fd)
+            except BaseException:
+                cleanup_marker()
+                raise
+            return report
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def parse_args(
+    argv: Sequence[str] | None = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Select and publish a point-in-time stock universe.",
+    )
+    parser.add_argument("policy", type=Path, metavar="POLICY")
+    parser.add_argument("output_dir", type=Path, metavar="OUTPUT_DIR")
+    parser.add_argument(
+        "--requests-per-minute", type=int, default=0, metavar="N",
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    arguments = parse_args()
+    try:
+        report = select_universe(
+            arguments.policy,
+            arguments.output_dir,
+            requests_per_minute=arguments.requests_per_minute,
+        )
+    except (OSError, ValueError):
+        raise SystemExit("universe selection failed") from None
+    print(json.dumps(report, allow_nan=False, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

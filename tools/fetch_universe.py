@@ -121,7 +121,7 @@ class UniverseManifest:
             series.append(SeriesSpec(ticker, _text(item["stratum"], "stratum")))
         if len({item.ticker for item in series}) != len(series):
             raise ValueError("universe tickers must be unique")
-        if declared_on < eligibility_date or eligibility_date != start or start > end:
+        if declared_on < eligibility_date or eligibility_date > start or start > end:
             raise ValueError("universe date relationship is invalid")
         return cls(
             value["schema"], purpose, declared_on, eligibility_date, start, end,

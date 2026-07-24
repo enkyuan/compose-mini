@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, TextIO
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import secrets
+import stat
+import sys
 import tempfile
 
 
@@ -27,6 +31,12 @@ class FrozenInput:
     source: Path
     snapshot: Path
     sha256: str
+
+
+@dataclass(frozen=True)
+class ExclusiveTemp:
+    name: str
+    identity: tuple[int, int]
 
 
 @contextmanager
@@ -63,46 +73,141 @@ def atomic_text(path: Path, write: Callable[[TextIO], None]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _entry_state(
+    directory_fd: int,
+    name: str,
+) -> tuple[tuple[int, int], int, int] | None:
+    try:
+        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return (
+        (value.st_dev, value.st_ino),
+        stat.S_IFMT(value.st_mode),
+        value.st_nlink,
+    )
+
+
+def _owns_entry(
+    directory_fd: int,
+    binding: ExclusiveTemp,
+    links: tuple[int, ...],
+) -> bool:
+    state = _entry_state(directory_fd, binding.name)
+    return state is not None and state[:2] == (
+        binding.identity, stat.S_IFREG,
+    ) and state[2] in links
+
+
+def _require_entry(
+    directory_fd: int,
+    binding: ExclusiveTemp,
+    links: tuple[int, ...],
+) -> None:
+    if not _owns_entry(directory_fd, binding, links):
+        raise OSError("exclusive output changed during publication")
+
+
+def rename_noreplace(
+    source_fd: int,
+    source: str,
+    target_fd: int,
+    target: str,
+) -> None:
+    """Atomically rename without replacing an existing target."""
+    names = {
+        "darwin": ("renameatx_np", 0x4),
+        "linux": ("renameat2", 0x1),
+    }
+    platform = "linux" if sys.platform.startswith("linux") else sys.platform
+    if platform not in names:
+        raise OSError(errno.ENOTSUP, "exclusive rename is unsupported")
+    symbol, flag = names[platform]
+    try:
+        function = getattr(ctypes.CDLL(None, use_errno=True), symbol)
+    except AttributeError as error:
+        raise OSError(
+            errno.ENOTSUP, "exclusive rename is unsupported"
+        ) from error
+    function.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(
+        source_fd, os.fsencode(source), target_fd, os.fsencode(target), flag,
+    ):
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, os.strerror(code), target)
+
+
+def rename_may_have_committed(error: OSError | None) -> bool:
+    return error is None or error.errno in (None, errno.EINTR, errno.EIO)
+
+
 def exclusive_text(
     path: Path, write: Callable[[TextIO], None], directory_fd: int | None = None,
     before_link: Callable[[], None] | None = None,
+    *,
+    before_link_with_temp: Callable[[ExclusiveTemp], None] | None = None,
 ) -> None:
-    """Fsync, optionally revalidate, then link a new file without replacing."""
+    """Fsync, revalidate, then rename a writer-bound inode without replacing."""
+    if before_link is not None and before_link_with_temp is not None:
+        raise ValueError("exclusive output accepts one pre-link callback")
+    owned_directory = directory_fd is None
+    descriptor: int | None = None
     if directory_fd is None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, name = tempfile.mkstemp(
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True,
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_NOFOLLOW", 0),
         )
-        temporary = Path(name)
-    else:
+    try:
         name = f".{path.name}.{secrets.token_hex(16)}.tmp"
         descriptor = os.open(
             name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
             getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd,
         )
-        temporary = None
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        metadata = os.fstat(descriptor)
+        binding = ExclusiveTemp(name, (metadata.st_dev, metadata.st_ino))
+        with os.fdopen(
+            descriptor, "w", encoding="utf-8", closefd=False,
+        ) as file:
             write(file)
             file.flush()
             os.fsync(file.fileno())
-        if before_link is not None:
-            before_link()
-        if directory_fd is None:
-            os.link(temporary, path)
-        else:
-            os.link(
-                name, path.name, src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd, follow_symlinks=False,
-            )
-    finally:
-        if directory_fd is None:
-            temporary.unlink(missing_ok=True)
-        else:
+            _require_entry(directory_fd, binding, (1,))
+            if before_link_with_temp is not None:
+                before_link_with_temp(binding)
+            elif before_link is not None:
+                before_link()
+            _require_entry(directory_fd, binding, (1,))
+            failure: OSError | None = None
             try:
-                os.unlink(name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+                rename_noreplace(
+                    directory_fd, binding.name, directory_fd, path.name,
+                )
+            except OSError as error:
+                failure = error
+            source = _entry_state(directory_fd, binding.name)
+            target = _entry_state(directory_fd, path.name)
+            committed = rename_may_have_committed(failure) and \
+                source is None and target == (
+                binding.identity, stat.S_IFREG, 1,
+            ) and _entry_state(directory_fd, binding.name) is None
+            if not committed:
+                if failure is not None:
+                    raise failure
+                raise OSError("exclusive output changed during publication")
+    finally:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        finally:
+            if owned_directory:
+                os.close(directory_fd)
 
 
 def write_json(path: Path, value: Mapping[str, object]) -> None:
@@ -116,12 +221,17 @@ def write_json(path: Path, value: Mapping[str, object]) -> None:
 def write_json_exclusive(
     path: Path, value: Mapping[str, object], directory_fd: int | None = None,
     before_link: Callable[[], None] | None = None,
+    *,
+    before_link_with_temp: Callable[[ExclusiveTemp], None] | None = None,
 ) -> None:
     def write(file: TextIO) -> None:
         json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
         file.write("\n")
 
-    exclusive_text(path, write, directory_fd, before_link)
+    exclusive_text(
+        path, write, directory_fd, before_link,
+        before_link_with_temp=before_link_with_temp,
+    )
 
 
 def series_arg(value: str, pattern: re.Pattern[str]) -> tuple[str, Path]:
