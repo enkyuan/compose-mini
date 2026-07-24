@@ -504,11 +504,12 @@ def _prepare_packed(rows: array, candidate: Candidate, packed: PackedRows,
                     max_history: int, sweep: Sweep) -> TrainingData:
     """Prepare embargoed development rows without exposing a test block."""
     if not isinstance(packed, PackedRows) or len(packed.counts) != 2 or \
-       any(type(count) is not int or count < 1 for count in packed.counts) or \
+       type(packed.counts[0]) is not int or packed.counts[0] < 1 or \
+       type(packed.counts[1]) is not int or packed.counts[1] < 0 or \
        sum(packed.counts) != len(packed.rows):
         raise ValueError("packed rows must cover only train and validation")
     boundary = packed.counts[0]
-    if packed.rows[boundary - 1].as_of_ordinal + \
+    if packed.counts[1] and packed.rows[boundary - 1].as_of_ordinal + \
        sweep.alignment_horizon_bars > packed.rows[boundary].as_of_ordinal:
         raise ValueError("packed rows do not preserve the alignment embargo")
     return _candidate_data(

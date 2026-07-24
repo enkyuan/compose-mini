@@ -586,6 +586,17 @@ def verify_packed_development_data() -> None:
     data = _prepare_packed(values, selected, packed, 3, sweep)
     assert tuple(map(len, (data.train, data.validation, data.test))) == (2, 2, 0)
     assert (data.train.start, data.validation.start, data.test.start) == (0, 2, 4)
+    training_only = _prepare_packed(
+        values, selected, PackedRows(packed.rows[:2], (2, 0)), 3, sweep,
+    )
+    assert tuple(map(
+        len, (training_only.train, training_only.validation, training_only.test),
+    )) == (2, 0, 0)
+    assert (
+        training_only.train.start,
+        training_only.validation.start,
+        training_only.test.start,
+    ) == (0, 2, 2)
     assert _boundary(
         timestamps, 0, (*packed.counts, 0), 0, sample_rows=packed.rows,
     ) == {
@@ -624,7 +635,9 @@ def verify_packed_development_data() -> None:
 
     for invalid in (
         replace(packed, counts=(2, 1)),
-        replace(packed, counts=(4, 0)),
+        replace(packed, counts=(0, 4)),
+        PackedRows(packed.rows[:1], (2, -1)),
+        PackedRows(packed.rows[:2], (1, True)),
         replace(packed, counts=(*packed.counts, 0)),
     ):
         try:
@@ -1095,6 +1108,7 @@ def verify_stock_macro_training() -> None:
     missing_validation = DataSplits(
         dataset((0.0,), 0.0), dataset((), 0.0), dataset((0.0,), 0.0),
     )
+    fit_members = (members[0], missing_validation)
     try:
         _macro_validation_loss(
             Zero(), (missing_validation, members[1]), 2,
@@ -1126,31 +1140,37 @@ def verify_stock_macro_training() -> None:
         with patch("tools.experiment.fit_updates") as updates:
             updates.return_value = object()
             model, fit = _fit_shared_updates(
-                model_name, selected, members, sweep, 7, 2,
+                model_name, selected, fit_members, sweep, 7, 2,
                 torch.device("cpu"), validation_indices=(0,),
             )
             assert fit is updates.return_value
             assert isinstance(model, FlatMLP) == (model_name == "mlp")
             loader = updates.call_args.args[1]
             assert len(loader) == 6
+            assert tuple(loader.dataset.datasets) == tuple(
+                member.train for member in fit_members
+            )
             assert updates.call_args.args[3:5] == (3, 2)
             assert updates.call_args.args[2]() == _macro_validation_loss(
-                model, members[:1], 4, torch.device("cpu"),
+                model, fit_members[:1], 4, torch.device("cpu"),
             )
             orders[model_name] = tuple(loader.sampler)
         with patch("tools.experiment.fit_model") as epochs:
             epochs.return_value = (object(), (object(), object(), object()))
             model, fit, loaders = _fit_shared_epochs(
-                model_name, selected, members, sweep, 7,
+                model_name, selected, fit_members, sweep, 7,
                 torch.device("cpu"), validation_indices=(0,),
             )
             assert fit is epochs.return_value[0] and \
                 loaders == epochs.return_value[1]
             assert isinstance(model, FlatMLP) == (model_name == "mlp")
             options = epochs.call_args.kwargs
-            assert len(options["train_loader"].sampler) == 8
+            assert len(options["train_loader"].sampler) == 3
+            assert tuple(
+                options["train_loader"].dataset.datasets
+            ) == tuple(member.train for member in fit_members)
             assert options["validation_loss"]() == _macro_validation_loss(
-                model, members[:1], 4, torch.device("cpu"),
+                model, fit_members[:1], 4, torch.device("cpu"),
             )
             epoch_orders[model_name] = tuple(options["train_loader"].sampler)
     assert orders["panel_transformer"] == orders["mlp"]
