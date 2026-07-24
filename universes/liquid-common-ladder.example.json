@@ -1,0 +1,21 @@
+{
+  "adjusted": true,
+  "anchor_date": "2024-10-31",
+  "cohort_sizes": [11, 22, 33, 55],
+  "declared_on": "2026-07-24",
+  "end": "2026-07-21",
+  "formation_end": "2024-10-31",
+  "formation_start": "2024-08-01",
+  "interval_minutes": 30,
+  "liquidity_strata": 5,
+  "minimum_coverage": "0.95",
+  "minimum_formation_sessions": 60,
+  "minimum_median_close_usd": "5",
+  "minimum_median_dollar_volume_usd": "25000000",
+  "primary_cohort_size": 55,
+  "purpose": "Select nested point-in-time U.S. common-stock cohorts before fetching model data.",
+  "schema": 1,
+  "selection_seed": "compose-mini-massive-universe-v1",
+  "session": "regular",
+  "start": "2024-11-01"
+}

@@ -2,6 +2,7 @@
 """Verify Massive downloads and strict universe fetching without network."""
 
 from datetime import date, datetime
+from decimal import Decimal
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +29,9 @@ from tools.fetch_universe import (
     reference_url,
 )
 from tools.files import file_sha256, write_json
+from tools.select_universe import (
+    Candidate, DailyRow, Reference, SelectionPolicy, select_candidates,
+)
 
 
 class FakeClock:
@@ -70,6 +74,260 @@ def raises(
         if isinstance(kind, tuple) else kind.__name__
     )
     raise AssertionError(f"{names} was not raised")
+
+
+def selection_policy_value() -> dict[str, object]:
+    return {
+        "adjusted": True,
+        "anchor_date": "2024-10-31",
+        "cohort_sizes": [11, 22, 33, 55],
+        "declared_on": "2026-07-24",
+        "end": "2026-07-21",
+        "formation_end": "2024-10-31",
+        "formation_start": "2024-08-01",
+        "interval_minutes": 30,
+        "liquidity_strata": 5,
+        "minimum_coverage": "0.95",
+        "minimum_formation_sessions": 60,
+        "minimum_median_close_usd": "5",
+        "minimum_median_dollar_volume_usd": "25000000",
+        "primary_cohort_size": 55,
+        "purpose": (
+            "Select nested point-in-time U.S. common-stock cohorts before "
+            "fetching model data."
+        ),
+        "schema": 1,
+        "selection_seed": "compose-mini-massive-universe-v1",
+        "session": "regular",
+        "start": "2024-11-01",
+    }
+
+
+def write_selection_policy(
+    path: Path, value: dict[str, object] | None = None,
+) -> None:
+    path.write_text(
+        json.dumps(selection_policy_value() if value is None else value) + "\n",
+        encoding="ascii",
+    )
+
+
+def assert_selection_policy_error(path: Path) -> None:
+    raises((OSError, ValueError), SelectionPolicy.read, path)
+
+
+def test_selection_policy(directory: Path) -> None:
+    path = directory / "selection-policy.json"
+    write_selection_policy(path)
+    assert SelectionPolicy.read(
+        ROOT / "universes/liquid-common-ladder.example.json",
+    ) == SelectionPolicy(
+        1,
+        "Select nested point-in-time U.S. common-stock cohorts before "
+        "fetching model data.",
+        date(2026, 7, 24), date(2024, 10, 31), date(2024, 8, 1),
+        date(2024, 10, 31), date(2024, 11, 1), date(2026, 7, 21), 30, True,
+        "regular", (11, 22, 33, 55), 55,
+        "compose-mini-massive-universe-v1", 5, 60, Decimal("0.95"),
+        Decimal("5"), Decimal("25000000"),
+    )
+
+    for field in selection_policy_value():
+        value = selection_policy_value()
+        del value[field]
+        write_selection_policy(path, value)
+        assert_selection_policy_error(path)
+    write_selection_policy(path, selection_policy_value() | {"extra": True})
+    assert_selection_policy_error(path)
+
+    raw = json.dumps(selection_policy_value())
+    path.write_text(
+        raw.replace('"schema": 1', '"schema": 1, "schema": 1', 1),
+        encoding="ascii",
+    )
+    assert_selection_policy_error(path)
+
+    for field in (
+        "schema", "interval_minutes", "liquidity_strata",
+        "minimum_formation_sessions", "primary_cohort_size",
+    ):
+        value = selection_policy_value()
+        value[field] = True
+        write_selection_policy(path, value)
+        assert_selection_policy_error(path)
+
+    for field, replacement in (
+        ("anchor_date", "2024-10-31T00:00:00"),
+        ("minimum_coverage", "0.950"),
+        ("minimum_median_close_usd", "05"),
+        ("minimum_median_dollar_volume_usd", "2.5e7"),
+        ("formation_start", "2024-11-01"),
+        ("formation_end", "2024-10-30"),
+        ("start", "2024-10-31"),
+        ("end", "2024-10-31"),
+        ("declared_on", "2024-10-30"),
+        ("cohort_sizes", [11, 22, 22, 55]),
+        ("primary_cohort_size", 33),
+        ("liquidity_strata", 1),
+        ("minimum_coverage", "0"),
+        ("minimum_coverage", "1.01"),
+        ("minimum_formation_sessions", 0),
+        ("minimum_median_close_usd", "0"),
+        ("minimum_median_dollar_volume_usd", "0"),
+    ):
+        value = selection_policy_value()
+        value[field] = replacement
+        write_selection_policy(path, value)
+        assert_selection_policy_error(path)
+
+    precise = "0.12345678901234567890123456789"
+    value = selection_policy_value() | {"minimum_coverage": precise}
+    write_selection_policy(path, value)
+    assert SelectionPolicy.read(path).minimum_coverage == Decimal(precise)
+    for nonfinite in ("NaN", "sNaN", "Infinity", "-Infinity"):
+        value["minimum_coverage"] = nonfinite
+        write_selection_policy(path, value)
+        raises(ValueError, SelectionPolicy.read, path)
+
+
+def selection_reference(
+    ticker: str, share_class_figi: str, **changes: object,
+) -> Reference:
+    value: dict[str, object] = {
+        "active": True,
+        "market": "stocks",
+        "locale": "us",
+        "type": "CS",
+        "currency_name": "usd",
+        "primary_exchange": "XNYS",
+        "composite_figi": f"BBG{ticker}",
+        "share_class_figi": share_class_figi,
+    }
+    value.update(changes)
+    return Reference(ticker=ticker, **value)  # type: ignore[arg-type]
+
+
+def test_pure_selection() -> None:
+    policy = SelectionPolicy.read(
+        ROOT / "universes/liquid-common-ladder.example.json",
+    )
+    dollar_volumes = (
+        Decimal("100000000"), Decimal("80000000"), Decimal("60000000"),
+        Decimal("40000000"), Decimal("30000000"),
+    )
+    references = []
+    for band, dollar_volume in enumerate(dollar_volumes):
+        for member in range(12):
+            ticker = f"B{band}-{member:02d}"
+            share_class_figi = (
+                "SC0-00" if ticker == "B0-01" else f"SC{band}-{member:02d}"
+            )
+            references.append(selection_reference(ticker, share_class_figi))
+    references.append(selection_reference(
+        "META", "", active=False, market="otc", locale="ca", type="ETF",
+        currency_name="cad", primary_exchange="OTC", composite_figi="",
+    ))
+
+    sessions = []
+    first = date(2024, 8, 1)
+    for day in range(60):
+        rows = []
+        for band, dollar_volume in enumerate(dollar_volumes):
+            for member in range(12):
+                ticker = f"B{band}-{member:02d}"
+                close = vwap = Decimal("50")
+                volume = dollar_volume / close
+                if ticker == "B4-02" and day == 0:
+                    vwap = Decimal("NaN")
+                if ticker == "B4-03" and day < 4:
+                    volume = Decimal(0)
+                if ticker == "B4-04":
+                    close = Decimal((day * 17) % 60 + 1)
+                    vwap = Decimal(1)
+                    volume = close * Decimal("1000000")
+                rows.append(DailyRow(ticker, close, volume, vwap))
+        sessions.append((
+            date.fromordinal(first.toordinal() + day), tuple(rows),
+        ))
+
+    selection = select_candidates(
+        policy, tuple(reversed(references)), tuple(reversed(sessions)),
+    )
+    repeated = select_candidates(policy, tuple(references), tuple(sessions))
+    assert selection == repeated
+    assert selection.candidates == tuple(sorted(
+        selection.candidates, key=lambda item: item.reference.ticker,
+    ))
+    assert len(selection.master) == 55
+    assert all(isinstance(item, Candidate) for item in selection.master)
+
+    candidates = {
+        item.reference.ticker: item for item in selection.candidates
+    }
+    assert candidates["B4-02"].observed == 59
+    assert candidates["B4-02"].coverage == Decimal(59) / Decimal(60)
+    assert candidates["B4-02"].median_close == Decimal("50")
+    assert candidates["B4-02"].median_dollar_volume == Decimal("30000000")
+    assert candidates["B4-03"].rejection_reasons == (
+        "coverage-below-minimum",
+    )
+    assert candidates["B4-04"].median_close == Decimal("30.5")
+    assert candidates["B4-04"].median_dollar_volume == Decimal("30500000")
+    assert candidates["B0-01"].rejection_reasons == (
+        "duplicate-share-class-figi",
+    )
+    assert candidates["META"].rejection_reasons == (
+        "inactive", "market-not-stocks", "locale-not-us",
+        "type-not-common-stock", "currency-not-usd", "exchange-not-listed",
+        "missing-composite-figi", "missing-share-class-figi",
+        "coverage-below-minimum", "median-close-below-minimum",
+        "median-dollar-volume-below-minimum",
+    )
+
+    assert [item.stratum for item in selection.master[:5]] == [1, 2, 3, 4, 5]
+    for size in policy.cohort_sizes:
+        cohort = selection.master[:size]
+        assert len(cohort) == size
+        counts = [
+            sum(item.stratum == stratum for item in cohort)
+            for stratum in range(1, 6)
+        ]
+        assert max(counts) - min(counts) <= 1
+    assert tuple(item.master_rank for item in selection.master) == tuple(
+        range(55),
+    )
+    assert len({item.reference.ticker for item in selection.master}) == 55
+    assert "B0-01" not in {
+        item.reference.ticker for item in selection.master
+    }
+
+    for stratum in range(1, 6):
+        members = sorted(
+            (
+                item for item in selection.candidates
+                if item.stratum == stratum
+            ),
+            key=lambda item: item.within_stratum_rank,
+        )
+        expected = sorted(
+            members,
+            key=lambda item: (
+                hashlib.sha256(
+                    (
+                        policy.selection_seed + "\0" +
+                        item.reference.share_class_figi
+                    ).encode()
+                ).digest(),
+                item.reference.composite_figi,
+                item.reference.ticker,
+            ),
+        )
+        assert members == expected
+
+    raises(
+        ValueError, select_candidates, policy, tuple(references[:55]),
+        tuple(sessions),
+    )
 
 
 def test_request_gate() -> None:
@@ -808,6 +1066,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="compose-mini-massive-") as name:
         directory = Path(name)
         test_request_gate()
+        test_selection_policy(directory)
+        test_pure_selection()
         test_existing_downloader(directory)
         test_manifest_contract(directory)
         test_target_rejections(directory)
