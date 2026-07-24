@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date
-from decimal import Decimal, InvalidOperation
+from datetime import date, timedelta
+from decimal import Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import hashlib
 import json
 import os
 
-from tools.fetch_massive import TICKER
+from tools.fetch_massive import (
+    API_HOST, TICKER, Requester, authorized_url,
+)
 
 POLICY_FIELDS = {
     "schema", "purpose", "declared_on", "anchor_date", "formation_start",
@@ -116,6 +119,20 @@ class Selection:
 
 
 @dataclass(frozen=True)
+class SourceArchive:
+    name: str
+    request: Mapping[str, object]
+    records: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True)
+class SourceBundle:
+    references: tuple[Reference, ...]
+    sessions: tuple[tuple[date, tuple[DailyRow, ...]], ...]
+    archives: tuple[SourceArchive, ...]
+
+
+@dataclass(frozen=True)
 class SelectionPolicy:
     schema: int
     purpose: str
@@ -202,6 +219,240 @@ def _ticker_valid(value: object) -> bool:
     )
 
 
+REFERENCE_FIELDS = (
+    "ticker", "active", "market", "locale", "type", "currency_name",
+    "primary_exchange", "composite_figi", "share_class_figi",
+)
+
+
+def reference_universe_url(anchor: date) -> str:
+    if type(anchor) is not date:
+        raise ValueError("reference date is invalid")
+    return urlunsplit((
+        "https", API_HOST, "/v3/reference/tickers",
+        urlencode({
+            "active": "true",
+            "date": str(anchor),
+            "limit": 1000,
+            "market": "stocks",
+            "order": "asc",
+            "sort": "ticker",
+            "type": "CS",
+        }),
+        "",
+    ))
+
+
+def daily_summary_url(day: date) -> str:
+    if type(day) is not date:
+        raise ValueError("daily-summary date is invalid")
+    return urlunsplit((
+        "https", API_HOST,
+        f"/v2/aggs/grouped/locale/us/market/stocks/{day}",
+        urlencode({"adjusted": "false", "include_otc": "false"}),
+        "",
+    ))
+
+
+def _public_request(url: str) -> tuple[str, dict[str, object]]:
+    authorized_url(url, "validation-only")
+    parts = urlsplit(url)
+    pairs = sorted(
+        (name, value)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+        if name != "apiKey"
+    )
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise ValueError("Massive request has duplicate query fields")
+    public = urlunsplit((
+        parts.scheme, parts.netloc, parts.path, urlencode(pairs), "",
+    ))
+    return public, {
+        "path": parts.path,
+        "query": dict(pairs),
+    }
+
+
+def _request(
+    public: str,
+    key: str,
+    requester: Requester,
+    before_request: Callable[[], None],
+) -> Mapping[str, object]:
+    before_request()
+    try:
+        payload = requester(authorized_url(public, key))
+    except Exception:
+        raise ValueError("Massive universe request failed") from None
+    if not isinstance(payload, Mapping):
+        raise ValueError("Massive returned a non-object universe response")
+    return payload
+
+
+def _results(
+    payload: Mapping[str, object],
+    name: str,
+    *,
+    allow_omitted_empty: bool = False,
+) -> list[object]:
+    if payload.get("status") != "OK":
+        raise ValueError(f"Massive returned an unsuccessful {name}")
+    results = payload.get("results")
+    count = payload.get("resultsCount")
+    if results is None and allow_omitted_empty and \
+       type(count) is int and count == 0:
+        return []
+    if not isinstance(results, list) or (
+        count is not None and (
+            type(count) is not int or count != len(results)
+        )
+    ):
+        raise ValueError(f"Massive returned an invalid {name}")
+    return results
+
+
+def _decimal_record(value: object, name: str) -> tuple[str, Decimal]:
+    if type(value) not in (int, float):
+        raise ValueError(f"Massive {name} is invalid")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"Massive {name} is invalid") from None
+    if not parsed.is_finite():
+        raise ValueError(f"Massive {name} is invalid")
+    text = format(parsed, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if parsed == 0:
+        text = "0"
+    return text, parsed
+
+
+def _reference_record(
+    value: object,
+) -> tuple[dict[str, object], Reference]:
+    if not isinstance(value, Mapping) or not _ticker_valid(value.get("ticker")):
+        raise ValueError("Massive returned an invalid reference record")
+    ticker = value["ticker"]
+    active = value.get("active")
+    if active is not None and type(active) is not bool:
+        raise ValueError("Massive returned an invalid reference record")
+    strings = tuple(value.get(name) for name in REFERENCE_FIELDS[2:])
+    if any(item is not None and not isinstance(item, str) for item in strings):
+        raise ValueError("Massive returned an invalid reference record")
+    record = {
+        "ticker": ticker,
+        "active": active,
+        **dict(zip(REFERENCE_FIELDS[2:], strings, strict=True)),
+    }
+    return record, Reference(*(record[name] for name in REFERENCE_FIELDS))
+
+
+def _daily_record(
+    value: object,
+) -> tuple[dict[str, object], DailyRow]:
+    if not isinstance(value, Mapping) or not _ticker_valid(value.get("T")):
+        raise ValueError("Massive returned an invalid daily record")
+    ticker = value["T"]
+    try:
+        values = tuple(
+            _decimal_record(value[name], name)
+            for name in ("c", "v", "vw")
+        )
+    except KeyError:
+        raise ValueError("Massive returned an invalid daily record") from None
+    record = {
+        "ticker": ticker,
+        **{
+            name: item[0]
+            for name, item in zip(("c", "v", "vw"), values, strict=True)
+        },
+    }
+    return record, DailyRow(ticker, *(item[1] for item in values))
+
+
+def fetch_sources(
+    policy: SelectionPolicy,
+    key: str,
+    requester: Requester,
+    before_request: Callable[[], None],
+) -> SourceBundle:
+    if not key or any(character.isspace() for character in key):
+        raise ValueError("Massive API key is missing or invalid")
+
+    references, archives, seen, previous = [], [], set(), ""
+    url = reference_universe_url(policy.anchor_date)
+    page = 1
+    while url:
+        public, contract = _public_request(url)
+        if public in seen:
+            raise ValueError("Massive reference pagination contains a cycle")
+        seen.add(public)
+        payload = _request(public, key, requester, before_request)
+        results = _results(payload, "reference page")
+        records = []
+        for value in results:
+            record, reference = _reference_record(value)
+            if reference.ticker <= previous:
+                raise ValueError(
+                    "Massive reference tickers are not strictly increasing"
+                )
+            previous = reference.ticker
+            records.append(record)
+            references.append(reference)
+        archives.append(SourceArchive(
+            f"tickers-{page:04d}", contract, tuple(records),
+        ))
+        next_url = payload.get("next_url", "")
+        if not isinstance(next_url, str):
+            raise ValueError("Massive returned an invalid reference next_url")
+        url, page = next_url, page + 1
+    if not references:
+        raise ValueError("Massive returned no reference candidates")
+
+    sessions = []
+    reference_tickers = {item.ticker for item in references}
+    day = policy.formation_start
+    while day <= policy.formation_end:
+        if day.weekday() < 5:
+            public, contract = _public_request(daily_summary_url(day))
+            payload = _request(public, key, requester, before_request)
+            results = _results(
+                payload, "daily summary", allow_omitted_empty=True,
+            )
+            raw_tickers = []
+            retained = []
+            for value in results:
+                if not isinstance(value, Mapping) or not _ticker_valid(
+                    value.get("T")
+                ):
+                    raise ValueError("Massive returned an invalid daily record")
+                ticker = value["T"]
+                raw_tickers.append(ticker)
+                if ticker in reference_tickers:
+                    retained.append(_daily_record(value))
+            if len(set(raw_tickers)) != len(raw_tickers):
+                raise ValueError("Massive daily tickers are not unique")
+            normalized = sorted(
+                retained,
+                key=lambda item: item[1].ticker,
+            )
+            archives.append(SourceArchive(
+                f"daily-{day}", contract,
+                tuple(record for record, _ in normalized),
+            ))
+            if results:
+                sessions.append((
+                    day, tuple(row for _, row in normalized),
+                ))
+        day += timedelta(days=1)
+    if len(sessions) < policy.minimum_formation_sessions:
+        raise ValueError("Massive returned too few formation sessions")
+    return SourceBundle(
+        tuple(references), tuple(sessions), tuple(archives),
+    )
+
+
 def _median(values: Sequence[Decimal]) -> Decimal:
     ordered = sorted(values)
     middle = len(ordered) // 2
@@ -246,8 +497,6 @@ def _formation_rows(
             if not _ticker_valid(row.ticker) or row.ticker in by_ticker:
                 raise ValueError("formation rows are invalid")
             by_ticker[row.ticker] = row
-        if not by_ticker:
-            raise ValueError("formation sessions must be nonempty")
         normalized.append(by_ticker)
     return tuple(normalized)
 
@@ -310,6 +559,15 @@ def _hash_key(policy: SelectionPolicy, candidate: Candidate) -> tuple:
 
 
 def select_candidates(
+    policy: SelectionPolicy,
+    references: Sequence[Reference],
+    sessions: Sequence[tuple[date, Sequence[DailyRow]]],
+) -> Selection:
+    with localcontext(Context(prec=64)):
+        return _select_candidates(policy, references, sessions)
+
+
+def _select_candidates(
     policy: SelectionPolicy,
     references: Sequence[Reference],
     sessions: Sequence[tuple[date, Sequence[DailyRow]]],

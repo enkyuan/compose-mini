@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Verify Massive downloads and strict universe fetching without network."""
 
-from datetime import date, datetime
-from decimal import Decimal
+from dataclasses import replace
+from datetime import date, datetime, timedelta
+from decimal import Decimal, localcontext
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, parse_qs, unquote, urlsplit
+from urllib.parse import (
+    parse_qsl, parse_qs, unquote, urlencode, urlsplit, urlunsplit,
+)
 from unittest.mock import patch
 import hashlib
 import json
@@ -30,7 +33,9 @@ from tools.fetch_universe import (
 )
 from tools.files import file_sha256, write_json
 from tools.select_universe import (
-    Candidate, DailyRow, Reference, SelectionPolicy, select_candidates,
+    Candidate, DailyRow, Reference, SelectionPolicy, SourceArchive,
+    SourceBundle, daily_summary_url, fetch_sources, reference_universe_url,
+    select_candidates,
 )
 
 
@@ -74,6 +79,12 @@ def raises(
         if isinstance(kind, tuple) else kind.__name__
     )
     raise AssertionError(f"{names} was not raised")
+
+
+def decimal_ratio(numerator: int, denominator: int) -> Decimal:
+    with localcontext() as context:
+        context.prec = 64
+        return Decimal(numerator) / Decimal(denominator)
 
 
 def selection_policy_value() -> dict[str, object]:
@@ -245,6 +256,9 @@ def test_pure_selection() -> None:
                     close = Decimal((day * 17) % 60 + 1)
                     vwap = Decimal(1)
                     volume = close * Decimal("1000000")
+                if ticker == "B4-05":
+                    volume = Decimal("1999999.9999999998")
+                    vwap = Decimal("12.5")
                 rows.append(DailyRow(ticker, close, volume, vwap))
         sessions.append((
             date.fromordinal(first.toordinal() + day), tuple(rows),
@@ -265,7 +279,7 @@ def test_pure_selection() -> None:
         item.reference.ticker: item for item in selection.candidates
     }
     assert candidates["B4-02"].observed == 59
-    assert candidates["B4-02"].coverage == Decimal(59) / Decimal(60)
+    assert candidates["B4-02"].coverage == decimal_ratio(59, 60)
     assert candidates["B4-02"].median_close == Decimal("50")
     assert candidates["B4-02"].median_dollar_volume == Decimal("30000000")
     assert candidates["B4-03"].rejection_reasons == (
@@ -273,6 +287,12 @@ def test_pure_selection() -> None:
     )
     assert candidates["B4-04"].median_close == Decimal("30.5")
     assert candidates["B4-04"].median_dollar_volume == Decimal("30500000")
+    assert candidates["B4-05"].median_dollar_volume == Decimal(
+        "24999999.99999999750"
+    )
+    assert candidates["B4-05"].rejection_reasons == (
+        "median-dollar-volume-below-minimum",
+    )
     assert candidates["B0-01"].rejection_reasons == (
         "duplicate-share-class-figi",
     )
@@ -301,6 +321,29 @@ def test_pure_selection() -> None:
         item.reference.ticker for item in selection.master
     }
 
+    missing = select_candidates(
+        policy, tuple(references),
+        (*sessions, (date(2024, 9, 30), ())),
+    )
+    missing_candidate = next(
+        item for item in missing.candidates
+        if item.reference.ticker == "B0-00"
+    )
+    assert missing_candidate.observed == 60
+    assert missing_candidate.coverage == decimal_ratio(60, 61)
+
+    with localcontext() as context:
+        context.prec = 8
+        low_precision = select_candidates(
+            policy, tuple(references), tuple(sessions),
+        )
+    with localcontext() as context:
+        context.prec = 60
+        high_precision = select_candidates(
+            policy, tuple(references), tuple(sessions),
+        )
+    assert low_precision == high_precision == repeated
+
     for stratum in range(1, 6):
         members = sorted(
             (
@@ -327,6 +370,315 @@ def test_pure_selection() -> None:
     raises(
         ValueError, select_candidates, policy, tuple(references[:55]),
         tuple(sessions),
+    )
+
+
+def source_reference(ticker: str) -> dict[str, object]:
+    return {
+        "active": True,
+        "composite_figi": f"BBG{ticker}",
+        "currency_name": "usd",
+        "locale": "us",
+        "market": "stocks",
+        "primary_exchange": "XNYS",
+        "share_class_figi": f"SC{ticker}",
+        "ticker": ticker,
+        "type": "CS",
+    }
+
+
+def source_daily(ticker: str, close: object = 10.25) -> dict[str, object]:
+    return {"T": ticker, "c": close, "v": 2_000_000, "vw": 10}
+
+
+def weekdays(start: date, end: date) -> tuple[date, ...]:
+    days = []
+    while start <= end:
+        if start.weekday() < 5:
+            days.append(start)
+        start += timedelta(days=1)
+    return tuple(days)
+
+
+def test_universe_sources() -> None:
+    policy = SelectionPolicy.read(
+        ROOT / "universes/liquid-common-ladder.example.json",
+    )
+    formation_days = weekdays(policy.formation_start, policy.formation_end)
+    empty_day = formation_days[0]
+    filtered_day = formation_days[1]
+    next_page = (
+        "https://api.massive.com/v3/reference/tickers"
+        "?apiKey=provider-value&cursor=next"
+    )
+    requested: list[str] = []
+    gated: list[int] = []
+
+    def before_request() -> None:
+        gated.append(len(requested))
+
+    def requester(url: str) -> dict[str, object]:
+        gated_index = len(requested)
+        requested.append(url)
+        assert gated[-1] == gated_index
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query))
+        assert query.pop("apiKey") == "source-secret"
+        if parts.path == "/v3/reference/tickers":
+            return (
+                {
+                    "status": "OK",
+                    "results": [
+                        source_reference("AAPL"),
+                        source_reference("MSFT"),
+                    ],
+                    "next_url": next_page,
+                }
+                if "cursor" not in query
+                else {
+                    "status": "OK",
+                    "results": [
+                        source_reference("SPY") |
+                        {"share_class_figi": None}
+                    ],
+                }
+            )
+        day = date.fromisoformat(parts.path.rsplit("/", 1)[-1])
+        assert query == {"adjusted": "false", "include_otc": "false"}
+        if day == empty_day:
+            return {"status": "OK", "resultsCount": 0}
+        if day == filtered_day:
+            return {
+                "status": "OK",
+                "resultsCount": 1,
+                "results": [{"T": "ZZZZ"}],
+            }
+        return {
+            "status": "OK",
+            "resultsCount": 3,
+            "results": [
+                {"T": "ZZZZ"},
+                source_daily("MSFT", 20.5),
+                source_daily("AAPL", 0.1 + 0.2),
+            ],
+        }
+
+    bundle = fetch_sources(
+        policy, "source-secret", requester, before_request,
+    )
+    assert isinstance(bundle, SourceBundle)
+    assert all(isinstance(item, SourceArchive) for item in bundle.archives)
+    assert tuple(item.ticker for item in bundle.references) == (
+        "AAPL", "MSFT", "SPY",
+    )
+    assert bundle.references[2].share_class_figi is None
+    assert len(bundle.sessions) == len(formation_days) - 1
+    assert empty_day not in {day for day, _ in bundle.sessions}
+    assert bundle.sessions[0] == (filtered_day, ())
+    assert all(
+        tuple(row.ticker for row in rows) == ("AAPL", "MSFT")
+        for _, rows in bundle.sessions[1:]
+    )
+    assert bundle.sessions[1][1][0].close == Decimal(
+        "0.30000000000000004"
+    )
+    assert len(requested) == len(gated) == len(formation_days) + 2
+    assert tuple(
+        date.fromisoformat(urlsplit(url).path.rsplit("/", 1)[-1])
+        for url in requested[2:]
+    ) == formation_days
+
+    first = bundle.archives[0]
+    assert first.name == "tickers-0001"
+    assert first.request == {
+        "path": "/v3/reference/tickers",
+        "query": {
+            "active": "true",
+            "date": "2024-10-31",
+            "limit": "1000",
+            "market": "stocks",
+            "order": "asc",
+            "sort": "ticker",
+            "type": "CS",
+        },
+    }
+    assert bundle.archives[1].name == "tickers-0002"
+    assert bundle.archives[2].name == f"daily-{empty_day}"
+    assert bundle.archives[2].records == ()
+    assert bundle.archives[3].name == f"daily-{filtered_day}"
+    assert bundle.archives[3].records == ()
+    populated = bundle.archives[4]
+    assert populated.records == (
+        {
+            "ticker": "AAPL",
+            "c": "0.30000000000000004",
+            "v": "2000000",
+            "vw": "10",
+        },
+        {"ticker": "MSFT", "c": "20.5", "v": "2000000", "vw": "10"},
+    )
+    for archive in bundle.archives:
+        assert tuple(archive.request["query"]) == tuple(
+            sorted(archive.request["query"])
+        )
+        value = {
+            "name": archive.name,
+            "records": archive.records,
+            "request": archive.request,
+            "schema": 1,
+        }
+        serialized = json.dumps(value, sort_keys=True)
+        assert "apiKey" not in serialized
+        assert "provider-value" not in serialized
+        assert "source-secret" not in serialized
+
+
+def test_universe_source_rejections() -> None:
+    tracked = SelectionPolicy.read(
+        ROOT / "universes/liquid-common-ladder.example.json",
+    )
+    policy = replace(
+        tracked,
+        anchor_date=tracked.formation_end,
+        formation_start=tracked.formation_end,
+        minimum_formation_sessions=1,
+    )
+    daily_ok = {
+        "status": "OK",
+        "results": [source_daily("AAPL")],
+        "resultsCount": 1,
+    }
+
+    def attempt(
+        reference: object,
+        daily: object = daily_ok,
+    ) -> BaseException:
+        def requester(url: str) -> object:
+            return (
+                reference
+                if urlsplit(url).path == "/v3/reference/tickers"
+                else daily
+            )
+
+        return raises(
+            ValueError, fetch_sources, policy, "source-secret",
+            requester, lambda: None,
+        )
+
+    for payload in (
+        [],
+        {"status": "ERROR", "results": []},
+        {"status": "OK", "results": {}},
+        {"status": "OK", "results": []},
+        {"status": "OK", "results": [{}]},
+        {
+            "status": "OK",
+            "results": [source_reference("AAPL") | {"active": 1}],
+        },
+        {
+            "status": "OK",
+            "results": [
+                source_reference("MSFT"),
+                source_reference("AAPL"),
+            ],
+        },
+        {
+            "status": "OK",
+            "results": [
+                source_reference("AAPL"),
+                source_reference("AAPL"),
+            ],
+        },
+        {
+            "status": "OK",
+            "results": [source_reference("AAPL")],
+            "next_url": 1,
+        },
+    ):
+        attempt(payload)
+
+    initial = reference_universe_url(policy.anchor_date)
+    attempt({
+        "status": "OK",
+        "results": [source_reference("AAPL")],
+        "next_url": "https://example.com/v3/reference/tickers",
+    })
+    parts = urlsplit(initial)
+    cycle = urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(
+            tuple(reversed(parse_qsl(parts.query))) +
+            (("apiKey", "different-provider-value"),)
+        ),
+        "",
+    ))
+    attempt({
+        "status": "OK",
+        "results": [source_reference("AAPL")],
+        "next_url": cycle,
+    })
+
+    reference_ok = {
+        "status": "OK",
+        "results": [source_reference("AAPL")],
+    }
+    for payload in (
+        [],
+        {"status": "ERROR", "results": []},
+        {"status": "OK", "results": {}},
+        {"status": "OK", "results": [{}]},
+        {
+            "status": "OK",
+            "results": [source_daily("AAPL"), source_daily("AAPL")],
+        },
+        {
+            "status": "OK",
+            "results": [{"T": "ZZZZ"}, {"T": "ZZZZ"}],
+        },
+        {
+            "status": "OK",
+            "results": [{"T": "AAPL"}],
+        },
+        {
+            "status": "OK",
+            "results": [source_daily("AAPL", float("nan"))],
+        },
+        {
+            "status": "OK",
+            "results": [
+                source_daily("AAPL") | {"c": True}
+            ],
+        },
+        {"status": "OK", "results": [], "resultsCount": 1},
+        {"status": "OK", "results": [], "resultsCount": False},
+        {"status": "OK", "resultsCount": 0},
+    ):
+        attempt(reference_ok, payload)
+
+    def leaking(url: str) -> object:
+        raise OSError(url)
+
+    error = raises(
+        ValueError, fetch_sources, policy, "source-secret",
+        leaking, lambda: None,
+    )
+    assert "source-secret" not in str(error)
+    for invalid_key in ("", " ", "two words"):
+        raises(
+            ValueError, fetch_sources, policy, invalid_key,
+            lambda _url: reference_ok, lambda: None,
+        )
+
+    assert reference_universe_url(policy.anchor_date) == (
+        "https://api.massive.com/v3/reference/tickers"
+        "?active=true&date=2024-10-31&limit=1000&market=stocks"
+        "&order=asc&sort=ticker&type=CS"
+    )
+    assert daily_summary_url(policy.formation_end) == (
+        "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks"
+        "/2024-10-31?adjusted=false&include_otc=false"
     )
 
 
@@ -1068,6 +1420,8 @@ def main() -> None:
         test_request_gate()
         test_selection_policy(directory)
         test_pure_selection()
+        test_universe_sources()
+        test_universe_source_rejections()
         test_existing_downloader(directory)
         test_manifest_contract(directory)
         test_target_rejections(directory)
