@@ -1,0 +1,30 @@
+{
+  "base_manifest": {
+    "path": "reports/universe-selection-20260724-06/manifests/liquid-common-55.json",
+    "sha256": "61819afe2729682180d361094793bbff0d0ba13909d04f9dbb838d5233f9e5ff"
+  },
+  "declared_on": "2026-07-24",
+  "failed_member": {
+    "master_rank": 49,
+    "stratum": 5,
+    "ticker": "ENLC"
+  },
+  "purpose": "Replace one structurally unavailable unseen member for development-only coverage.",
+  "replacement": {
+    "composite_figi": "BBG000C2LZP3",
+    "share_class_figi": "BBG001S6CZK0",
+    "ticker": "AAON"
+  },
+  "replacement_rule": "first-same-stratum-eligible-not-selected-by-within-stratum-rank",
+  "schema": 1,
+  "scope": "development-coverage-only-conditional-on-observability",
+  "selection": {
+    "path": "reports/universe-selection-20260724-06/selection.json",
+    "sha256": "9f484ca3e7f44d329179b54b9c1655957d0ad385240b59c2a569ecc76fd32737"
+  },
+  "selection_tree": {
+    "files": 77,
+    "root": "reports/universe-selection-20260724-06",
+    "sha256": "bd9366ec5b040555e8b05ae932447b01b97d57e51832c9d5503059fc9119db24"
+  }
+}

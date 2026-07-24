@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.data_v1 import FEATURE_COUNT, read_bars, read_csv
+from tools.apply_universe_coverage_overlay import (
+    apply_overlay, replacement_candidate, revised_manifest,
+)
 from tools.fetch_massive import (
     aggregate_url, api_key, authorized_url, fetch_bars, regular_bars,
     request_gate, request_json, scan_regular_bars, session_grid_audit,
@@ -2124,7 +2128,6 @@ def test_manifest_contract(directory: Path) -> None:
     value["eligibility_date"] = "2024-11-02"
     write_manifest(path, value)
     assert_manifest_error(path)
-
     top = set(manifest_value())
     for field in top:
         value = manifest_value()
@@ -2223,6 +2226,224 @@ def test_manifest_contract(directory: Path) -> None:
     assert len(tracked.series) == 11
     assert len({item.ticker for item in tracked.series}) == 11
     assert len({item.stratum for item in tracked.series}) == 11
+
+
+def test_universe_coverage_overlay(directory: Path) -> None:
+    policy_path = (
+        ROOT / "universes/liquid-common-55-coverage-v2.example.json"
+    )
+    selection_path = (
+        ROOT / "reports/universe-selection-20260724-06/selection.json"
+    )
+    base_path = (
+        ROOT / "reports/universe-selection-20260724-06/manifests/"
+        "liquid-common-55.json"
+    )
+    policy_value = json.loads(policy_path.read_bytes())
+    selection = json.loads(selection_path.read_bytes())
+    base = json.loads(base_path.read_bytes())
+    failed = next(
+        item for item in selection["candidates"] if item["ticker"] == "ENLC"
+    )
+    replacement = replacement_candidate(selection, "ENLC")
+    assert replacement["ticker"] == "AAON"
+    revised = revised_manifest(
+        base, failed, replacement,
+        purpose=policy_value["purpose"],
+        declared_on=policy_value["declared_on"],
+    )
+    assert revised["series"][:49] == base["series"][:49]
+    assert revised["series"][49] == {
+        "stratum": "liquidity-5", "ticker": "AAON",
+    }
+    assert revised["series"][50:] == base["series"][50:]
+
+    output = directory / "coverage-overlay.json"
+    assert apply_overlay(policy_path, output) == revised
+    parsed = UniverseManifest.read(output)
+    assert [item.ticker for item in parsed.series[:33]] == [
+        item["ticker"] for item in base["series"][:33]
+    ]
+    assert parsed.series[49].ticker == "AAON"
+    original = output.read_bytes()
+    raises(ValueError, apply_overlay, policy_path, output)
+    assert output.read_bytes() == original
+    nested_output = selection_path.parent / "coverage-overlay-test.json"
+    raises(ValueError, apply_overlay, policy_path, nested_output)
+    assert not os.path.lexists(nested_output)
+
+    fixture = (directory / "overlay-fixture").resolve()
+    fixture.mkdir()
+    tree = fixture / "selection-tree"
+    shutil.copytree(selection_path.parent, tree)
+    selection_copy, base_copy = (
+        tree / "selection.json", tree / "manifests/liquid-common-55.json",
+    )
+
+    def tree_binding() -> dict[str, object]:
+        entries = sorted(
+            (
+                path.relative_to(tree).as_posix(),
+                file_sha256(path),
+            )
+            for path in tree.rglob("*") if path.is_file()
+        )
+        digest = hashlib.sha256()
+        for path, sha256 in entries:
+            digest.update(
+                path.encode() + b"\0" + sha256.encode() + b"\n"
+            )
+        return {
+            "root": "selection-tree", "files": len(entries),
+            "sha256": digest.hexdigest(),
+        }
+
+    policy = json.loads(policy_path.read_bytes())
+    policy["selection"] = {
+        "path": "selection-tree/selection.json",
+        "sha256": file_sha256(selection_copy),
+    }
+    policy["base_manifest"] = {
+        "path": "selection-tree/manifests/liquid-common-55.json",
+        "sha256": file_sha256(base_copy),
+    }
+    policy["selection_tree"] = tree_binding()
+    local_policy = fixture / "policy.json"
+    write_json(local_policy, policy)
+
+    race_output = fixture / "race-output.json"
+    mutated = False
+
+    def mutate_before_publish(
+        path: Path, value: dict[str, object], **kwargs: object,
+    ) -> None:
+        nonlocal mutated
+        mutated = True
+        base_copy.write_bytes(base_copy.read_bytes() + b" ")
+        write_json_exclusive(path, value, **kwargs)
+
+    with patch(
+        "tools.apply_universe_coverage_overlay.write_json_exclusive",
+        side_effect=mutate_before_publish,
+    ):
+        raises(
+            ValueError, apply_overlay, local_policy,
+            race_output, root=fixture,
+        )
+    assert mutated
+    assert not os.path.lexists(race_output)
+    base_copy.write_bytes(base_path.read_bytes())
+
+    for name, change in (
+        ("replacement", lambda item: item["replacement"].update(
+            {"ticker": "POR"},
+        )),
+        ("wrong-stratum", lambda item: item["failed_member"].update(
+            {"stratum": 4},
+        )),
+        ("extra-field", lambda item: item.update({"metrics": {}})),
+        ("selection-hash", lambda item: item["selection"].update(
+            {"sha256": "0" * 64},
+        )),
+    ):
+        candidate = json.loads(json.dumps(policy))
+        change(candidate)
+        candidate_path = fixture / f"{name}.json"
+        write_json(candidate_path, candidate)
+        rejected_output = fixture / f"{name}-output.json"
+        raises(
+            ValueError, apply_overlay, candidate_path,
+            rejected_output, root=fixture,
+        )
+        assert not os.path.lexists(rejected_output)
+
+    changed_base = json.loads(base_copy.read_bytes())
+    changed_base["series"][0], changed_base["series"][1] = (
+        changed_base["series"][1], changed_base["series"][0]
+    )
+    write_json(base_copy, changed_base)
+    changed_selection = json.loads(selection_copy.read_bytes())
+    changed_selection["cohorts"]["55"]["manifest_sha256"] = \
+        file_sha256(base_copy)
+    write_json(selection_copy, changed_selection)
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["base_manifest"]["sha256"] = file_sha256(base_copy)
+    policy["selection_tree"] = tree_binding()
+    write_json(local_policy, policy)
+    changed_base_output = fixture / "changed-base-output.json"
+    raises(
+        ValueError, apply_overlay, local_policy,
+        changed_base_output, root=fixture,
+    )
+    assert not os.path.lexists(changed_base_output)
+    base_copy.write_bytes(base_path.read_bytes())
+    selection_copy.write_bytes(selection_path.read_bytes())
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["base_manifest"]["sha256"] = file_sha256(base_copy)
+    policy["selection_tree"] = tree_binding()
+
+    invalid_master = json.loads(selection_copy.read_bytes())
+    invalid_master["master_sha256"] = "0" * 64
+    write_json(selection_copy, invalid_master)
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["selection_tree"] = tree_binding()
+    write_json(local_policy, policy)
+    invalid_master_output = fixture / "invalid-master-output.json"
+    raises(
+        ValueError, apply_overlay, local_policy,
+        invalid_master_output, root=fixture,
+    )
+    assert not os.path.lexists(invalid_master_output)
+    selection_copy.write_bytes(selection_path.read_bytes())
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["selection_tree"] = tree_binding()
+
+    extra_selected = json.loads(selection_copy.read_bytes())
+    extra = next(
+        item for item in extra_selected["candidates"]
+        if item["ticker"] == "POR"
+    )
+    extra.update({"decision": "selected", "master_rank": 55})
+    write_json(selection_copy, extra_selected)
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["selection_tree"] = tree_binding()
+    write_json(local_policy, policy)
+    extra_selected_output = fixture / "extra-selected-output.json"
+    raises(
+        ValueError, apply_overlay, local_policy,
+        extra_selected_output, root=fixture,
+    )
+    assert not os.path.lexists(extra_selected_output)
+    selection_copy.write_bytes(selection_path.read_bytes())
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["selection_tree"] = tree_binding()
+
+    changed_selection = json.loads(selection_copy.read_bytes())
+    next(
+        item for item in changed_selection["candidates"]
+        if item["ticker"] == "AAON"
+    )["decision"] = "rejected"
+    write_json(selection_copy, changed_selection)
+    policy["selection"]["sha256"] = file_sha256(selection_copy)
+    policy["selection_tree"] = tree_binding()
+    write_json(local_policy, policy)
+    changed_selection_output = fixture / "changed-selection-output.json"
+    raises(
+        ValueError, apply_overlay, local_policy,
+        changed_selection_output, root=fixture,
+    )
+    assert not os.path.lexists(changed_selection_output)
+
+    selection_copy.unlink()
+    selection_copy.symlink_to(selection_path)
+    policy["selection"]["sha256"] = file_sha256(selection_path)
+    write_json(local_policy, policy)
+    symlink_output = fixture / "symlink-output.json"
+    raises(
+        ValueError, apply_overlay, local_policy,
+        symlink_output, root=fixture,
+    )
+    assert not os.path.lexists(symlink_output)
 
 
 def test_target_rejections(directory: Path) -> None:
@@ -3100,6 +3321,7 @@ def main() -> None:
         test_selection_cli(directory)
         test_existing_downloader(directory)
         test_manifest_contract(directory)
+        test_universe_coverage_overlay(directory)
         test_target_rejections(directory)
         test_rate_validation(directory)
         test_universe_fetch(directory)
