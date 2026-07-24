@@ -22,6 +22,7 @@ SOURCE_PATHS = (
     "tools/experiment.py",
     "tools/panel_contract.py",
     "tools/train.py",
+    "tools/chronology.py",
     "tools/artifact_v1.py",
     "tools/data_v1.py",
     "tools/session_calendar.py",

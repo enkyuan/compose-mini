@@ -32,6 +32,9 @@ from tools.data_v1 import (
     CLOSE_RETURN_TARGET, FEATURE_COUNT, TARGET_FORMULAS, TARGET_KINDS, read_bars,
 )
 from tools.backtest import experiment_fingerprint, read_policy
+from tools.chronology import (
+    holdout_split, purged_split, walk_forward_splits,
+)
 from tools.files import (
     FrozenInput, atomic_text, exclusive_text, file_sha256, freeze_inputs,
     require_disjoint, series_arg, verify_frozen, write_json,
@@ -322,34 +325,6 @@ class RollingMean(nn.Module):
                    torch.log(raw[:, 1:, 3] / raw[:, :-1, 3]))
         prediction = returns[:, -self.window:].mean(1) * self.horizon_bars
         return (prediction - self.target_mean) / self.target_scale
-
-
-def walk_forward_splits(samples: int, folds: int, fraction: float,
-                        reserved_blocks: int = 1
-                        ) -> tuple[tuple[int, int], ...]:
-    block = int(samples * fraction)
-    initial = samples - (folds + reserved_blocks) * block
-    if min(block, initial) <= 0:
-        raise ValueError("series is too short for the requested walk-forward folds")
-    return tuple((initial + fold * block, block) for fold in range(folds))
-
-
-def holdout_split(samples: int, fraction: float) -> tuple[int, int, int]:
-    block = int(samples * fraction)
-    if block <= 0 or samples - 2 * block <= 0:
-        raise ValueError("series is too short for validation and test holdouts")
-    return samples - 2 * block, block, block
-
-
-def purged_split(split: tuple[int, ...], gap: int,
-                 preserve_last: bool = True) -> tuple[int, ...]:
-    """Remove boundary labels whose horizons overlap the following split."""
-    purge_count = len(split) - int(preserve_last)
-    result = tuple(count - gap if index < purge_count else count
-                   for index, count in enumerate(split))
-    if min(result) <= 0:
-        raise ValueError("series blocks must exceed the horizon embargo")
-    return result
 
 
 def _label_available(
