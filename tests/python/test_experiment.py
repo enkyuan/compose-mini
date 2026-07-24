@@ -26,19 +26,21 @@ except ModuleNotFoundError as error:
 from tools.experiment import (
     PANEL_MODEL_SET, Candidate, ConstantReturn, RollingMean,
     SeriesTransformer, Sweep, _authorize_test, _boundary, _candidate_data,
-    _fit_neural, _label_available, _matrix, _model_fingerprint, _panel_data,
-    _panel_selected_epochs, _prediction_records, _run_experiment,
-    _selected_epochs, _SeriesDataset, _verify_test_state, expected_runs,
-    holdout_split, linear_model, purged_split, run_experiment,
-    select_candidates, walk_forward_splits, write_predictions, write_report,
+    _fit_neural, _fit_panel_epochs, _fit_panel_updates, _label_available,
+    _macro_validation_loss, _matrix, _model_fingerprint, _panel_data,
+    _panel_members, _panel_selected_epochs, _prediction_records,
+    _run_experiment, _selected_epochs, _SeriesDataset, _stock_uniform_loader,
+    _stock_uniform_weights, _verify_test_state, expected_runs, holdout_split,
+    linear_model, purged_split, run_experiment, select_candidates,
+    walk_forward_splits, write_predictions, write_report,
 )
 from tools.backtest import Forecast, experiment_fingerprint, validate_policy
 from tools.data_v1 import (
     CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET, read_bars,
 )
 from tools.train import (
-    ForecastTransformer, TrainingData, Windows, data_loaders, evaluate,
-    feature_lookback, feature_values, fit_epochs, prepare_data,
+    DataSplits, ForecastTransformer, TrainingData, Windows, data_loaders,
+    evaluate, feature_lookback, feature_values, fit_epochs, prepare_data,
 )
 from tools.files import file_sha256
 from tools.panel_contract import (
@@ -906,6 +908,108 @@ def verify_series_conditioning() -> None:
     assert not torch.equal(changed[1], plain[1])
 
 
+def verify_stock_macro_training() -> None:
+    def dataset(targets: tuple[float, ...], marker: float) -> object:
+        count = len(targets)
+        return torch.utils.data.TensorDataset(
+            torch.full((count, 3, 5), marker),
+            torch.tensor(targets), torch.ones(count), torch.ones(count),
+        )
+
+    members = (
+        DataSplits(dataset((0.0, 0.0), 0.0), dataset((1.0,), 0.0),
+                   dataset((0.0,), 0.0)),
+        DataSplits(dataset((1.0,) * 6, 1.0), dataset((3.0,) * 3, 1.0),
+                   dataset((0.0,), 1.0)),
+    )
+    weights = _stock_uniform_weights(members)
+    torch.testing.assert_close(weights[:2].sum(), weights[2:].sum())
+    assert weights[:2].sum() == 1.0
+
+    first = _stock_uniform_loader(members, 4, 32, 7, drop_last=True)
+    second = _stock_uniform_loader(members, 4, 32, 7, drop_last=True)
+    assert len(first) == len(second) == 8
+    assert [
+        batch[1].tolist() for batch in first
+    ] == [
+        batch[1].tolist() for batch in second
+    ]
+    conditioned = _panel_members(members, conditioned=True)
+    torch.testing.assert_close(
+        _stock_uniform_weights(conditioned), weights,
+    )
+
+    class Zero(torch.nn.Module):
+        def forward(self, values: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(len(values))
+
+    assert _macro_validation_loss(
+        Zero(), members, 2, torch.device("cpu"),
+    ) == 5.0
+    empty = DataSplits(
+        dataset((), 0.0), dataset((0.0,), 0.0), dataset((0.0,), 0.0),
+    )
+    try:
+        _stock_uniform_weights((empty, members[1]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an empty stock received sampling weight")
+    missing_validation = DataSplits(
+        dataset((0.0,), 0.0), dataset((), 0.0), dataset((0.0,), 0.0),
+    )
+    try:
+        _macro_validation_loss(
+            Zero(), (missing_validation, members[1]), 2,
+            torch.device("cpu"),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an incomplete validation cohort was accepted")
+
+    equal = (
+        DataSplits(dataset((0.0, 1.0), 0.0), dataset((0.0,), 0.0),
+                   dataset((0.0,), 0.0)),
+        DataSplits(dataset((2.0, 3.0), 1.0), dataset((0.0,), 1.0),
+                   dataset((0.0,), 1.0)),
+    )
+    epoch = _stock_uniform_loader(equal, 2, 4, 7)
+    assert not epoch.sampler.replacement
+    assert sorted(
+        target for batch in epoch for target in batch[1].tolist()
+    ) == [0.0, 1.0, 2.0, 3.0]
+
+    selected = candidate("macro", 3)
+    sweep = Sweep(
+        (selected,), ("panel_transformer",), (7,), 1, 0.2, 3, 2, 4,
+    )
+    with patch("tools.experiment.fit_updates") as updates:
+        updates.return_value = object()
+        _, fit = _fit_panel_updates(
+            "panel_transformer", selected, members, sweep, 7, 2,
+            torch.device("cpu"),
+        )
+        assert fit is updates.return_value
+        assert len(updates.call_args.args[1]) == 6
+        assert updates.call_args.args[3:5] == (3, 2)
+        assert updates.call_args.args[2]() == _macro_validation_loss(
+            updates.call_args.args[0], members, 4, torch.device("cpu"),
+        )
+    with patch("tools.experiment.fit_model") as epochs:
+        epochs.return_value = (object(), (object(), object(), object()))
+        _, fit, loaders = _fit_panel_epochs(
+            "panel_transformer", selected, members, sweep, 7,
+            torch.device("cpu"),
+        )
+        assert fit is epochs.return_value[0] and loaders == epochs.return_value[1]
+        options = epochs.call_args.kwargs
+        assert len(options["train_loader"].sampler) == 8
+        assert options["validation_loss"]() == _macro_validation_loss(
+            epochs.call_args.args[0], members, 4, torch.device("cpu"),
+        )
+
+
 def verify_panel_orchestration() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-source-tree-", dir=ROOT,
@@ -1492,6 +1596,7 @@ def main() -> None:
     assert purged_split((12, 4, 4), 2) == (10, 2, 4)
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
     verify_series_conditioning()
+    verify_stock_macro_training()
     verify_panel_orchestration()
     verify_universe_contract(ROOT)
     verify_selection_is_validation_only()

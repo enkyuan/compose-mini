@@ -46,6 +46,29 @@ class Coverage:
         return not self.missing
 
 
+@dataclass(frozen=True, slots=True)
+class UpdateBudget:
+    control_samples: int
+    batch_size: int
+    checkpoints: int
+    updates_per_checkpoint: int
+    total_updates: int
+
+
+def fixed_update_budget(
+    control_samples: int, batch_size: int, checkpoints: int,
+) -> UpdateBudget:
+    """Derive one cohort-invariant optimizer budget from the control rows."""
+    values = (control_samples, batch_size, checkpoints)
+    if any(type(value) is not int or value < 1 for value in values):
+        raise ValueError("update budget values must be positive integers")
+    updates = (control_samples + batch_size - 1) // batch_size
+    return UpdateBudget(
+        control_samples, batch_size, checkpoints, updates,
+        checkpoints * updates,
+    )
+
+
 def common_calendar(
     opportunities: int, folds: int, fraction: float, embargo: int,
 ) -> CalendarBlocks:

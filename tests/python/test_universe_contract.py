@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 from tools.chronology import IndexRange
 from tools.session_samples import SampleRows
 from tools.universe_contract import (
-    common_calendar, coverage, pack_rows, universe_roles,
+    common_calendar, coverage, fixed_update_budget, pack_rows, universe_roles,
 )
 
 
@@ -35,6 +35,19 @@ def test_fixed_blocks() -> None:
     )
     for arguments in ((True, 2, 0.1, 12), (20, 2, 1.0, 2), (20, 2, 0.2, -1)):
         raises(common_calendar, *arguments)
+
+
+def test_fixed_update_budget() -> None:
+    budgets = tuple(
+        fixed_update_budget(samples, 128, 100)
+        for samples in (34_992, 41_042, 47_092)
+    )
+    assert tuple(item.updates_per_checkpoint for item in budgets) == \
+        (274, 321, 368)
+    assert tuple(item.total_updates for item in budgets) == \
+        (27_400, 32_100, 36_800)
+    for arguments in ((0, 128, 100), (10, True, 100), (10, 128, 0)):
+        raises(fixed_update_budget, *arguments)
 
 
 def test_sparse_rows() -> None:
@@ -83,6 +96,7 @@ def test_roles_and_coverage() -> None:
 
 def main() -> None:
     test_fixed_blocks()
+    test_fixed_update_budget()
     test_sparse_rows()
     test_roles_and_coverage()
     print("universe contract tests passed")

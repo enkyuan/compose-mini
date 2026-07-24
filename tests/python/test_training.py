@@ -27,8 +27,8 @@ from tools.reference import predict_windows
 from tools.session_samples import SampleRows
 from tools.train import (
     DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
-    evaluate, feature_values, fit_epochs, fit_model, mean_loss, parse_args,
-    prepare_data, prepare_rows, train as train_model, train_epoch,
+    evaluate, feature_values, fit_epochs, fit_model, fit_updates, mean_loss,
+    parse_args, prepare_data, prepare_rows, train as train_model, train_epoch,
 )
 
 
@@ -191,6 +191,81 @@ def verify_fixed_epochs(csv: Path) -> None:
     )
     assert len(loaders) == 3
     assert all(torch.isfinite(value).all() for value in model.state_dict().values())
+
+
+def verify_fixed_updates() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    batches = DataLoader(
+        tuple((torch.zeros(1), torch.zeros(()), 0.0, 0.0) for _ in range(6)),
+        batch_size=1,
+    )
+    step = 0
+
+    def train_batch(model, *_args) -> tuple[float, int]:
+        nonlocal step
+        step += 1
+        with torch.no_grad():
+            model.weight.fill_(step)
+        return float(step), 1
+
+    losses = iter((3.0, 1.0, 2.0))
+    with patch("tools.train._train_batch", side_effect=train_batch):
+        fit = fit_updates(
+            model, batches, lambda: next(losses), 3, 2, 3e-4, 1e-4,
+            torch.device("cpu"),
+        )
+    assert fit.best_checkpoint == 2
+    assert fit.updates_trained == step == 6
+    assert torch.equal(model.weight, torch.full_like(model.weight, 4.0))
+    try:
+        fit_updates(
+            model, batches, lambda: 0.0, 2, 2, 3e-4, 1e-4,
+            torch.device("cpu"),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mismatched fixed-update loader was accepted")
+    with patch("tools.train._train_batch", return_value=(0.0, 1)):
+        try:
+            fit_updates(
+                model, DataLoader(batches.dataset, batch_size=1),
+                lambda: math.nan, 1, 6, 3e-4, 1e-4,
+                torch.device("cpu"),
+            )
+        except FloatingPointError:
+            pass
+        else:
+            raise AssertionError("non-finite fixed-update validation was accepted")
+
+
+def verify_sampled_epoch_mean() -> None:
+    class Samples(Dataset):
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+            return (
+                torch.ones(1), torch.tensor((1.0, 3.0)[index]),
+                torch.ones(()), torch.ones(()),
+            )
+
+    class Scalar(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, values: torch.Tensor) -> torch.Tensor:
+            return values.squeeze(-1) * self.weight
+
+    model = Scalar()
+    loader = DataLoader(Samples(), batch_size=2, sampler=(1, 1, 1, 1))
+    assert mean_loss(model, loader, torch.device("cpu")) == 9.0
+    loss = train_epoch(
+        model, loader, torch.optim.SGD(model.parameters(), lr=0.0),
+        torch.device("cpu"),
+    )
+    assert loss == 9.0
 
 
 def verify_data_splits(csv: Path) -> None:
@@ -374,6 +449,8 @@ def main() -> None:
         verify_data_splits(Path(directory) / "training.csv")
         verify_indexed_windows(Path(directory) / "training.csv")
         verify_fixed_epochs(Path(directory) / "training.csv")
+        verify_fixed_updates()
+        verify_sampled_epoch_mean()
         verify_conditioned_batches()
     print("training and export tests passed "
           f"(fixture {distance} ULP, trained maximum {trained_distance} ULP)")

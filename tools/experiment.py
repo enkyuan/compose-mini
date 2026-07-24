@@ -23,7 +23,9 @@ sys.path.insert(0, str(ROOT))
 try:
     import torch
     from torch import nn
-    from torch.utils.data import ConcatDataset, Dataset
+    from torch.utils.data import (
+        ConcatDataset, DataLoader, Dataset, WeightedRandomSampler,
+    )
 except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
 
@@ -47,8 +49,8 @@ from tools.panel_contract import (
 from tools.session_samples import SampleRows
 from tools.train import (
     FEATURE_NAMES, FEATURE_SETS, DataSplits, Fit, ForecastTransformer,
-    TrainingData, Windows, data_loaders, evaluate, feature_lookback, fit_epochs,
-    fit_model, mean_loss, prepare_rows,
+    TrainingData, UpdateFit, Windows, data_loaders, evaluate, feature_lookback,
+    fit_epochs, fit_model, fit_updates, mean_loss, prepare_rows,
 )
 
 PANEL_MODELS = ("panel_transformer", "conditioned_panel_transformer")
@@ -576,19 +578,134 @@ def _conditioned(data: DataSplits, series_id: int) -> DataSplits:
     ))
 
 
-def _panel_data(
-    members: Sequence[TrainingData], conditioned: bool = False,
-) -> DataSplits:
+def _panel_members(
+    members: Sequence[DataSplits], conditioned: bool = False,
+) -> tuple[DataSplits, ...]:
     if not members:
         raise ValueError("panel data requires at least one series")
-    splits = [
+    return tuple(
         _conditioned(member, series_id) if conditioned else member
         for series_id, member in enumerate(members)
-    ]
+    )
+
+
+def _panel_data(
+    members: Sequence[DataSplits], conditioned: bool = False,
+) -> DataSplits:
+    splits = _panel_members(members, conditioned)
     return DataSplits(*(
         ConcatDataset([getattr(member, name) for member in splits])
         for name in ("train", "validation", "test")
     ))
+
+
+def _stock_uniform_weights(members: Sequence[DataSplits]) -> torch.Tensor:
+    """Give every stock one unit of total sampling weight."""
+    lengths = tuple(len(member.train) for member in members)
+    if not lengths or min(lengths) < 1:
+        raise ValueError("stock-uniform training requires nonempty series")
+    return torch.cat(tuple(
+        torch.full((length,), 1.0 / length, dtype=torch.double)
+        for length in lengths
+    ))
+
+
+def _stock_uniform_loader(
+    members: Sequence[DataSplits], batch_size: int, samples: int, seed: int,
+    *, drop_last: bool = False,
+) -> DataLoader:
+    _integer(batch_size, "batch_size")
+    _integer(samples, "samples")
+    datasets = tuple(member.train for member in members)
+    lengths = tuple(map(len, datasets))
+    generator = torch.Generator().manual_seed(seed)
+    if lengths and len(set(lengths)) == 1 and \
+       samples == sum(lengths) and not drop_last:
+        return DataLoader(
+            ConcatDataset(datasets), batch_size, shuffle=True,
+            generator=generator,
+        )
+    sampler = WeightedRandomSampler(
+        _stock_uniform_weights(members), samples, True,
+        generator=generator,
+    )
+    return DataLoader(
+        ConcatDataset(datasets),
+        batch_size, sampler=sampler, drop_last=drop_last,
+    )
+
+
+def _macro_validation_loss(
+    model: nn.Module, members: Sequence[DataSplits], batch_size: int,
+    device: torch.device,
+) -> float:
+    """Average complete per-stock validation means without row weighting."""
+    datasets = tuple(member.validation for member in members)
+    if not datasets or any(not len(dataset) for dataset in datasets):
+        raise ValueError("macro validation requires every bound stock")
+    return fmean(
+        mean_loss(model, DataLoader(dataset, batch_size), device)
+        for dataset in datasets
+    )
+
+
+def _fit_panel_updates(
+    model_name: str, candidate: Candidate, members: Sequence[TrainingData],
+    sweep: Sweep, seed: int, updates_per_checkpoint: int,
+    device: torch.device,
+) -> tuple[nn.Module, UpdateFit]:
+    """Fit one shared model with stock-macro sampling and a fixed budget."""
+    if model_name not in PANEL_MODEL_SET:
+        raise ValueError("fixed-update fitting requires a panel model")
+    conditioned = model_name == "conditioned_panel_transformer"
+    splits = _panel_members(members, conditioned)
+    torch.manual_seed(seed)
+    model = _neural_model(model_name, candidate, len(splits)).to(device)
+    loader = _stock_uniform_loader(
+        splits, sweep.batch_size,
+        sweep.batch_size * sweep.epochs * updates_per_checkpoint, seed,
+        drop_last=True,
+    )
+    fit = fit_updates(
+        model, loader,
+        lambda: _macro_validation_loss(
+            model, splits, sweep.batch_size, device,
+        ),
+        sweep.epochs, updates_per_checkpoint, candidate.learning_rate,
+        candidate.weight_decay, device,
+    )
+    return model, fit
+
+
+def _fit_panel_epochs(
+    model_name: str, candidate: Candidate, members: Sequence[TrainingData],
+    sweep: Sweep, seed: int, device: torch.device,
+) -> tuple[nn.Module, Fit, tuple[DataLoader, ...]]:
+    """Fit the secondary fixed-epoch curve with the same stock-macro objective."""
+    if model_name not in PANEL_MODEL_SET:
+        raise ValueError("fixed-epoch fitting requires a panel model")
+    splits = _panel_members(
+        members, model_name == "conditioned_panel_transformer",
+    )
+    pooled = DataSplits(*(
+        ConcatDataset([getattr(member, name) for member in splits])
+        for name in ("train", "validation", "test")
+    ))
+    torch.manual_seed(seed)
+    model = _neural_model(model_name, candidate, len(splits)).to(device)
+    loader = _stock_uniform_loader(
+        splits, sweep.batch_size, sum(len(member.train) for member in splits),
+        seed,
+    )
+    fit, loaders = fit_model(
+        model, pooled, sweep.batch_size, sweep.epochs, sweep.patience,
+        candidate.learning_rate, candidate.weight_decay, seed, device,
+        train_loader=loader,
+        validation_loss=lambda: _macro_validation_loss(
+            model, splits, sweep.batch_size, device,
+        ),
+    )
+    return model, fit, loaders
 
 
 def _means(records: Sequence[Mapping[str, object]],

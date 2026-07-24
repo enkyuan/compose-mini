@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import argparse
@@ -218,6 +218,13 @@ class Fit:
     epochs_trained: int
 
 
+@dataclass(frozen=True)
+class UpdateFit:
+    best_validation_scaled_mse: float
+    best_checkpoint: int
+    updates_trained: int
+
+
 def _model_output(model: nn.Module,
                   values: torch.Tensor | Sequence[torch.Tensor],
                   device: torch.device) -> torch.Tensor:
@@ -225,31 +232,53 @@ def _model_output(model: nn.Module,
     return model(*(item.to(device) for item in inputs))
 
 
+def _snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in model.state_dict().items()
+    }
+
+
 def mean_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
-    total = 0.0
+    total, count = 0.0, 0
     with torch.no_grad():
         for features, targets, *_ in loader:
             loss = F.mse_loss(_model_output(model, features, device),
                               targets.to(device), reduction="sum")
             total += loss.item()
-    return total / len(loader.dataset)
+            count += len(targets)
+    if not count:
+        raise ValueError("loss loader is empty")
+    return total / count
+
+
+def _train_batch(
+    model: nn.Module, batch: Sequence[object],
+    optimizer: torch.optim.Optimizer, device: torch.device,
+) -> tuple[float, int]:
+    features, targets, *_ = batch
+    targets = targets.to(device)
+    optimizer.zero_grad(set_to_none=True)
+    loss = F.mse_loss(_model_output(model, features, device), targets)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("training produced a non-finite loss")
+    loss.backward()
+    optimizer.step()
+    count = len(targets)
+    return loss.item() * count, count
 
 
 def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
                 device: torch.device) -> float:
     model.train()
-    total = 0.0
-    for features, targets, *_ in loader:
-        targets = targets.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        loss = F.mse_loss(_model_output(model, features, device), targets)
-        if not torch.isfinite(loss):
-            raise FloatingPointError("training produced a non-finite loss")
-        loss.backward()
-        optimizer.step()
-        total += loss.item() * len(targets)
-    return total / len(loader.dataset)
+    total, count = 0.0, 0
+    for batch in loader:
+        loss, samples = _train_batch(model, batch, optimizer, device)
+        total, count = total + loss, count + samples
+    if not count:
+        raise ValueError("training loader is empty")
+    return total / count
 
 
 def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
@@ -548,24 +577,31 @@ def fit_epochs(model: nn.Module, data: DataSplits, batch_size: int,
 def fit_model(model: nn.Module, data: DataSplits, batch_size: int,
               epochs: int, patience: int, learning_rate: float,
               weight_decay: float, seed: int, device: torch.device,
-              log_epochs: bool = False) -> tuple[Fit, tuple[DataLoader, ...]]:
+              log_epochs: bool = False, *,
+              train_loader: DataLoader | None = None,
+              validation_loss: Callable[[], float] | None = None,
+              ) -> tuple[Fit, tuple[DataLoader, ...]]:
     """Fit and restore the checkpoint selected by chronological validation loss."""
     loaders = data_loaders(data, batch_size, seed)
+    if train_loader is not None:
+        loaders = (train_loader, *loaders[1:])
+    validate = validation_loss if validation_loss is not None else (
+        lambda: mean_loss(model, loaders[1], device)
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                   weight_decay=weight_decay)
     best_loss, best_state, best_epoch, stale = math.inf, None, 0, 0
     for epoch in range(1, epochs + 1):
         training_loss = train_epoch(model, loaders[0], optimizer, device)
-        validation_loss = mean_loss(model, loaders[1], device)
-        if not math.isfinite(training_loss) or not math.isfinite(validation_loss):
+        observed = float(validate())
+        if not math.isfinite(training_loss) or not math.isfinite(observed):
             raise FloatingPointError(f"epoch {epoch} produced a non-finite loss")
         if log_epochs:
-            print(f"epoch={epoch} train={training_loss:.6g} val={validation_loss:.6g}",
+            print(f"epoch={epoch} train={training_loss:.6g} val={observed:.6g}",
                   file=sys.stderr)
-        if validation_loss < best_loss:
-            best_loss, best_epoch, stale = validation_loss, epoch, 0
-            best_state = {name: value.detach().cpu().clone()
-                          for name, value in model.state_dict().items()}
+        if observed < best_loss:
+            best_loss, best_epoch, stale = observed, epoch, 0
+            best_state = _snapshot(model)
         else:
             stale += 1
             if stale == patience:
@@ -574,6 +610,57 @@ def fit_model(model: nn.Module, data: DataSplits, batch_size: int,
         raise FloatingPointError("training did not produce a finite validation checkpoint")
     model.load_state_dict(best_state)
     return Fit(best_loss, best_epoch, epoch), loaders
+
+
+def fit_updates(
+    model: nn.Module, loader: DataLoader, validation_loss: Callable[[], float],
+    checkpoints: int, updates_per_checkpoint: int, learning_rate: float,
+    weight_decay: float, device: torch.device,
+    log_checkpoints: bool = False,
+) -> UpdateFit:
+    """Run an exact update budget and restore the best validation checkpoint."""
+    if type(checkpoints) is not int or type(updates_per_checkpoint) is not int or \
+       min(checkpoints, updates_per_checkpoint) < 1 or \
+       len(loader) != checkpoints * updates_per_checkpoint:
+        raise ValueError("fixed-update loader does not match its budget")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay,
+    )
+    batches = iter(loader)
+    best_loss, best_state, best_checkpoint = math.inf, None, 0
+    for checkpoint in range(1, checkpoints + 1):
+        model.train()
+        total, count = 0.0, 0
+        for _ in range(updates_per_checkpoint):
+            try:
+                batch = next(batches)
+            except StopIteration as error:
+                raise ValueError(
+                    "fixed-update loader ended before its budget"
+                ) from error
+            loss, samples = _train_batch(model, batch, optimizer, device)
+            total, count = total + loss, count + samples
+        observed = float(validation_loss())
+        if not count or not math.isfinite(total) or not math.isfinite(observed):
+            raise FloatingPointError(
+                f"checkpoint {checkpoint} produced a non-finite loss"
+            )
+        if log_checkpoints:
+            print(
+                f"checkpoint={checkpoint} train={total / count:.6g} "
+                f"val={observed:.6g}", file=sys.stderr,
+            )
+        if observed < best_loss:
+            best_loss, best_checkpoint = observed, checkpoint
+            best_state = _snapshot(model)
+    if best_state is None:
+        raise FloatingPointError(
+            "training did not produce a finite validation checkpoint"
+        )
+    model.load_state_dict(best_state)
+    return UpdateFit(
+        best_loss, best_checkpoint, checkpoints * updates_per_checkpoint,
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
