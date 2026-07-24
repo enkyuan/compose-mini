@@ -1,0 +1,53 @@
+{
+  "attempt": {
+    "path": "experiments/executable-h13-conditioned-panel-attempt.json",
+    "run_id": "h13-conditioned-panel-20260724-01",
+    "sha256": "22f802ade058d33a6c1c50c2062486a62cc9e7923794f9b9ced9ce51d02ddda7"
+  },
+  "ended": "2026-07-24T10:13:43Z",
+  "exit": 2,
+  "integrity": {
+    "broader": {
+      "baseline_ledger": true,
+      "baseline_report": true,
+      "config": true,
+      "input_manifest": true,
+      "series": true,
+      "source_tree": true,
+      "torch_package_tree": true,
+      "torch_python": true,
+      "uv": true
+    },
+    "primary_python": {
+      "path": "/Users/Enkang.Yuan1/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3.12",
+      "sha256": "eb9d74b9c7cfdfb2c9b91614edb2c3607360ba46c5aa7fc4557b3a4a23e97cff"
+    },
+    "trusted_finalizer_tree": "0bbd2244c27b0260b904df4682d6429d8aba1676791fbdcd3df668c8b1f08b25"
+  },
+  "outputs": {
+    "analysis_report": {
+      "path": "reports/h13-conditioned-panel-20260724-01/analysis.json",
+      "sha256": null,
+      "state": "absent"
+    },
+    "calibration_ledger": {
+      "path": "reports/h13-conditioned-panel-20260724-01/calibration.jsonl",
+      "sha256": "04575ee2ef517e29b523e888ea4099ca5d0dee4e915d373e71440b8197ed48aa",
+      "state": "present"
+    },
+    "experiment_report": {
+      "path": "reports/h13-conditioned-panel-20260724-01/experiment.json",
+      "sha256": "79de195a7cbcb1e139cef6181261f3b36c188bdc842a0fd18c88c592357a1940",
+      "state": "present"
+    },
+    "outcome": {
+      "path": "experiments/executable-h13-conditioned-panel-outcome.json",
+      "sha256": null,
+      "state": "absent"
+    }
+  },
+  "schema": 1,
+  "stage": "analysis",
+  "started": "2026-07-24T10:05:02Z",
+  "status": "analysis-integrity-failure"
+}
