@@ -718,11 +718,12 @@ def _require_exact(
 
 
 def _require_regrouped(
-    actual: float, expected: float, label: str,
+    actual: float, expected: float, label: str, *operands: float,
 ) -> None:
     relation = lambda value: (value > 0.0) - (value < 0.0)
+    scale = operands or (actual, expected)
     if relation(actual) != relation(expected) or abs(actual - expected) > \
-            4 * max(math.ulp(actual), math.ulp(expected)):
+            4 * max(math.ulp(value) for value in scale):
         raise ValueError(f"{label} is inconsistent")
 
 
@@ -785,15 +786,17 @@ def _comparison_analysis(
     by_fold = _axis(paired["by_fold"], ("0", "1"), 15, "paired.by_fold")
     seed_keys = tuple(str(seed) for seed in SEEDS)
     by_seed = _axis(paired["by_seed"], seed_keys, 6, "paired.by_seed")
+    candidate_validation = float(validation_macro[profile.candidate])
     reference_validation = float(validation_macro[profile.reference])
     if reference_validation <= 0.0 or relative != 1.0 - \
-            float(validation_macro[profile.candidate]) / reference_validation:
+            candidate_validation / reference_validation:
         raise ValueError("validation relative improvement is inconsistent")
     mean_delta = float(paired["mean_delta"])
     _require_regrouped(
         mean_delta,
-        float(validation_macro[profile.candidate]) - reference_validation,
+        candidate_validation - reference_validation,
         "paired mean delta",
+        candidate_validation, reference_validation,
     )
     for label, axis in (
         ("stock", by_stock), ("fold", by_fold), ("seed", by_seed),

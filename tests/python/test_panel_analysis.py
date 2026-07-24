@@ -2363,6 +2363,104 @@ def verify_comparison_gate_boundaries(
         )["calibration_close_mae"]["pass"]
 
 
+def verify_comparison_regrouping_roundoff(
+    analysis: Mapping[str, object],
+) -> None:
+    pairs = (
+        (0.009689836893789765, 0.00976980749464713),
+        (0.010374686352637896, 0.010491816353458928),
+        (0.00977292595693097, 0.00981728160550809),
+        (0.009872231061613014, 0.00987490630262836),
+        (0.009654324295773137, 0.009649827299524823),
+        (0.011693752584110881, 0.011685663113285203),
+        (0.011790064556338777, 0.011790637815544767),
+        (0.011698099485882463, 0.01170756306505128),
+        (0.011921406168884952, 0.011919094864602714),
+        (0.011641670742306098, 0.011625686151344818),
+        (0.009717350604974829, 0.009733508548465386),
+        (0.009664622245806654, 0.009697555742369256),
+        (0.0097291179554534, 0.009737850930453477),
+        (0.009805062747491291, 0.009805331580446795),
+        (0.009803757660008532, 0.009807483844847475),
+        (0.014960602467282312, 0.014944458836439474),
+        (0.014907927215570145, 0.01491413457322083),
+        (0.014871945878340734, 0.014865885037004853),
+        (0.014804744889950865, 0.014805961370844788),
+        (0.014645993992050677, 0.014651577996228356),
+        (0.006153843979134944, 0.006131400617566342),
+        (0.006218777542807291, 0.0062325867054775054),
+        (0.0060884090961438216, 0.006076828233815294),
+        (0.006279149562073357, 0.006282521132232642),
+        (0.006034795236060216, 0.006032582001663497),
+        (0.0054812137549522365, 0.005465072007352518),
+        (0.00561968268941364, 0.005612997929631817),
+        (0.005540772731081946, 0.005529092857246338),
+        (0.00556988399740644, 0.005573301424535718),
+        (0.005428773249495086, 0.005439464891503019),
+    )
+    records = [
+        {"model": model, "metrics": {"return_mae": 0.02}}
+        for model in LOCAL_MODELS
+    ]
+    keys = (
+        (stock, fold, seed)
+        for stock in SERIES for fold in range(2) for seed in SEEDS
+    )
+    for (reference, candidate), (stock, fold, seed) in zip(
+        pairs, keys, strict=True,
+    ):
+        records.extend((
+            {
+                "model": COMPARISON_PROFILE.reference,
+                "series": stock, "fold": fold, "seed": seed,
+                "metrics": {"return_mae": reference},
+            },
+            {
+                "model": COMPARISON_PROFILE.candidate,
+                "series": stock, "fold": fold, "seed": seed,
+                "metrics": {"return_mae": candidate},
+            },
+        ))
+    validation = panel_analysis._validation_metrics(
+        records, COMPARISON_PROFILE,
+    )
+    macro = validation["macro_return_mae"]
+    paired = validation["paired_candidate_minus_reference"]
+    macro_delta = macro[COMPARISON_PROFILE.candidate] - \
+        macro[COMPARISON_PROFILE.reference]
+    assert paired["mean_delta"] == 7.881824439170873e-06
+    assert macro_delta == 7.881824439169224e-06
+    assert abs(paired["mean_delta"] - macro_delta) > 4 * max(
+        math.ulp(paired["mean_delta"]), math.ulp(macro_delta),
+    )
+
+    value = deepcopy(analysis)
+    value["validation"] = validation
+    value["gates"] = panel_gates(
+        validation, value["calibration"], COMPARISON_PROFILE,
+    )
+    value["status"] = (
+        "pass" if value["gates"]["all_pass"] else "gate-failure"
+    )
+    validate_panel_analysis(value, COMPARISON_PROFILE)
+
+    forged = deepcopy(value)
+    forged_paired = forged["validation"]["paired_candidate_minus_reference"]
+    forged_offset = 8 * max(
+        math.ulp(macro[COMPARISON_PROFILE.candidate]),
+        math.ulp(macro[COMPARISON_PROFILE.reference]),
+    )
+    forged_paired["mean_delta"] += forged_offset
+    for axis in ("by_stock", "by_fold", "by_seed"):
+        for item in forged_paired[axis].values():
+            for field in ("mean", "minimum", "maximum"):
+                item[field] += forged_offset
+    forged["gates"] = panel_gates(
+        forged["validation"], forged["calibration"], COMPARISON_PROFILE,
+    )
+    rejects(lambda: validate_panel_analysis(forged, COMPARISON_PROFILE))
+
+
 def verify_bootstrap_boundaries() -> None:
     class StubRandom:
         def __init__(self, starts: list[int]) -> None:
@@ -2947,6 +3045,7 @@ def verify_comparison_semantics() -> None:
                 block[name] for block in bootstrap["by_block_rows"].values()
             )
         assert analysis["gates"]["all_pass"]
+        verify_comparison_regrouping_roundoff(analysis)
         verify_comparison_gate_boundaries(analysis)
         assert fixture.finalize("pass")["status"] == "pass"
 
