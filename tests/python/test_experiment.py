@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Verify walk-forward selection, aligned targets, baselines, and JSON reports."""
 
-from collections.abc import Callable, Mapping
-from dataclasses import replace
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import hashlib
 import math
+import os
 import sys
 import tempfile
 from unittest.mock import patch
@@ -21,9 +24,11 @@ except ModuleNotFoundError as error:
 
 from tools.experiment import (
     Candidate, ConstantReturn, RollingMean, Sweep, _authorize_test,
-    _candidate_data, _model_fingerprint, _selected_epochs, _verify_test_state,
-    expected_runs, holdout_split, linear_model, purged_split, run_experiment,
-    select_candidates, walk_forward_splits, write_predictions, write_report,
+    _candidate_data, _fit_neural, _label_available, _model_fingerprint,
+    _panel_data, _panel_selected_epochs, _run_experiment, _selected_epochs,
+    _verify_test_state, expected_runs, holdout_split, linear_model,
+    purged_split, run_experiment, select_candidates, walk_forward_splits,
+    write_predictions, write_report,
 )
 from tools.backtest import experiment_fingerprint, validate_policy
 from tools.data_v1 import (
@@ -33,14 +38,20 @@ from tools.train import (
     ForecastTransformer, TrainingData, Windows, data_loaders, evaluate,
     feature_lookback, feature_values, fit_epochs, prepare_data,
 )
+from tools.files import file_sha256
+from tools.panel_contract import (
+    FINALIZER_SOURCE_PATHS, SOURCE_PATHS, ExecutableBinding, SourceTree,
+    TorchIdentity, executable_binding, freeze_panel_execution, source_tree,
+)
 
 
 def close_value(index: int) -> float:
     return 100.0 + 0.08 * index + 0.05 * (index % 7) - 0.03 * (index % 3)
 
 
-def write_csv(path: Path, count: int = 56) -> None:
-    start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
+def write_csv(path: Path, count: int = 56, offset_minutes: int = 0) -> None:
+    start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc) + \
+        timedelta(minutes=offset_minutes)
     lines = ["timestamp,open,high,low,close,volume"]
     for index in range(count):
         close = close_value(index)
@@ -49,6 +60,208 @@ def write_csv(path: Path, count: int = 56) -> None:
         timestamp = (start + timedelta(minutes=index)).strftime("%Y-%m-%dT%H:%M:%SZ")
         lines.append(timestamp + "," + ",".join(f"{value:.9g}" for value in values))
     path.write_text("\n".join(lines), encoding="ascii")
+
+
+def write_canonical(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def scale_csv(path: Path, scale: float) -> None:
+    lines = path.read_text(encoding="ascii").splitlines()
+    for index in range(1, len(lines)):
+        fields = lines[index].split(",")
+        fields[1:] = [str(float(value) * scale) for value in fields[1:]]
+        lines[index] = ",".join(fields)
+    path.write_text("\n".join(lines), encoding="ascii")
+
+
+def binding(path: Path) -> dict[str, str]:
+    return {"path": path.as_posix(), "sha256": file_sha256(path)}
+
+
+def tree_binding(root: Path, paths: tuple[str, ...]) -> dict[str, object]:
+    files = [
+        {"path": path, "sha256": file_sha256(root / path)}
+        for path in sorted(paths)
+    ]
+    digest = hashlib.sha256()
+    for item in files:
+        digest.update(
+            item["path"].encode() + b"\0" +
+            item["sha256"].encode() + b"\n"
+        )
+    return {"root": str(root), "files": files, "sha256": digest.hexdigest()}
+
+
+@contextmanager
+def panel_fixture(
+    directory: Path, sweep: Sweep, *, mismatched: bool = False,
+    mutation: str | None = None,
+) -> Iterator[object]:
+    relative = directory.relative_to(ROOT)
+    source_root = directory / "source"
+    for name in SOURCE_PATHS:
+        path = source_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name, encoding="ascii")
+    package_root = directory / "torch"
+    package_root.mkdir()
+    (package_root / "module.py").write_text("value = 1\n", encoding="ascii")
+    python = (directory / "runtime").resolve()
+    python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'fixture runtime'\n", encoding="ascii",
+    )
+    python.chmod(0o700)
+    command_version = "fixture runtime"
+    command = ExecutableBinding(
+        str(python), file_sha256(python), command_version,
+    )
+    observed = TorchIdentity(
+        executable_binding(python, sys.version), str(torch.__version__),
+        torch.version.git_version, torch.version.cuda,
+        torch.__config__.show(), source_tree(package_root),
+    )
+    config = relative / "sweep.json"
+    baseline_report = relative / "baseline.json"
+    baseline_ledger = relative / "baseline.jsonl"
+    inputs = relative / "inputs.json"
+    attempt = relative / "attempt.json"
+    write_canonical(ROOT / config, {
+        "candidates": [asdict(item) for item in sweep.candidates],
+        "models": list(sweep.models), "seeds": list(sweep.seeds),
+        "folds": sweep.folds, "fold_fraction": sweep.fold_fraction,
+        "epochs": sweep.epochs, "patience": sweep.patience,
+        "batch_size": sweep.batch_size,
+        "target_horizon_bars": sweep.target_horizon_bars,
+        "alignment_horizon_bars": sweep.alignment_horizon_bars,
+        "target_kind": sweep.target_kind,
+    })
+    write_canonical(ROOT / baseline_report, {"fixture": True})
+    (ROOT / baseline_ledger).write_text("{}\n", encoding="ascii")
+    paths = []
+    declarations = []
+    for index, name in enumerate(("A", "B", "C"), 1):
+        path = relative / f"{name}.csv"
+        write_csv(ROOT / path, 72, int(mismatched and name == "B"))
+        scale_csv(ROOT / path, float(index))
+        timestamps, _ = read_bars(ROOT / path)
+        digest = hashlib.sha256(
+            "".join(f"{timestamp}\n" for timestamp in timestamps).encode()
+        ).hexdigest()
+        paths.append((name, path))
+        declarations.append({
+            "name": name, "csv": binding(path),
+            "rows": len(timestamps), "first_timestamp": timestamps[0],
+            "last_timestamp": timestamps[-1],
+            "timestamp_sha256": digest,
+        })
+    write_canonical(ROOT / inputs, {
+        "schema": 1, "series": declarations,
+        "baseline_report": binding(baseline_report),
+        "baseline_ledger": binding(baseline_ledger),
+    })
+    run_dir = relative / "run"
+    (ROOT / run_dir).mkdir()
+    environment = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPYCACHEPREFIX": f"{run_dir}/.pycache",
+    }
+    argv = ("tools/experiment.py", "fixture")
+    write_canonical(ROOT / attempt, {
+        "schema": 1, "run_id": "fixture", "status": "armed",
+        "run_dir": run_dir.as_posix(),
+        "implementation_commit": "0" * 40,
+        "input_manifest": binding(inputs), "config": binding(config),
+        "baseline_report": binding(baseline_report),
+        "baseline_ledger": binding(baseline_ledger),
+        "source_tree": tree_binding(source_root, SOURCE_PATHS),
+        "finalizer_tree": tree_binding(source_root, FINALIZER_SOURCE_PATHS),
+        "primary_python": asdict(command), "uv": asdict(command),
+        "torch_argv": [
+            str(python), "run", "--offline", "--with", "torch", "python",
+        ],
+        "torch_probe": asdict(observed),
+        "environment": environment,
+        "commands": {
+            "validate_attempt": ["validate"],
+            "preflight": ["preflight"], "experiment": list(argv),
+            "analyze": ["analyze"], "finalizer_prefix": ["finalize"],
+        },
+        "expected_equivalent_runs": expected_runs(sweep, 3),
+        "expected_panel_fits":
+            len(sweep.seeds) * (len(sweep.candidates) * sweep.folds + 1),
+        "outputs": {
+            "experiment_report": f"{run_dir}/experiment.json",
+            "calibration_ledger": f"{run_dir}/calibration.jsonl",
+            "analysis_report": f"{run_dir}/analysis.json",
+            "outcome": f"{relative}/outcome.json",
+        },
+    })
+    mutation_paths = {
+        "config": ROOT / config,
+        "baseline": ROOT / baseline_report,
+        "csv": ROOT / paths[0][1],
+        "source": source_root / SOURCE_PATHS[0],
+    }
+    if mutation in mutation_paths:
+        with mutation_paths[mutation].open("a", encoding="ascii") as file:
+            file.write(" ")
+    if mutation == "binary":
+        with python.open("a", encoding="ascii") as file:
+            file.write(" ")
+    if mutation == "output":
+        (ROOT / run_dir / "experiment.json").write_text(
+            "occupied", encoding="ascii",
+        )
+    if mutation == "symlink":
+        path = ROOT / paths[0][1]
+        target = path.with_suffix(".source")
+        path.rename(target)
+        path.symlink_to(target.name)
+    if mutation == "hardlink":
+        path = ROOT / paths[1][1]
+        path.unlink()
+        os.link(ROOT / paths[0][1], path)
+    runtime = [
+        replace(observed, version=f"{observed.version}-changed")
+        if mutation == "runtime" else observed
+    ]
+    observe = lambda: runtime[0]
+    previous = {name: os.environ.get(name) for name in environment}
+    os.environ.update(environment)
+    if mutation == "cache":
+        os.environ["PYTHONPYCACHEPREFIX"] = f"{run_dir}/changed"
+    try:
+        with freeze_panel_execution(
+            attempt, inputs, config, baseline_report, baseline_ledger,
+            paths, source_root, observe,
+            (*argv, "changed") if mutation == "argv" else argv,
+        ) as execution:
+            moved = (ROOT / run_dir).with_name(f"{run_dir.name}-bound")
+            if mutation == "runtime-after-freeze":
+                runtime[0] = replace(
+                    observed, version=f"{observed.version}-changed",
+                )
+            elif mutation == "directory-after-freeze":
+                (ROOT / run_dir).rename(moved)
+                (ROOT / run_dir).mkdir()
+            try:
+                yield execution
+            finally:
+                runtime[0] = observed
+                if mutation == "directory-after-freeze":
+                    (ROOT / run_dir).rmdir()
+                    moved.rename(ROOT / run_dir)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def candidate(name: str, seq_len: int,
@@ -573,6 +786,389 @@ def verify_test_state(csv: Path) -> None:
         test_evaluate.assert_not_called()
 
 
+def verify_panel_orchestration() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-source-tree-", dir=ROOT,
+    ) as directory:
+        package = Path(directory)
+        (package / "_C").mkdir()
+        (package / "_C" / "_VariableFunctions.pyi").write_text(
+            "nested\n", encoding="ascii",
+        )
+        (package / "_C.cpython-314-darwin.so").write_text(
+            "sibling\n", encoding="ascii",
+        )
+        observed = source_tree(package)
+        paths = tuple(item.path for item in observed.files)
+        assert paths == tuple(sorted(paths))
+        encoded = json.loads(json.dumps(asdict(observed)))
+        assert SourceTree.parse(encoded, "package") == observed
+
+    selected = candidate("panel", 3)
+    sweep = Sweep(
+        (selected,), ("panel_transformer",), (7, 19, 31, 43, 61),
+        2, 0.1, 1, 1, 16,
+    )
+    fixed = replace(
+        sweep,
+        models=(
+            "transformer", "linear", "mlp", "rolling_mean", "last_close",
+            "panel_transformer",
+        ),
+    )
+    assert expected_runs(fixed, 3) == 162
+    assert expected_runs(sweep, 3) == 45
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-default-", dir=ROOT,
+    ) as directory:
+        path = Path(directory) / "implicit.json"
+        write_canonical(path, {"candidates": [asdict(selected)]})
+        assert Sweep.read(path).models == (
+            "transformer", "linear", "mlp", "rolling_mean", "last_close",
+        )
+    try:
+        run_experiment(
+            sweep, (("A", Path("missing.csv")),), torch.device("cpu"), 45,
+            evaluate_test=False, requested_models=frozenset(),
+        )
+    except ValueError as error:
+        assert "bound calibration-only execution" in str(error)
+    else:
+        raise AssertionError("manifestless panel execution was accepted")
+
+    with patch("tools.experiment.read_bars") as read, \
+         patch("tools.experiment._candidate_data") as prepared, \
+         patch("tools.experiment._fit_neural") as fitted:
+        try:
+            _run_experiment(
+                sweep, (), torch.device("cpu"), 45, None, None, True,
+                None, frozenset(), None,
+            )
+        except ValueError as error:
+            assert "bound calibration-only execution" in str(error)
+        else:
+            raise AssertionError("test-mode panel execution was accepted")
+        read.assert_not_called()
+        prepared.assert_not_called()
+        fitted.assert_not_called()
+    try:
+        _authorize_test({
+            "sweep": {"models": ["panel_transformer"]},
+        }, ())
+    except ValueError as error:
+        assert "calibration-only" in str(error)
+    else:
+        raise AssertionError("panel test authorization was accepted")
+
+    timestamps = tuple(f"2026-01-01T00:00:{index:02d}Z" for index in range(10))
+    _label_available(timestamps, 2, (5, 1), 1, 1)
+    try:
+        _label_available(timestamps, 2, (5, 1), 0, 2)
+    except ValueError as error:
+        assert "unavailable" in str(error)
+    else:
+        raise AssertionError("unavailable training labels were accepted")
+
+    epoch_records = [
+        {
+            "model": "panel_transformer", "candidate": "panel",
+            "series": series, "fold": fold, "seed": 7,
+            "best_epoch": 3 + fold,
+        }
+        for series in ("A", "B", "C") for fold in range(2)
+    ]
+    assert _panel_selected_epochs(
+        epoch_records, "panel", ("A", "B", "C"), 7, 2,
+    ) == 3
+    for invalid in (
+        epoch_records[:-1],
+        [*epoch_records, epoch_records[0]],
+        [
+            record | {"best_epoch": 9}
+            if record["series"] == "C" and record["fold"] == 1 else record
+            for record in epoch_records
+        ],
+    ):
+        try:
+            _panel_selected_epochs(
+                invalid, "panel", ("A", "B", "C"), 7, 2,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid shared panel epochs were accepted")
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-", dir=ROOT,
+    ) as directory:
+        with panel_fixture(Path(directory), sweep) as execution:
+            report_path = Path(
+                execution.attempt.outputs["experiment_report"],
+            )
+            ledger_path = Path(
+                execution.attempt.outputs["calibration_ledger"],
+            )
+            execution.validate_outputs(report_path, ledger_path)
+            for report, ledger in (
+                (report_path.with_name("wrong.json"), ledger_path),
+                (report_path, None),
+            ):
+                try:
+                    execution.validate_outputs(report, ledger)
+                except ValueError as error:
+                    assert "outputs do not match" in str(error)
+                else:
+                    raise AssertionError("unbound panel outputs were accepted")
+            try:
+                execution.inputs.validate_timestamps(tuple(
+                    (name, frozen, ()) for name, frozen in execution.series
+                ))
+            except ValueError as error:
+                assert "empty" in str(error)
+            else:
+                raise AssertionError("empty timestamp grid was accepted")
+            members = [
+                prepare_data(
+                    frozen.snapshot, selected.config(), 0.7, 0.15,
+                    (40, 10, 10),
+                )
+                for _, frozen in execution.series
+            ]
+            pooled = _panel_data(members)
+            for name in ("train", "validation", "test"):
+                combined = getattr(pooled, name)
+                parts = [getattr(member, name) for member in members]
+                assert len(combined) == sum(map(len, parts))
+                assert tuple(combined.datasets) == tuple(parts)
+                left = combined[len(parts[0]) - 1][0]
+                right = combined[len(parts[0])][0]
+                assert torch.equal(left, parts[0][len(parts[0]) - 1][0])
+                assert torch.equal(right, parts[1][0][0])
+            assert len({
+                tuple(member.feature_mean.tolist()) for member in members
+            }) == 3
+            late = Path(directory) / "late.csv"
+            late.write_bytes(execution.series[0][1].snapshot.read_bytes())
+            lines = late.read_text(encoding="ascii").splitlines()
+            for index in range(50, len(lines)):
+                fields = lines[index].split(",")
+                fields[1:] = [
+                    str(float(value) * 1.5) for value in fields[1:]
+                ]
+                lines[index] = ",".join(fields)
+            late.write_text("\n".join(lines), encoding="ascii")
+            late_data = prepare_data(
+                late, selected.config(), 0.7, 0.15, (40, 10, 10),
+            )
+            for left, right in zip(
+                (
+                    members[0].feature_mean, members[0].feature_scale,
+                    members[0].target_mean, members[0].target_scale,
+                ),
+                (
+                    late_data.feature_mean, late_data.feature_scale,
+                    late_data.target_mean, late_data.target_scale,
+                ),
+                strict=True,
+            ):
+                assert torch.equal(left, right)
+            for index in range(len(members[0].train)):
+                assert torch.equal(
+                    members[0].train[index][0], late_data.train[index][0],
+                )
+            torch.manual_seed(3)
+            shared = ForecastTransformer(selected.config())
+            before = [
+                _model_fingerprint(shared, member, selected)
+                for member in members
+            ]
+            changed = [members[0], replace(
+                members[1], target_scale=members[1].target_scale * 2,
+            ), members[2]]
+            after = [
+                _model_fingerprint(shared, member, selected)
+                for member in changed
+            ]
+            assert before[0] == after[0] and before[1] != after[1] and \
+                before[2] == after[2]
+
+            with patch(
+                "tools.experiment._panel_selected_epochs",
+                side_effect=(1, ValueError("invalid later seed")),
+            ), patch("tools.experiment.fit_epochs") as final_fit:
+                try:
+                    run_experiment(
+                        sweep, execution.series, torch.device("cpu"), 45,
+                        evaluate_test=False, requested_models=frozenset(),
+                        panel_execution=execution,
+                    )
+                except ValueError as error:
+                    assert "invalid later seed" in str(error)
+                else:
+                    raise AssertionError(
+                        "invalid later seed fitted an earlier final model"
+                    )
+                final_fit.assert_not_called()
+
+            ledger: list[dict[str, object]] = []
+            model_ids = []
+
+            def fingerprint(model: object, data: TrainingData,
+                            configuration: Candidate) -> str:
+                model_ids.append(id(model))
+                return _model_fingerprint(model, data, configuration)
+
+            with patch(
+                "tools.experiment._fit_neural",
+                wraps=_fit_neural,
+            ) as validation_fit, patch(
+                "tools.experiment.fit_epochs", wraps=fit_epochs,
+            ) as calibration_fit, patch(
+                "tools.experiment._model_fingerprint",
+                side_effect=fingerprint,
+            ):
+                report = run_experiment(
+                    sweep, execution.series, torch.device("cpu"), 45,
+                    calibration_prediction_records=ledger,
+                    evaluate_test=False, requested_models=frozenset(),
+                    panel_execution=execution,
+                )
+            assert validation_fit.call_count == 10
+            assert calibration_fit.call_count == 5
+            assert len(set(model_ids)) == 5
+            assert all(model_ids.count(model) == 3 for model in set(model_ids))
+            expected_validation = [
+                (series, fold, seed)
+                for series in ("A", "B", "C")
+                for fold in range(2) for seed in sweep.seeds
+            ]
+            assert [
+                (record["series"], record["fold"], record["seed"])
+                for record in report["validation"]
+            ] == expected_validation
+            assert [
+                (record["series"], record["seed"])
+                for record in report["calibration"]
+            ] == [
+                (series, seed)
+                for series in ("A", "B", "C") for seed in sweep.seeds
+            ]
+            for fold in range(2):
+                for seed in sweep.seeds:
+                    epochs = {
+                        record["best_epoch"] for record in report["validation"]
+                        if record["fold"] == fold and record["seed"] == seed
+                    }
+                    assert len(epochs) == 1
+            assert [
+                (record["series"], record["seed"], record["target_time"])
+                for record in ledger
+            ] == sorted(
+                (
+                    record["series"], record["seed"], record["target_time"]
+                )
+                for record in ledger
+            )
+            for seed in sweep.seeds:
+                hashes = {
+                    item["sha256"] for item in report["model_fingerprints"]
+                    if item["seed"] == seed
+                }
+                assert len(hashes) == 3
+            repeated_ledger: list[dict[str, object]] = []
+            repeated = run_experiment(
+                sweep, execution.series, torch.device("cpu"), 45,
+                calibration_prediction_records=repeated_ledger,
+                evaluate_test=False, requested_models=frozenset(),
+                panel_execution=execution,
+            )
+            assert repeated == report
+            assert repeated_ledger == ledger
+
+        occupied = Path(directory) / "occupied.json"
+        occupied.write_text("original", encoding="ascii")
+        try:
+            write_report(occupied, {"changed": True}, exclusive=True)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("exclusive report replaced an existing file")
+        assert occupied.read_text(encoding="ascii") == "original"
+        target = Path(directory) / "target.json"
+        target.write_text("target", encoding="ascii")
+        symlink = Path(directory) / "symlink.json"
+        symlink.symlink_to(target.name)
+        try:
+            write_report(symlink, {"changed": True}, exclusive=True)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("exclusive report followed a symlink")
+        assert target.read_text(encoding="ascii") == "target"
+        stable = Path(directory) / "stable"
+        moved = Path(directory) / "moved"
+        stable.mkdir()
+        descriptor = os.open(stable, os.O_RDONLY)
+        try:
+            stable.rename(moved)
+            stable.mkdir()
+            write_report(
+                stable / "bound.json", {"bound": True}, exclusive=True,
+                directory_fd=descriptor,
+            )
+            assert (moved / "bound.json").is_file()
+            assert not (stable / "bound.json").exists()
+        finally:
+            os.close(descriptor)
+
+    for mutation in (
+        "config", "baseline", "csv", "source", "binary", "runtime", "cache",
+        "argv", "output", "symlink", "hardlink", "runtime-after-freeze",
+        "directory-after-freeze",
+    ):
+        with tempfile.TemporaryDirectory(
+            prefix=f"compose-mini-panel-{mutation}-", dir=ROOT,
+        ) as directory, \
+             patch("tools.experiment._candidate_data") as prepared, \
+             patch("tools.experiment._fit_neural") as fitted, \
+             patch("tools.experiment.fit_epochs") as final_fit:
+            try:
+                with panel_fixture(
+                    Path(directory), sweep, mutation=mutation,
+                ) as execution:
+                    if mutation.endswith("-after-freeze"):
+                        run_experiment(
+                            sweep, execution.series, torch.device("cpu"), 45,
+                            evaluate_test=False,
+                            requested_models=frozenset(),
+                            panel_execution=execution,
+                        )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{mutation} mutation was accepted")
+            prepared.assert_not_called()
+            fitted.assert_not_called()
+            final_fit.assert_not_called()
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-panel-grid-", dir=ROOT,
+    ) as directory, panel_fixture(
+        Path(directory), sweep, mismatched=True,
+    ) as execution, patch("tools.experiment._fit_neural") as fitted:
+        try:
+            run_experiment(
+                sweep, execution.series, torch.device("cpu"), 45,
+                evaluate_test=False, requested_models=frozenset(),
+                panel_execution=execution,
+            )
+        except ValueError as error:
+            assert "identical timestamp grids" in str(error)
+        else:
+            raise AssertionError("mismatched panel timestamps were accepted")
+        fitted.assert_not_called()
+
+
 def main() -> None:
     assert walk_forward_splits(20, 2, 0.2) == ((8, 4), (12, 4))
     assert walk_forward_splits(100, 2, 0.1) == ((70, 10), (80, 10))
@@ -580,6 +1176,7 @@ def main() -> None:
     assert holdout_split(20, 0.2) == (12, 4, 4)
     assert purged_split((12, 4, 4), 2) == (10, 2, 4)
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
+    verify_panel_orchestration()
     verify_selection_is_validation_only()
     verify_selected_epochs()
     verify_ridge()

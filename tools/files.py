@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import tempfile
 
 
@@ -62,12 +63,61 @@ def atomic_text(path: Path, write: Callable[[TextIO], None]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def exclusive_text(
+    path: Path, write: Callable[[TextIO], None], directory_fd: int | None = None,
+) -> None:
+    """Publish a new text file atomically without following or replacing it."""
+    if directory_fd is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True,
+        )
+        temporary = Path(name)
+    else:
+        name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd,
+        )
+        temporary = None
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            write(file)
+            file.flush()
+            os.fsync(file.fileno())
+        if directory_fd is None:
+            os.link(temporary, path)
+        else:
+            os.link(
+                name, path.name, src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd, follow_symlinks=False,
+            )
+    finally:
+        if directory_fd is None:
+            temporary.unlink(missing_ok=True)
+        else:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
 def write_json(path: Path, value: Mapping[str, object]) -> None:
     def write(file: TextIO) -> None:
         json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
         file.write("\n")
 
     atomic_text(path, write)
+
+
+def write_json_exclusive(
+    path: Path, value: Mapping[str, object], directory_fd: int | None = None,
+) -> None:
+    def write(file: TextIO) -> None:
+        json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
+        file.write("\n")
+
+    exclusive_text(path, write, directory_fd)
 
 
 def series_arg(value: str, pattern: re.Pattern[str]) -> tuple[str, Path]:

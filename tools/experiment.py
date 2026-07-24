@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 try:
     import torch
     from torch import nn
+    from torch.utils.data import ConcatDataset
 except ModuleNotFoundError as error:
     raise SystemExit("experiments require PyTorch: python -m pip install torch") from error
 
@@ -32,22 +33,39 @@ from tools.data_v1 import (
 )
 from tools.backtest import experiment_fingerprint, read_policy
 from tools.files import (
-    FrozenInput, atomic_text, file_sha256, freeze_inputs, require_disjoint,
-    series_arg, verify_frozen, write_json,
+    FrozenInput, atomic_text, exclusive_text, file_sha256, freeze_inputs,
+    require_disjoint, series_arg, verify_frozen, write_json,
+    write_json_exclusive,
+)
+from tools.panel_contract import (
+    PanelExecution, TorchIdentity, executable_binding, freeze_panel_execution,
+    source_tree,
 )
 from tools.train import (
-    FEATURE_NAMES, FEATURE_SETS, Fit, ForecastTransformer, TrainingData, Windows,
-    data_loaders, evaluate, feature_lookback, fit_epochs, fit_model, mean_loss,
-    prepare_rows,
+    FEATURE_NAMES, FEATURE_SETS, DataSplits, Fit, ForecastTransformer,
+    TrainingData, Windows, data_loaders, evaluate, feature_lookback, fit_epochs,
+    fit_model, mean_loss, prepare_rows,
 )
 
-MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
-NEURAL = frozenset(("transformer", "mlp"))
+TRANSFORMERS = frozenset(("transformer", "panel_transformer"))
+PANEL_MODELS = frozenset(("panel_transformer",))
+NEURAL = TRANSFORMERS | {"mlp"}
+LOCAL_MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
+MODELS = (*LOCAL_MODELS, "panel_transformer")
 RETURN_METRICS = ("return_mse", "return_mae", "direction_accuracy")
 EVALUATION_METRICS = (*RETURN_METRICS, "close_mae", "zero_return_baseline_mae")
 SERIES_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_FLAT_FEATURES = 2_048
 MAX_MLP_PARAMETERS = 8_388_608
+
+
+def _torch_identity() -> TorchIdentity:
+    package = Path(torch.__file__).resolve().parent
+    return TorchIdentity(
+        executable_binding(Path(sys.executable), sys.version),
+        str(torch.__version__), torch.version.git_version,
+        torch.version.cuda, torch.__config__.show(), source_tree(package),
+    )
 
 
 def _integer(value: object, name: str, minimum: int = 1) -> int:
@@ -190,7 +208,7 @@ class Sweep:
         candidates = tuple(Candidate.parse(item) for item in candidates_value)
         if len({item.name for item in candidates}) != len(candidates):
             raise ValueError("candidate names must be unique")
-        models_value = value.get("models", list(MODELS))
+        models_value = value.get("models", list(LOCAL_MODELS))
         if not isinstance(models_value, list) or not models_value or \
            any(model not in MODELS for model in models_value) or \
            len(set(models_value)) != len(models_value):
@@ -307,6 +325,18 @@ def purged_split(split: tuple[int, ...], gap: int,
     return result
 
 
+def _label_available(
+    timestamps: Sequence[str], target_offset: int,
+    split: Sequence[int], gap: int, horizon: int,
+) -> None:
+    last_train_target = target_offset + split[0] - 1
+    first_validation_as_of = target_offset + split[0] + gap - horizon
+    if timestamps[last_train_target] > timestamps[first_validation_as_of]:
+        raise ValueError(
+            "training labels are unavailable at the first validation decision"
+        )
+
+
 def _matrix(dataset: Windows) -> tuple[torch.Tensor, torch.Tensor]:
     windows = dataset.features.unfold(0, dataset.seq_len, 1).transpose(1, 2)
     start, end = dataset.start, dataset.start + dataset.count
@@ -382,12 +412,19 @@ def _prediction_records(model: str, candidate: Candidate, series: str,
         }
 
 
-def _fit_neural(model_name: str, candidate: Candidate, data: TrainingData,
+def _neural_model(model_name: str, candidate: Candidate) -> nn.Module:
+    if model_name in TRANSFORMERS:
+        return ForecastTransformer(candidate.config())
+    if model_name == "mlp":
+        return FlatMLP(candidate.seq_len, candidate.mlp_dim)
+    raise ValueError("unsupported neural model")
+
+
+def _fit_neural(model_name: str, candidate: Candidate, data: DataSplits,
                 sweep: Sweep, seed: int,
                 device: torch.device) -> tuple[nn.Module, Fit, tuple[object, ...]]:
     torch.manual_seed(seed)
-    model = (ForecastTransformer(candidate.config()) if model_name == "transformer"
-             else FlatMLP(candidate.seq_len, candidate.mlp_dim)).to(device)
+    model = _neural_model(model_name, candidate).to(device)
     fit, loaders = fit_model(
         model, data, sweep.batch_size, sweep.epochs, sweep.patience,
         candidate.learning_rate, candidate.weight_decay, seed, device,
@@ -450,6 +487,37 @@ def _selected_epochs(records: Sequence[Mapping[str, object]], model: str,
     if not values:
         raise ValueError("neural model has no selected epoch evidence")
     return median_low(values)
+
+
+def _panel_selected_epochs(
+    records: Sequence[Mapping[str, object]], candidate: str,
+    series: Sequence[str], seed: int, folds: int,
+) -> int:
+    selected = [
+        record for record in records
+        if record["model"] == "panel_transformer" and
+        record["candidate"] == candidate and record["seed"] == seed
+    ]
+    epochs = []
+    for fold in range(folds):
+        copies = [record for record in selected if record["fold"] == fold]
+        if len(copies) != len(series) or \
+           tuple(record["series"] for record in copies) != tuple(series) or \
+           len({int(record["best_epoch"]) for record in copies}) != 1:
+            raise ValueError("panel model has invalid shared epoch evidence")
+        epochs.append(int(copies[0]["best_epoch"]))
+    if len(selected) != folds * len(series):
+        raise ValueError("panel model has invalid shared epoch evidence")
+    return median_low(epochs)
+
+
+def _panel_data(members: Sequence[TrainingData]) -> DataSplits:
+    if not members:
+        raise ValueError("panel data requires at least one series")
+    return DataSplits(*(
+        ConcatDataset([getattr(member, name) for member in members])
+        for name in ("train", "validation", "test")
+    ))
 
 
 def _means(records: Sequence[Mapping[str, object]],
@@ -620,6 +688,8 @@ def _calibration_contract(
 def _authorize_test(contract: Mapping[str, object],
                     policies: Sequence[Mapping[str, object]],
                     ) -> dict[str, Mapping[str, object]]:
+    if PANEL_MODELS.intersection(contract["sweep"]["models"]):
+        raise ValueError("panel models are calibration-only")
     if not policies:
         raise ValueError("test evaluation requires a frozen policy")
     fingerprint = experiment_fingerprint(contract)
@@ -698,8 +768,20 @@ def run_experiment(
         [Mapping[str, object]], Mapping[str, Mapping[str, object]]
     ] | None = None,
     *, requested_models: frozenset[str],
+    panel_execution: PanelExecution | None = None,
 ) -> dict[str, object]:
+    panel = bool(PANEL_MODELS.intersection(sweep.models))
+    if panel and (evaluate_test or
+                  not isinstance(panel_execution, PanelExecution)):
+        raise ValueError("panel models require a bound calibration-only execution")
+    if not panel and panel_execution is not None:
+        raise ValueError("panel execution requires a panel model")
+    if panel_execution is not None and \
+       Sweep.read(panel_execution.config_input.snapshot) != sweep:
+        raise ValueError("panel sweep does not match the bound config")
     inputs = tuple(item for _, item in series)
+    if panel and any(isinstance(item, Path) for item in inputs):
+        raise ValueError("panel series must share the bound frozen execution")
     if all(isinstance(item, Path) for item in inputs):
         with freeze_inputs(inputs) as frozen:
             report = _run_experiment(
@@ -709,7 +791,7 @@ def run_experiment(
                 ),
                 device, max_runs, prediction_records,
                 calibration_prediction_records, evaluate_test,
-                test_authorizer, requested_models,
+                test_authorizer, requested_models, panel_execution,
             )
             verify_frozen(frozen)
             return report
@@ -718,7 +800,7 @@ def run_experiment(
     report = _run_experiment(
         sweep, series, device, max_runs, prediction_records,
         calibration_prediction_records, evaluate_test, test_authorizer,
-        requested_models,
+        requested_models, panel_execution,
     )
     verify_frozen(inputs)
     return report
@@ -734,7 +816,21 @@ def _run_experiment(
         [Mapping[str, object]], Mapping[str, Mapping[str, object]]
     ] | None,
     requested_models: frozenset[str],
+    panel_execution: PanelExecution | None,
 ) -> dict[str, object]:
+    panel = bool(PANEL_MODELS.intersection(sweep.models))
+    if panel and (evaluate_test or
+                  not isinstance(panel_execution, PanelExecution)):
+        raise ValueError("panel models require a bound calibration-only execution")
+    if not panel and panel_execution is not None:
+        raise ValueError("panel execution requires a panel model")
+    if panel_execution is not None and \
+       Sweep.read(panel_execution.config_input.snapshot) != sweep:
+        raise ValueError("panel sweep does not match the bound config")
+    if panel_execution is not None:
+        panel_execution.validate()
+        if tuple(series) != panel_execution.series:
+            raise ValueError("panel series do not match the bound execution")
     if not series or len({name for name, _ in series}) != len(series):
         raise ValueError("series names must be nonempty and unique")
     if not isinstance(requested_models, frozenset) or \
@@ -751,6 +847,13 @@ def _run_experiment(
     if runs > max_runs:
         raise ValueError(f"experiment requires {runs} runs; "
                          f"--max-runs is {max_runs}")
+    if panel_execution is not None:
+        physical = len(sweep.seeds) * (
+            len(sweep.candidates) * sweep.folds + 1
+        )
+        if panel_execution.attempt.expected_equivalent_runs != runs or \
+           panel_execution.attempt.expected_panel_fits != physical:
+            raise ValueError("panel run accounting does not match the attempt")
     torch.use_deterministic_algorithms(True)
     max_history = max(candidate.seq_len + feature_lookback(candidate.feature_set)
                       for candidate in sweep.candidates)
@@ -786,7 +889,27 @@ def _run_experiment(
                          "first_timestamp": timestamps[0],
                          "last_timestamp": timestamps[-1]})
 
+    if panel:
+        if panel_execution is None:
+            raise ValueError("panel execution is missing")
+        panel_execution.inputs.validate_timestamps(tuple(
+            (name, frozen, timestamps)
+            for name, (frozen, timestamps, _, _, _) in folds_by_series.items()
+        ))
+        grids = [timestamps for _, timestamps, _, _, _
+                 in folds_by_series.values()]
+        if any(timestamps != grids[0] for timestamps in grids[1:]):
+            raise ValueError("panel series must have identical timestamp grids")
+        for _, timestamps, _, splits, holdout in folds_by_series.values():
+            for split in (*splits, holdout):
+                _label_available(
+                    timestamps, target_offset, split, gap, horizon,
+                )
+
     validation: list[dict[str, object]] = []
+    panel_fold_data: dict[
+        tuple[str, str, int], tuple[TrainingData, dict[str, list[str]]]
+    ] = {}
     for candidate in sweep.candidates:
         for name, (_, timestamps, rows, splits, _) in folds_by_series.items():
             for fold, (train_count, validation_count) in enumerate(splits):
@@ -797,7 +920,11 @@ def _run_experiment(
                 boundary = _boundary(
                     timestamps, target_offset, (train_count, validation_count), gap,
                 )
+                if panel:
+                    panel_fold_data[(candidate.name, name, fold)] = data, boundary
                 for model_name in sweep.models:
+                    if model_name in PANEL_MODELS:
+                        continue
                     seeds = sweep.seeds if model_name in NEURAL else (None,)
                     for seed in seeds:
                         if seed is None:
@@ -821,6 +948,46 @@ def _run_experiment(
                             metrics, fit,
                         ))
 
+    names = tuple(folds_by_series)
+    if panel:
+        panel_validation = []
+        for candidate in sweep.candidates:
+            for fold in range(sweep.folds):
+                members = [
+                    panel_fold_data[(candidate.name, name, fold)][0]
+                    for name in names
+                ]
+                pooled = _panel_data(members)
+                for seed in sweep.seeds:
+                    model, fit, _ = _fit_neural(
+                        "panel_transformer", candidate, pooled, sweep,
+                        seed, device,
+                    )
+                    for name, data in zip(names, members, strict=True):
+                        loader = data_loaders(data, sweep.batch_size, seed)[1]
+                        metrics = evaluate(
+                            model, loader, data.target_mean,
+                            data.target_scale, device,
+                        )
+                        panel_validation.append(_validation_record(
+                            "panel_transformer", candidate, name, fold,
+                            panel_fold_data[(candidate.name, name, fold)][1],
+                            seed, len(data.validation),
+                            mean_loss(model, loader, device), metrics, fit,
+                        ))
+        candidate_order = {
+            candidate.name: index
+            for index, candidate in enumerate(sweep.candidates)
+        }
+        series_order = {name: index for index, name in enumerate(names)}
+        seed_order = {seed: index for index, seed in enumerate(sweep.seeds)}
+        panel_validation.sort(key=lambda record: (
+            candidate_order[str(record["candidate"])],
+            series_order[str(record["series"])], int(record["fold"]),
+            seed_order[int(record["seed"])],
+        ))
+        validation.extend(panel_validation)
+
     selection = select_candidates(validation, sweep.models, sweep.candidates)
     candidates = {candidate.name: candidate for candidate in sweep.candidates}
     calibration: list[dict[str, object]] = []
@@ -828,6 +995,8 @@ def _run_experiment(
     retained: dict[tuple[str, str, int | None], FinalModel] = {}
     final_data: dict[tuple[str, str], TrainingData] = {}
     for model_name in sweep.models:
+        if model_name in PANEL_MODELS:
+            continue
         candidate = candidates[str(selection[model_name]["candidate"])]
         for name, (frozen, timestamps, rows, _, split) in \
                 folds_by_series.items():
@@ -850,11 +1019,7 @@ def _run_experiment(
                         validation, model_name, candidate.name, name, seed,
                     )
                     torch.manual_seed(seed)
-                    model = (
-                        ForecastTransformer(candidate.config())
-                        if model_name == "transformer" else
-                        FlatMLP(candidate.seq_len, candidate.mlp_dim)
-                    ).to(device)
+                    model = _neural_model(model_name, candidate).to(device)
                     loaders = fit_epochs(
                         model, data, sweep.batch_size, epochs,
                         candidate.learning_rate, candidate.weight_decay,
@@ -891,6 +1056,76 @@ def _run_experiment(
                         frozen.sha256, predictions, data.validation,
                         "calibration", None,
                     ))
+    if panel:
+        candidate = candidates[
+            str(selection["panel_transformer"]["candidate"])
+        ]
+        members = []
+        for name, (_, _, rows, _, split) in folds_by_series.items():
+            data_key = (name, candidate.name)
+            data = final_data.get(data_key)
+            if data is None:
+                data = _candidate_data(
+                    rows, candidate, split, max_history, sweep,
+                )
+                final_data[data_key] = data
+            members.append(data)
+        pooled = _panel_data(members)
+        panel_calibration = []
+        panel_predictions = []
+        selected_epochs = {
+            seed: _panel_selected_epochs(
+                validation, candidate.name, names, seed, sweep.folds,
+            )
+            for seed in sweep.seeds
+        }
+        for seed, epochs in selected_epochs.items():
+            torch.manual_seed(seed)
+            model = _neural_model("panel_transformer", candidate).to(device)
+            fit_epochs(
+                model, pooled, sweep.batch_size, epochs,
+                candidate.learning_rate, candidate.weight_decay,
+                seed, device,
+            )
+            for name, data in zip(names, members, strict=True):
+                frozen, timestamps, _, _, split = folds_by_series[name]
+                loader = data_loaders(data, sweep.batch_size, seed)[1]
+                digest = _model_fingerprint(model, data, candidate)
+                fingerprints.append({
+                    "model": "panel_transformer", "series": name,
+                    "seed": seed, "epochs": epochs, "sha256": digest,
+                })
+                predictions = [] if calibration_prediction_records is not None \
+                    else None
+                metrics = evaluate(
+                    model, loader, data.target_mean, data.target_scale,
+                    device, predictions,
+                )
+                record = _validation_record(
+                    "panel_transformer", candidate, name, None,
+                    _boundary(timestamps, target_offset, split, gap), seed,
+                    len(data.validation), mean_loss(model, loader, device),
+                    metrics, None,
+                )
+                record["epochs"] = epochs
+                panel_calibration.append(record)
+                if predictions is not None:
+                    panel_predictions.extend(_prediction_records(
+                        "panel_transformer", candidate, name, seed, data,
+                        timestamps, frozen.sha256, predictions,
+                        data.validation, "calibration", None,
+                    ))
+        panel_calibration.sort(key=lambda record: (
+            series_order[str(record["series"])],
+            seed_order[int(record["seed"])],
+        ))
+        calibration.extend(panel_calibration)
+        if calibration_prediction_records is not None:
+            panel_predictions.sort(key=lambda record: (
+                series_order[str(record["series"])],
+                seed_order[int(record["seed"])], str(record["target_time"]),
+            ))
+            calibration_prediction_records.extend(panel_predictions)
     fingerprints.sort(key=lambda item: (
         item["model"], item["series"],
         -1 if item["seed"] is None else item["seed"],
@@ -942,7 +1177,7 @@ def _run_experiment(
                             final.data.test, "test", None,
                         ))
 
-    return {
+    report = {
         "schema": 6,
         "protocol": {
             "split": "embargoed expanding walk-forward by target time",
@@ -989,20 +1224,35 @@ def _run_experiment(
         "test": test,
         "summary": summarize(test, sweep.models),
     }
+    if panel_execution is not None:
+        report.update(panel_execution.provenance())
+        panel_execution.validate()
+    return report
 
 
-def write_report(path: Path, report: Mapping[str, object]) -> None:
-    write_json(path, report)
+def write_report(
+    path: Path, report: Mapping[str, object], *, exclusive: bool = False,
+    directory_fd: int | None = None,
+) -> None:
+    if exclusive:
+        write_json_exclusive(path, report, directory_fd)
+    else:
+        write_json(path, report)
 
 
 def write_predictions(path: Path,
-                      records: Sequence[Mapping[str, object]]) -> None:
+                      records: Sequence[Mapping[str, object]], *,
+                      exclusive: bool = False,
+                      directory_fd: int | None = None) -> None:
     def write(file: TextIO) -> None:
         for record in records:
             json.dump(record, file, allow_nan=False, sort_keys=True)
             file.write("\n")
 
-    atomic_text(path, write)
+    if exclusive:
+        exclusive_text(path, write, directory_fd)
+    else:
+        atomic_text(path, write)
 
 
 def _series(value: str) -> tuple[str, Path]:
@@ -1022,22 +1272,131 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--calibration-predictions", type=Path)
     parser.add_argument("--calibration-only", action="store_true")
     parser.add_argument("--policy", dest="policies", action="append", type=Path)
+    parser.add_argument("--attempt-manifest", type=Path)
+    parser.add_argument("--input-manifest", type=Path)
+    parser.add_argument("--baseline-report", type=Path)
+    parser.add_argument("--baseline-ledger", type=Path)
     return parser.parse_args(argv)
+
+
+def _execute(
+    args: argparse.Namespace, sweep_input: FrozenInput,
+    policy_inputs: Sequence[FrozenInput],
+    series_inputs: Sequence[FrozenInput],
+    panel_execution: PanelExecution | None,
+) -> dict[str, object]:
+    frozen = (sweep_input, *policy_inputs, *series_inputs)
+    output_directory_fd = (
+        panel_execution.run_directory_fd
+        if panel_execution is not None else None
+    )
+    if panel_execution is not None:
+        panel_execution.validate_outputs(
+            args.report, args.calibration_predictions,
+        )
+
+    def verify() -> None:
+        verify_frozen(frozen)
+        if panel_execution is not None:
+            panel_execution.verify()
+
+    sweep = Sweep.read(sweep_input.snapshot)
+    if not args.calibration_only and PANEL_MODELS.intersection(sweep.models):
+        raise ValueError("panel models are calibration-only")
+    if args.horizon_bars is not None:
+        sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
+    if args.target_kind is not None:
+        sweep = replace(sweep, target_kind=args.target_kind)
+    policies = tuple(read_policy(item.snapshot) for item in policy_inputs)
+    requested_models = frozenset(policy["model"] for policy in policies)
+    if len(requested_models) != len(policies):
+        raise ValueError("test policies must name unique models")
+    predictions = [] if args.predictions else None
+    calibration_predictions = [] if args.calibration_predictions else None
+    report = run_experiment(
+        sweep, tuple(
+            (name, item)
+            for (name, _), item in zip(
+                args.series, series_inputs, strict=True,
+            )
+        ),
+        torch.device(args.device), args.max_runs, predictions,
+        calibration_predictions, not args.calibration_only,
+        (lambda contract: _authorize_test(contract, policies))
+        if policies else None,
+        requested_models=requested_models,
+        panel_execution=panel_execution,
+    )
+    report["sweep_input"] = {
+        "path": str(sweep_input.source), "sha256": sweep_input.sha256,
+    }
+    if policies:
+        report["policies"] = [
+            {
+                "path": str(item.source), "sha256": item.sha256,
+                "model": policy["model"],
+            }
+            for item, policy in zip(policy_inputs, policies, strict=True)
+        ]
+    if args.predictions and predictions is not None:
+        verify()
+        write_predictions(args.predictions, predictions)
+        report["prediction_ledger"] = {
+            "schema": 3, "path": str(args.predictions),
+            "records": len(predictions),
+            "sha256": file_sha256(args.predictions),
+        }
+    if args.calibration_predictions and \
+       calibration_predictions is not None:
+        verify()
+        if panel_execution is not None:
+            panel_execution.prepare_output(
+                "calibration_ledger", args.calibration_predictions,
+            )
+        write_predictions(
+            args.calibration_predictions, calibration_predictions,
+            exclusive=panel_execution is not None,
+            directory_fd=output_directory_fd,
+        )
+        report["calibration_prediction_ledger"] = {
+            "schema": 3, "path": str(args.calibration_predictions),
+            "records": len(calibration_predictions),
+            "sha256": file_sha256(args.calibration_predictions),
+        }
+    verify()
+    if panel_execution is not None:
+        panel_execution.prepare_output("experiment_report", args.report)
+    write_report(
+        args.report, report, exclusive=panel_execution is not None,
+        directory_fd=output_directory_fd,
+    )
+    return report
 
 
 def main() -> None:
     args = parse_args()
     try:
         policy_paths = tuple(args.policies or ())
+        panel_paths = (
+            args.attempt_manifest, args.input_manifest,
+            args.baseline_report, args.baseline_ledger,
+        )
         outputs = [path for path in (
             args.report, args.predictions, args.calibration_predictions,
         ) if path]
         require_disjoint(
-            [args.sweep, *policy_paths, *(path for _, path in args.series)], outputs,
+            [
+                args.sweep, *policy_paths,
+                *(path for path in panel_paths if path),
+                *(path for _, path in args.series),
+            ],
+            outputs,
         )
         device = torch.device(args.device)
         if device.type == "meta" or args.max_runs <= 0:
-            raise ValueError("device must execute tensors and max-runs must be positive")
+            raise ValueError(
+                "device must execute tensors and max-runs must be positive"
+            )
         if args.calibration_only and args.predictions:
             raise ValueError("calibration-only mode cannot export test predictions")
         if (args.calibration_only and policy_paths) or \
@@ -1045,73 +1404,37 @@ def main() -> None:
            len(policy_paths) != len(set(policy_paths)):
             raise ValueError("full experiments require unique frozen policies")
         torch.empty(0, device=device)
-        sources = (
-            args.sweep, *policy_paths, *(path for _, path in args.series),
-        )
-        with freeze_inputs(sources) as frozen:
-            sweep_input = frozen[0]
-            policy_inputs = frozen[1:1 + len(policy_paths)]
-            series_inputs = frozen[1 + len(policy_paths):]
-            sweep = Sweep.read(sweep_input.snapshot)
-            if args.horizon_bars is not None:
-                sweep = replace(sweep, target_horizon_bars=args.horizon_bars)
-            if args.target_kind is not None:
-                sweep = replace(sweep, target_kind=args.target_kind)
-            policies = tuple(read_policy(item.snapshot)
-                             for item in policy_inputs)
-            requested_models = frozenset(policy["model"] for policy in policies)
-            if len(requested_models) != len(policies):
-                raise ValueError("test policies must name unique models")
-            predictions = [] if args.predictions else None
-            calibration_predictions = [] if args.calibration_predictions else None
-            report = run_experiment(
-                sweep, tuple(
-                    (name, item)
-                    for (name, _), item in zip(
-                        args.series, series_inputs, strict=True,
-                    )
-                ),
-                device, args.max_runs, predictions, calibration_predictions,
-                not args.calibration_only,
-                (lambda contract: _authorize_test(contract, policies))
-                if policies else None,
-                requested_models=requested_models,
+        discovered = Sweep.read(args.sweep)
+        panel = bool(PANEL_MODELS.intersection(discovered.models))
+        if panel and not args.calibration_only:
+            raise ValueError("panel models are calibration-only")
+        if panel != all(panel_paths):
+            raise ValueError(
+                "panel models require attempt, input, and baseline manifests"
             )
-            report["sweep_input"] = {
-                "path": str(sweep_input.source),
-                "sha256": sweep_input.sha256,
-            }
-            if policies:
-                report["policies"] = [
-                    {
-                        "path": str(item.source), "sha256": item.sha256,
-                        "model": policy["model"],
-                    }
-                    for item, policy in zip(
-                        policy_inputs, policies, strict=True,
-                    )
-                ]
-            if args.predictions and predictions is not None:
-                verify_frozen(frozen)
-                write_predictions(args.predictions, predictions)
-                report["prediction_ledger"] = {
-                    "schema": 3, "path": str(args.predictions),
-                    "records": len(predictions),
-                    "sha256": file_sha256(args.predictions),
-                }
-            if args.calibration_predictions and \
-               calibration_predictions is not None:
-                verify_frozen(frozen)
-                write_predictions(
-                    args.calibration_predictions, calibration_predictions,
+        if not panel and any(panel_paths):
+            raise ValueError("panel manifests require a panel model")
+        if panel:
+            with freeze_panel_execution(
+                args.attempt_manifest, args.input_manifest, args.sweep,
+                args.baseline_report, args.baseline_ledger, args.series,
+                ROOT, _torch_identity, sys.argv,
+            ) as execution:
+                report = _execute(
+                    args, execution.config_input, (), tuple(
+                        item for _, item in execution.series
+                    ), execution,
                 )
-                report["calibration_prediction_ledger"] = {
-                    "schema": 3, "path": str(args.calibration_predictions),
-                    "records": len(calibration_predictions),
-                    "sha256": file_sha256(args.calibration_predictions),
-                }
-            verify_frozen(frozen)
-            write_report(args.report, report)
+        else:
+            sources = (
+                args.sweep, *policy_paths, *(path for _, path in args.series),
+            )
+            with freeze_inputs(sources) as frozen:
+                report = _execute(
+                    args, frozen[0], frozen[1:1 + len(policy_paths)],
+                    frozen[1 + len(policy_paths):], None,
+                )
+                verify_frozen(frozen)
     except (FloatingPointError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
     result = {"report": str(args.report), "selection": report["selection"]}
