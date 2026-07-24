@@ -235,8 +235,14 @@ def test_gap_audit_contract(directory: Path) -> None:
         DEFAULT_CALENDAR, DEFAULT_CALENDAR, file_sha256(DEFAULT_CALENDAR),
     )
     bars = {"AAPL": load_bars(Path(report["series"][0]["csv"]["path"]))}
+    observed = {
+        name: analysis.ObservedCsv.from_bars(item)
+        for name, item in bars.items()
+    }
+    assert not hasattr(observed["AAPL"], "opens")
+    assert not hasattr(observed["AAPL"], "closes")
     analysis.validate_fetch(
-        report, parsed, manifest_input, bars, calendar_input,
+        report, parsed, manifest_input, observed, calendar_input,
     )
 
     assert report["fetch_schema"] == 4
@@ -287,20 +293,20 @@ def test_gap_audit_contract(directory: Path) -> None:
     }
     del schema3["series"][0]["csv"]["session_audit"]
     analysis.validate_fetch(
-        schema3, parsed, manifest_input, bars, calendar_input,
+        schema3, parsed, manifest_input, observed, calendar_input,
     )
 
     schema2 = json.loads(json.dumps(schema3))
     schema2["fetch_schema"] = 2
     del schema2["session_calendar"]
     del schema2["series"][0]["reference"]["primary_exchange"]
-    analysis.validate_fetch(schema2, parsed, manifest_input, bars)
+    analysis.validate_fetch(schema2, parsed, manifest_input, observed)
 
     unversioned = json.loads(json.dumps(schema2))
     del unversioned["fetch_schema"]
     del unversioned["gap_policy"]
     del unversioned["series"][0]["csv"]["gap_audit"]
-    analysis.validate_fetch(unversioned, parsed, manifest_input, bars)
+    analysis.validate_fetch(unversioned, parsed, manifest_input, observed)
 
     for candidate, supplied in (
         (report, None), (schema3, None),
@@ -308,7 +314,7 @@ def test_gap_audit_contract(directory: Path) -> None:
     ):
         try:
             analysis.validate_fetch(
-                candidate, parsed, manifest_input, bars, supplied,
+                candidate, parsed, manifest_input, observed, supplied,
             )
         except ValueError:
             pass
@@ -320,7 +326,7 @@ def test_gap_audit_contract(directory: Path) -> None:
         change(candidate)
         try:
             analysis.validate_fetch(
-                candidate, parsed, manifest_input, bars, calendar_input,
+                candidate, parsed, manifest_input, observed, calendar_input,
             )
         except ValueError:
             return
@@ -330,6 +336,10 @@ def test_gap_audit_contract(directory: Path) -> None:
         lambda value: value.update({"fetch_schema": 1}),
         lambda value: value.update({"fetch_schema": 2.0}),
         lambda value: value.update({"gap_policy": "strict"}),
+        lambda value: value["manifest"].update({"path": "other.json"}),
+        lambda value: value["session_calendar"].update(
+            {"path": "other.json"}
+        ),
         lambda value: value["session_calendar"].update({"sha256": "0" * 64}),
         lambda value: value["series"][0]["reference"].update(
             {"primary_exchange": "XASE"}
@@ -395,7 +405,12 @@ def test_gap_audit_contract(directory: Path) -> None:
         try:
             analysis.validate_fetch(
                 candidate, parsed, manifest_input,
-                {"AAPL": load_bars(csv_path)}, calendar_input,
+                {
+                    "AAPL": analysis.ObservedCsv.from_bars(
+                        load_bars(csv_path)
+                    ),
+                },
+                calendar_input,
             )
         except ValueError:
             pass

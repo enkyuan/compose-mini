@@ -4,11 +4,12 @@
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.data_v1 import CSV_HEADER, read_bars, read_csv
+from tools.data_v1 import CSV_HEADER, read_bars, read_csv, read_timestamps
 from tools.float32 import f32
 
 VALID_ROWS = (
@@ -39,6 +40,11 @@ def main() -> None:
         timestamps, values = read_bars(path)
         assert timestamps == tuple(row.partition(",")[0] for row in VALID_ROWS)
         assert list(values) == list(read_csv(path))
+        with patch(
+            "tools.data_v1._number",
+            side_effect=AssertionError("numeric parser was called"),
+        ):
+            assert read_timestamps(path) == timestamps
         for row in invalid:
             path.write_bytes((CSV_HEADER + "\n" + row).encode("ascii"))
             try:
@@ -46,6 +52,21 @@ def main() -> None:
             except ValueError:
                 continue
             raise AssertionError(f"invalid CSV was accepted: {row[:40]!r}")
+        for value in (
+            "wrong,header",
+            f"{VALID_ROWS[0]}\n{VALID_ROWS[0]}",
+            "2026-07-21T10:00:00Z,1,2,3,4",
+            "2026-02-29T10:00:00Z,1,2,3,4,5",
+        ):
+            path.write_text(
+                value if value == "wrong,header" else f"{CSV_HEADER}\n{value}",
+                encoding="ascii",
+            )
+            try:
+                read_timestamps(path)
+            except ValueError:
+                continue
+            raise AssertionError("invalid timestamp CSV was accepted")
     print("training CSV tests passed")
 
 

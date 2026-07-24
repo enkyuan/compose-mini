@@ -13,10 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.analyze_universe import (
-    POLICY_MODELS, DirectoryMembership, _absent, build_replay_report,
-    directory_membership, read_json, read_ledger, regular_file_identities,
-    resolve_fresh_output, validate_experiment, validate_fetch,
-    validate_one_policy, validate_prediction_grid, verify_membership,
+    POLICY_MODELS, DirectoryMembership, ObservedCsv, _absent,
+    build_replay_report, directory_membership, read_json, read_ledger,
+    regular_file_identities, resolve_fresh_output, validate_experiment,
+    validate_fetch, validate_one_policy, validate_prediction_grid,
+    verify_membership,
 )
 from tools.backtest import load_frozen_bars
 from tools.fetch_universe import UniverseManifest
@@ -74,7 +75,9 @@ def replay(
     }
     fetch = read_json(fetch_input.snapshot, canonical=True)
     validate_fetch(
-        fetch, manifest, manifest_input, bars, session_calendar_input,
+        fetch, manifest, manifest_input,
+        {name: ObservedCsv.from_bars(item) for name, item in bars.items()},
+        session_calendar_input,
     )
     forecasts = read_ledger(ledger_input)
     experiment = read_json(experiment_input.snapshot, canonical=True)

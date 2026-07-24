@@ -14,15 +14,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.universe_scaling_contract import (
-    CALENDAR_SHA256, CONFIG_SHA256, EXPECTED_BUDGETS, FETCH_SHA256,
-    FINALIZER_SOURCE_PATHS, MANIFEST_SHA256, PHASES, SELECTION_FILES,
-    SELECTION_SHA256, SOURCE_PATHS, FitJob, ScalingAttempt,
+    CALENDAR_SHA256, CONFIG_SHA256, CSV_ROOT, EXPECTED_BUDGETS, FETCH_PATH,
+    FETCH_SHA256, FINALIZER_SOURCE_PATHS, MANIFEST_BINDINGS, PHASES,
+    SELECTION_FILES, SELECTION_SHA256, SOURCE_PATHS, FitJob, ScalingAttempt,
     expected_fit_jobs, expected_protocol, expected_scaling_commands,
     question_uses,
 )
-from tools.universe_scaling_inputs import ScalingCoverage, fetch_series
 from tools.universe_scaling_inputs import (
-    EXPECTED_MISSING, common_coverage, selection_binding, selection_paths,
+    ScalingCoverage, common_coverage, fetch_series, selection_binding,
+    selection_paths,
 )
 from tools.universe_contract import PackedRows
 
@@ -97,7 +97,7 @@ def attempt_value(repository_root: str) -> dict[str, object]:
             "PYTHONPYCACHEPREFIX": f"{run_dir}/.pycache",
         },
         "fetch_report": binding(
-            "reports/liquid-common-55-20260724-02-fetch.json", FETCH_SHA256,
+            FETCH_PATH.as_posix(), FETCH_SHA256,
         ),
         "finalizer_tree": tree(
             repository_root, FINALIZER_SOURCE_PATHS, 7_000,
@@ -106,13 +106,9 @@ def attempt_value(repository_root: str) -> dict[str, object]:
         "manifests": [
             {
                 "size": size,
-                **binding(
-                    "reports/universe-selection-20260724-06/manifests/"
-                    f"liquid-common-{size}.json",
-                    digest,
-                ),
+                **binding(file.path, file.sha256),
             }
-            for size, digest in MANIFEST_SHA256.items()
+            for size, file in MANIFEST_BINDINGS.items()
         ],
         "outputs": outputs,
         "primary_python": executable("/runtime/primary-python", 9_000),
@@ -352,8 +348,7 @@ def verify_input_derivation() -> None:
                 "ticker": f"S{index:02d}",
                 "csv": {
                     "path": str(
-                        root / "data/liquid-common-55-20260724-02" /
-                        f"s{index:02d}-30m.csv"
+                        root / CSV_ROOT / f"s{index:02d}-30m.csv"
                     ),
                     "rows": 5_000 + index,
                     "sha256": sha256(2_000 + index),
@@ -395,68 +390,99 @@ def verify_input_derivation() -> None:
                 raise AssertionError("symlinked selection root was accepted")
 
     names = [f"S{index:02d}" for index in range(55)]
-    for index, name in (
-        (11, "ALTR"), (20, "ZI"), (34, "FYBR"),
-        (40, "INFA"), (49, "ENLC"),
-    ):
-        names[index] = name
     manifest = SimpleNamespace(
         series=tuple(SimpleNamespace(ticker=name) for name in names),
         interval_minutes=30, start="start", end="end",
     )
-    bars = {
-        name: SimpleNamespace(timestamps=(name,))
-        for name in names
-    }
-    calls = 0
+    timestamps = {name: (name,) for name in names}
 
     def samples(timestamps: tuple[str, ...], *_: object) -> object:
         return SimpleNamespace(
             opportunities=5_505, rows=timestamps,
         )
 
-    def packed(rows: tuple[str, ...], *_: object) -> PackedRows:
-        nonlocal calls
-        name, phase = rows[0], PHASES[calls % len(PHASES)]
-        index = names.index(name)
-        budget = dict(EXPECTED_BUDGETS)[phase]
-        base, remainder = divmod(budget.control_samples, 11)
-        train = base + (index < remainder) if index < 11 else 1
-        validation = int(name not in dict(EXPECTED_MISSING)[phase])
-        calls += 1
-        return PackedRows((), (train, validation))
+    def derive(missing: dict[str, tuple[int, ...]]) -> ScalingCoverage:
+        calls = 0
 
-    with patch(
-        "tools.universe_scaling_inputs.session_samples",
-        side_effect=samples,
-    ), patch(
-        "tools.universe_scaling_inputs.pack_rows",
-        side_effect=packed,
-    ):
-        coverage = common_coverage(
-            manifest, SimpleNamespace(), bars,
-        )
-    assert calls == 55 * len(PHASES)
+        def packed(rows: tuple[str, ...], *_: object) -> PackedRows:
+            nonlocal calls
+            name, phase = rows[0], PHASES[calls % len(PHASES)]
+            index = names.index(name)
+            budget = dict(EXPECTED_BUDGETS)[phase]
+            base, remainder = divmod(budget.control_samples, 11)
+            train = base + (index < remainder) if index < 11 else 1
+            calls += 1
+            return PackedRows(
+                (), (train, int(index not in missing[phase])),
+            )
+
+        with patch(
+            "tools.universe_scaling_inputs.session_samples",
+            side_effect=samples,
+        ), patch(
+            "tools.universe_scaling_inputs.pack_rows",
+            side_effect=packed,
+        ):
+            result = common_coverage(
+                manifest, SimpleNamespace(), timestamps,
+            )
+        assert calls == 55 * len(PHASES)
+        return result
+
+    missing = {
+        "fold-0": (11, 20),
+        "fold-1": (11, 20, 34),
+        "calibration": (11, 20, 34, 40),
+    }
+    coverage = derive(missing)
     assert tuple(len(item.evaluable) for item in coverage.phases) == (
-        52, 51, 50,
+        53, 52, 51,
     )
     assert tuple(
         (item.phase, item.missing) for item in coverage.phases
-    ) == EXPECTED_MISSING
+    ) == tuple(
+        (phase, tuple(names[index] for index in missing[phase]))
+        for phase in PHASES
+    )
     assert tuple(
         sum(train for _, train, _ in item.counts[:11])
         for item in coverage.phases
     ) == tuple(
         budget.control_samples for _, budget in EXPECTED_BUDGETS
     )
-    assert coverage.unseen_missing == ("ENLC",)
+    assert coverage.promotable
+    coverage.require_promotable()
+
+    unseen_missing = dict(missing)
+    unseen_missing["calibration"] += (49,)
+    coverage = derive(unseen_missing)
+    assert coverage.unseen_missing == (names[49],)
     try:
         coverage.require_promotable()
     except ValueError as error:
-        assert str(error) == \
-            "unseen calibration coverage is incomplete: ENLC"
+        assert str(error) == (
+            f"unseen calibration coverage is incomplete: {names[49]}"
+        )
     else:
         raise AssertionError("incomplete unseen coverage was accepted")
+
+    core_missing = dict(missing)
+    core_missing["fold-0"] = (0, *core_missing["fold-0"])
+    try:
+        derive(core_missing)
+    except ValueError as error:
+        assert str(error) == "core validation coverage is incomplete"
+    else:
+        raise AssertionError("missing core validation coverage was accepted")
+
+    reordered = dict(reversed(tuple(timestamps.items())))
+    try:
+        common_coverage(manifest, SimpleNamespace(), reordered)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("reordered coverage timestamps were accepted")
+
     try:
         ScalingCoverage((), ()).require_promotable()
     except ValueError:

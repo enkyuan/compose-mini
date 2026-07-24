@@ -73,9 +73,7 @@ def _number(field: str, number: int) -> float:
     return value
 
 
-def _records(path: Path) -> Iterator[tuple[str, list[float]]]:
-    if locale.setlocale(locale.LC_NUMERIC) != "C":
-        raise ValueError("LC_NUMERIC must be C")
+def _fields(path: Path) -> Iterator[tuple[int, str, list[str]]]:
     lines = _lines(path)
     try:
         _, header = next(lines)
@@ -94,11 +92,18 @@ def _records(path: Path) -> Iterator[tuple[str, list[float]]]:
             raise ValueError(f"line {number}: invalid canonical UTC timestamp")
         if previous and timestamp <= previous:
             raise ValueError(f"line {number}: timestamps must increase")
-        values = [_number(field, number) for field in fields[1:]]
+        yield number, timestamp, fields[1:]
+        previous = timestamp
+
+
+def _records(path: Path) -> Iterator[tuple[str, list[float]]]:
+    if locale.setlocale(locale.LC_NUMERIC) != "C":
+        raise ValueError("LC_NUMERIC must be C")
+    for number, timestamp, fields in _fields(path):
+        values = [_number(field, number) for field in fields]
         if values[3] <= 0.0:
             raise ValueError(f"line {number}: close must be positive")
         yield timestamp, values
-        previous = timestamp
 
 
 def read_csv(path: Path) -> array:
@@ -116,3 +121,8 @@ def read_bars(path: Path) -> tuple[tuple[str, ...], array]:
         timestamps.append(timestamp)
         rows.extend(values)
     return tuple(timestamps), rows
+
+
+def read_timestamps(path: Path) -> tuple[str, ...]:
+    """Return validated ordered timestamps without parsing OHLCV values."""
+    return tuple(timestamp for _, timestamp, _ in _fields(path))

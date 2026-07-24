@@ -17,9 +17,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.analyze_universe import read_json, validate_config, validate_fetch
-from tools.backtest import load_frozen_bars
-from tools.fetch_universe import UniverseManifest
+from tools.analyze_universe import (
+    ObservedCsv, read_json, validate_config, validate_fetch,
+)
+from tools.data_v1 import read_timestamps
+from tools.fetch_universe import FETCH_SCHEMA, UniverseManifest
 from tools.files import (
     FrozenInput, freeze_inputs, verify_frozen, write_json,
     write_json_exclusive,
@@ -33,12 +35,14 @@ from tools.session_calendar import SessionCalendar
 from tools.universe_contract import universe_roles
 from tools.universe_scaling_contract import (
     CALENDAR_PATH, CALENDAR_SHA256, CONFIG_PATH, CONFIG_SHA256,
-    EXPECTED_BUDGETS, FETCH_PATH, FETCH_SHA256, FINALIZER_SOURCE_PATHS,
-    MANIFEST_SHA256, RUN_ID, SELECTION_ROOT, SOURCE_PATHS, ScalingAttempt,
-    expected_protocol, expected_scaling_commands,
+    EXPECTED_BUDGETS, EXPECTED_FIT_COUNT, EXPECTED_MISSING, FETCH_PATH,
+    FETCH_SHA256, FINALIZER_SOURCE_PATHS, MANIFEST_BINDINGS, RUN_ID,
+    SOURCE_PATHS, ScalingAttempt, expected_fit_jobs, expected_protocol,
+    expected_scaling_commands,
 )
 from tools.universe_scaling_inputs import (
-    common_coverage, fetch_series, selection_binding, selection_paths,
+    ScalingCoverage, common_coverage, fetch_series, selection_binding,
+    selection_paths,
 )
 
 COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -84,6 +88,21 @@ def _view(value: FrozenInput, source: str) -> FrozenInput:
     return FrozenInput(Path(source), value.snapshot, value.sha256)
 
 
+def _require_expected_coverage(
+    coverage: ScalingCoverage, names: Sequence[str],
+) -> None:
+    coverage.require_promotable()
+    if tuple(
+        (item.phase, item.missing) for item in coverage.phases
+    ) != EXPECTED_MISSING:
+        raise ValueError("scaling coverage does not match the frozen benchmark")
+    jobs = expected_fit_jobs(
+        names, {item.phase: item.evaluable for item in coverage.phases},
+    )
+    if len(jobs) != EXPECTED_FIT_COUNT or len(set(jobs)) != len(jobs):
+        raise ValueError("scaling fit schedule does not match the benchmark")
+
+
 def _snapshot_tree(
     paths: Sequence[str], frozen: Mapping[Path, FrozenInput],
 ) -> SourceTree:
@@ -119,18 +138,20 @@ def _parse_constructed(
 def _validate_data(
     frozen: Mapping[Path, FrozenInput],
     discovery: Mapping[str, object],
-) -> None:
+) -> ScalingCoverage:
     report_input = _frozen(frozen, ROOT / FETCH_PATH)
     report = read_json(report_input.snapshot, canonical=True)
     if report != discovery or report_input.sha256 != FETCH_SHA256:
         raise ValueError("frozen fetch report changed")
+    if type(report.get("fetch_schema")) is not int or \
+       report["fetch_schema"] != FETCH_SCHEMA:
+        raise ValueError("scaling fetch report must use schema 4")
     series = fetch_series(report)
     manifests = []
-    for size, digest in MANIFEST_SHA256.items():
-        path = ROOT / SELECTION_ROOT / "manifests" / \
-            f"liquid-common-{size}.json"
+    for size, binding in MANIFEST_BINDINGS.items():
+        path = ROOT / binding.path
         value = _frozen(frozen, path)
-        if value.sha256 != digest:
+        if value.sha256 != binding.sha256:
             raise ValueError(f"cohort-{size} manifest changed")
         manifests.append(UniverseManifest.read(value.snapshot))
     names = tuple(item.ticker for item in manifests[-1].series)
@@ -153,27 +174,29 @@ def _validate_data(
     bar_inputs = tuple(
         _frozen(frozen, Path(item.csv.path)) for item in series
     )
-    bars = {
-        item.name: load_frozen_bars(_view(value, item.csv.path))
+    observed = {
+        item.name: ObservedCsv(
+            item.csv.path, value.sha256, read_timestamps(value.snapshot),
+        )
         for item, value in zip(series, bar_inputs, strict=True)
     }
-    manifest_binding = report["manifest"]
-    calendar_binding = report["session_calendar"]
     validate_fetch(
         report, manifests[-1],
         _view(
             _frozen(
-                frozen,
-                ROOT / SELECTION_ROOT /
-                "manifests/liquid-common-55.json",
+                frozen, ROOT / MANIFEST_BINDINGS[55].path,
             ),
-            manifest_binding["path"],
+            MANIFEST_BINDINGS[55].path,
         ),
-        bars,
-        _view(calendar_input, calendar_binding["path"]),
+        observed,
+        _view(calendar_input, CALENDAR_PATH.as_posix()),
     )
-    coverage = common_coverage(manifests[-1], calendar, bars)
-    coverage.require_promotable()
+    coverage = common_coverage(
+        manifests[-1], calendar,
+        {name: item.timestamps for name, item in observed.items()},
+    )
+    _require_expected_coverage(coverage, names)
+    return coverage
 
 
 def arm(
@@ -208,12 +231,14 @@ def arm(
 
     direct = tuple(dict.fromkeys((
         *members, ROOT / FETCH_PATH, ROOT / CALENDAR_PATH,
-        ROOT / CONFIG_PATH, *(Path(item.csv.path) for item in series),
+        ROOT / CONFIG_PATH,
+        *(ROOT / binding.path for binding in MANIFEST_BINDINGS.values()),
+        *(Path(item.csv.path) for item in series),
     )))
     direct_identities = regular_file_identities(direct)
     with freeze_inputs(direct) as frozen_direct:
         direct_by_path = {item.source: item for item in frozen_direct}
-        _validate_data(direct_by_path, discovery)
+        coverage = _validate_data(direct_by_path, discovery)
         verify_frozen(frozen_direct)
         if regular_file_identities(direct) != direct_identities or \
            selection_binding() != selection:
@@ -267,6 +292,15 @@ def arm(
                     "path": CONFIG_PATH.as_posix(),
                     "sha256": CONFIG_SHA256,
                 },
+                "coverage": [
+                    {
+                        "phase": phase.phase,
+                        "series": [
+                            asdict(item) for item in phase.series
+                        ],
+                    }
+                    for phase in coverage.phases
+                ],
                 "environment": {
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTHONPYCACHEPREFIX": cache.as_posix(),
@@ -279,14 +313,10 @@ def arm(
                 "implementation_commit": implementation_commit,
                 "manifests": [
                     {
-                        "size": size,
-                        "path": (
-                            SELECTION_ROOT / "manifests" /
-                            f"liquid-common-{size}.json"
-                        ).as_posix(),
-                        "sha256": digest,
+                        "size": size, "path": binding.path,
+                        "sha256": binding.sha256,
                     }
-                    for size, digest in MANIFEST_SHA256.items()
+                    for size, binding in MANIFEST_BINDINGS.items()
                 ],
                 "outputs": outputs,
                 "primary_python": asdict(primary),

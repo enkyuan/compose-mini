@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import os
 import stat
 
-from tools.backtest import Bars
 from tools.fetch_universe import UniverseManifest
 from tools.files import file_sha256
 from tools.panel_contract import (
@@ -22,15 +21,11 @@ from tools.universe_contract import (
 )
 from tools.universe_scaling_contract import (
     CSV_ROOT, EXPECTED_BUDGETS, PHASES, SELECTION_FILES, SELECTION_ROOT,
-    SELECTION_SHA256, TreeBinding,
+    SELECTION_SHA256, PhaseCoverage, ScalingCoverage, SeriesCoverage,
+    TreeBinding, timestamp_grid_sha256,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MISSING = (
-    ("fold-0", ("ALTR", "ZI", "ENLC")),
-    ("fold-1", ("ALTR", "ZI", "INFA", "ENLC")),
-    ("calibration", ("ALTR", "ZI", "FYBR", "INFA", "ENLC")),
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,34 +33,6 @@ class ScalingSeries:
     name: str
     csv: FileBinding
     rows: int
-
-
-@dataclass(frozen=True, slots=True)
-class PhaseCoverage:
-    phase: str
-    counts: tuple[tuple[str, int, int], ...]
-    evaluable: tuple[str, ...]
-    missing: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ScalingCoverage:
-    phases: tuple[PhaseCoverage, ...]
-    unseen_missing: tuple[str, ...]
-
-    @property
-    def promotable(self) -> bool:
-        return tuple(item.phase for item in self.phases) == PHASES and \
-            not self.unseen_missing
-
-    def require_promotable(self) -> None:
-        if tuple(item.phase for item in self.phases) != PHASES:
-            raise ValueError("scaling coverage phases are incomplete")
-        if not self.promotable:
-            raise ValueError(
-                "unseen calibration coverage is incomplete: " +
-                ", ".join(self.unseen_missing)
-            )
 
 
 def fetch_series(
@@ -149,37 +116,44 @@ def selection_binding(root: Path = ROOT / SELECTION_ROOT) -> TreeBinding:
 
 def common_coverage(
     manifest: UniverseManifest, calendar: SessionCalendar,
-    bars: Mapping[str, Bars],
+    timestamps: Mapping[str, Sequence[str]],
 ) -> ScalingCoverage:
     """Measure train/development rows without materializing reserved targets."""
     names = tuple(item.ticker for item in manifest.series)
-    if tuple(bars) != names:
-        raise ValueError("coverage bars must follow manifest order")
+    universe_roles(names)
+    if tuple(timestamps) != names:
+        raise ValueError("coverage timestamps must follow manifest order")
     blocks = common_calendar(5_505, 2, 0.1, 12)
     phase_blocks = (*blocks.folds, blocks.holdout[:2])
-    counts = {phase: [] for phase in PHASES}
+    coverage = {phase: [] for phase in PHASES}
     for name in names:
+        series_timestamps = timestamps[name]
         samples = session_samples(
-            bars[name].timestamps, manifest.interval_minutes, calendar,
+            series_timestamps, manifest.interval_minutes, calendar,
             manifest.start, manifest.end, 17, 13, 13,
         )
         if samples.opportunities != 5_505:
             raise ValueError("series opportunity count changed")
         for phase, ranges in zip(PHASES, phase_blocks, strict=True):
-            train, validation = pack_rows(
+            packed = pack_rows(
                 samples.rows, ranges, 17, 13, 13,
-            ).counts
+            )
+            train, validation = packed.counts
             if train < 1:
                 raise ValueError("every series requires training rows")
-            counts[phase].append((name, train, validation))
+            grid = tuple(
+                (
+                    series_timestamps[row.as_of],
+                    series_timestamps[row.entry],
+                    series_timestamps[row.target],
+                )
+                for row in packed.rows[train:]
+            )
+            coverage[phase].append(SeriesCoverage(
+                name, train, validation, timestamp_grid_sha256(grid),
+            ))
     phases = tuple(
-        PhaseCoverage(
-            phase, tuple(counts[phase]),
-            tuple(name for name, _, validation in counts[phase]
-                  if validation),
-            tuple(name for name, _, validation in counts[phase]
-                  if not validation),
-        )
+        PhaseCoverage(phase, tuple(coverage[phase]))
         for phase in PHASES
     )
     budgets = dict(EXPECTED_BUDGETS)
@@ -192,13 +166,8 @@ def common_coverage(
         for item in phases
     ):
         raise ValueError("frozen core update budget changed")
-    if tuple((item.phase, item.missing) for item in phases) != \
-            EXPECTED_MISSING or any(
-                not set(names[:11]) <= set(item.evaluable) for item in phases
-            ):
-        raise ValueError("frozen validation coverage changed")
-    unseen = set(universe_roles(names).unseen)
-    calibration = phases[-1]
-    return ScalingCoverage(
-        phases, tuple(name for name in calibration.missing if name in unseen),
-    )
+    if any(
+        not set(names[:11]) <= set(item.evaluable) for item in phases
+    ):
+        raise ValueError("core validation coverage is incomplete")
+    return ScalingCoverage(phases)

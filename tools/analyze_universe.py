@@ -94,6 +94,19 @@ METRIC_FIELDS = {
 FileIdentity = tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class ObservedCsv:
+    """Bind fetch-audit metadata without exposing price values."""
+
+    path: str
+    sha256: str
+    timestamps: tuple[str, ...]
+
+    @classmethod
+    def from_bars(cls, bars: Bars) -> ObservedCsv:
+        return cls(bars.path, bars.sha256, bars.timestamps)
+
+
 @dataclass(frozen=True)
 class DirectoryMembership:
     run_dir: FileIdentity
@@ -321,7 +334,7 @@ def _session_audit(
 
 def validate_fetch(
     value: Mapping[str, object], manifest: UniverseManifest,
-    manifest_input: FrozenInput, bars: Mapping[str, Bars],
+    manifest_input: FrozenInput, observed: Mapping[str, ObservedCsv],
     calendar_input: FrozenInput | None = None,
 ) -> None:
     legacy_fields = {
@@ -421,27 +434,27 @@ def validate_fetch(
             },
         }
         csv = record["csv"]
-        series_bars = bars[spec.ticker]
+        series_csv = observed[spec.ticker]
         csv_fields = {
             "path", "rows", "sessions", "source_rows", "sha256",
         } | ({audit_field} if audit_field is not None else set())
         if record["reference"] != reference or record["aggregate"] != aggregate or \
            not isinstance(csv, dict) or set(csv) != csv_fields or \
-           csv["path"] != series_bars.path or \
-           csv["sha256"] != series_bars.sha256 or \
-           _integer(csv["rows"], "CSV rows", 1) != len(series_bars.timestamps) or \
+           csv["path"] != series_csv.path or \
+           csv["sha256"] != series_csv.sha256 or \
+           _integer(csv["rows"], "CSV rows", 1) != len(series_csv.timestamps) or \
            _integer(csv["sessions"], "CSV sessions", 1) > csv["rows"] or \
            _integer(csv["source_rows"], "CSV source rows", 1) < csv["rows"]:
             raise ValueError("fetch request or CSV contract is invalid")
         if audited:
             sessions, audit = (
                 _session_audit(
-                    series_bars.timestamps, manifest.interval_minutes,
+                    series_csv.timestamps, manifest.interval_minutes,
                     calendar, manifest.start, manifest.end,
                 )
                 if session_aware and calendar is not None else
                 _gap_audit(
-                    series_bars.timestamps, manifest.interval_minutes,
+                    series_csv.timestamps, manifest.interval_minutes,
                     calendar,
                 )
             )
@@ -1128,7 +1141,9 @@ def analyze(
     }
     fetch = read_json(named["fetch"].snapshot, canonical=True)
     validate_fetch(
-        fetch, manifest, manifest_input, bars, named.get("session_calendar"),
+        fetch, manifest, manifest_input,
+        {name: ObservedCsv.from_bars(item) for name, item in bars.items()},
+        named.get("session_calendar"),
     )
     ledger = read_ledger(named["ledger"])
     experiment = read_json(named["experiment"].snapshot, canonical=True)

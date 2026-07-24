@@ -6,13 +6,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+import hashlib
+import json
 
 from tools.panel_contract import (
     RUN_ID, ExecutableBinding, FileBinding, SourceTree, TorchIdentity,
     _argv, _exact_json, _integer, _object, _relative, _string,
     _sha256, read_canonical_json,
 )
-from tools.universe_contract import UpdateBudget
+from tools.universe_contract import (
+    UpdateBudget, fixed_update_budget,
+)
 
 TRAINING_COHORTS = (11, 22, 33, 55)
 TRANSFER_COHORTS = (11, 22, 33, 44)
@@ -24,30 +28,51 @@ MODELS = (
     "conditioned_panel_transformer", "local_transformer",
 )
 PHASES = ("fold-0", "fold-1", "calibration")
+EXPECTED_MISSING = (
+    ("fold-0", ("ALTR", "ZI")),
+    ("fold-1", ("ALTR", "ZI", "INFA")),
+    ("calibration", ("ALTR", "ZI", "FYBR", "INFA")),
+)
+EXPECTED_FIT_COUNT = 1_215
 COMMANDS = ("validate", "preflight", "calibrate", "analyze")
 OUTPUTS = ("fits", "predictions", "summary", "outcome")
 POOLED_MODELS = ("global_mlp", "panel_transformer")
 SELECTION_ROOT = Path("reports/universe-selection-20260724-06")
-FETCH_PATH = Path("reports/liquid-common-55-20260724-02-fetch.json")
+FETCH_PATH = Path("reports/liquid-common-55-20260724-03-fetch.json")
 CALENDAR_PATH = Path(
     "universes/us-equities-core-2024-07-22_2026-07-21.json",
 )
 CONFIG_PATH = Path("experiments/executable-h13-universe.example.json")
-CSV_ROOT = Path("data/liquid-common-55-20260724-02")
+CSV_ROOT = Path("data/liquid-common-55-20260724-03")
 SELECTION_FILES = 77
 SELECTION_SHA256 = \
     "bd9366ec5b040555e8b05ae932447b01b97d57e51832c9d5503059fc9119db24"
 FETCH_SHA256 = \
-    "6ce6f65a3719cc57382487e06a2e431ae5f7c435642e6c57fb4398260dd17dc5"
+    "add7222cd531103696f6835104182d175534dfbd99f99db5c30662069f20e42b"
 CALENDAR_SHA256 = \
     "b1e0835a60624a67e21f7941ac00ece6c488937989560bbd4d0333afd869e5f8"
 CONFIG_SHA256 = \
     "ea36e6301370fb3ae750aa96e0fc0d34052e58481f76886f5ebc24c033897454"
-MANIFEST_SHA256 = MappingProxyType({
-    11: "d6a4fb9d5f6d5a96c49d5c9419de2b1e559e4d6fcfc330a31690e471635f3777",
-    22: "17cf86450f8c82da84b65b4dad3386d2f1874393cc69d24c5ff20ecbb1948bf7",
-    33: "55513c6c0f43081f7d9d092cf4f4bca4f298617bbb52adeb7f8315299e1a35bc",
-    55: "61819afe2729682180d361094793bbff0d0ba13909d04f9dbb838d5233f9e5ff",
+MANIFEST_BINDINGS = MappingProxyType({
+    11: FileBinding(
+        "reports/universe-selection-20260724-06/manifests/"
+        "liquid-common-11.json",
+        "d6a4fb9d5f6d5a96c49d5c9419de2b1e559e4d6fcfc330a31690e471635f3777",
+    ),
+    22: FileBinding(
+        "reports/universe-selection-20260724-06/manifests/"
+        "liquid-common-22.json",
+        "17cf86450f8c82da84b65b4dad3386d2f1874393cc69d24c5ff20ecbb1948bf7",
+    ),
+    33: FileBinding(
+        "reports/universe-selection-20260724-06/manifests/"
+        "liquid-common-33.json",
+        "55513c6c0f43081f7d9d092cf4f4bca4f298617bbb52adeb7f8315299e1a35bc",
+    ),
+    55: FileBinding(
+        "reports/universe-coverage-20260724-01/liquid-common-55.json",
+        "c4ca707f8e4f98ef72ed584ab82c1adc43fcc581433307c29afbe45bef5d8e4d",
+    ),
 })
 EXPECTED_BUDGETS = (
     ("fold-0", UpdateBudget(34_992, 128, 100, 274, 27_400)),
@@ -85,6 +110,23 @@ FINALIZER_SOURCE_PATHS = (
     "tools/universe_scaling.py",
     "tools/universe_scaling_contract.py",
 )
+
+
+def timestamp_grid_sha256(rows: Sequence[Sequence[str]]) -> str:
+    """Hash ordered ``(as_of, entry_time, target_time)`` timestamp rows."""
+    grid = []
+    for index, row in enumerate(rows):
+        values = tuple(row) if isinstance(row, Sequence) and \
+            not isinstance(row, str) else ()
+        if len(values) != 3 or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(f"timestamp grid[{index}] is invalid")
+        grid.append(values)
+    payload = json.dumps(
+        grid, ensure_ascii=True, separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def expected_protocol() -> dict[str, object]:
@@ -277,13 +319,15 @@ class ManifestBinding:
         )
         size = _integer(item["size"], f"manifests[{index}].size")
         try:
-            digest = MANIFEST_SHA256[size]
+            expected = MANIFEST_BINDINGS[size]
         except KeyError as error:
             raise ValueError("manifest cohort size is invalid") from error
-        path = SELECTION_ROOT / "manifests" / f"liquid-common-{size}.json"
         binding = {name: item[name] for name in ("path", "sha256")}
         return cls(
-            size, _binding(binding, f"manifests[{index}]", path, digest),
+            size, _binding(
+                binding, f"manifests[{index}]",
+                Path(expected.path), expected.sha256,
+            ),
         )
 
 
@@ -309,6 +353,155 @@ class TreeBinding:
         if parsed != expected:
             raise ValueError("selection tree does not match the benchmark")
         return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesCoverage:
+    series: str
+    train_rows: int
+    validation_rows: int
+    timestamp_sha256: str
+
+    @classmethod
+    def parse(cls, value: object, label: str) -> SeriesCoverage:
+        item = _object(
+            value,
+            {
+                "series", "train_rows", "validation_rows",
+                "timestamp_sha256",
+            },
+            label,
+        )
+        return cls(
+            _string(item["series"], f"{label}.series"),
+            _integer(item["train_rows"], f"{label}.train_rows"),
+            _integer(
+                item["validation_rows"], f"{label}.validation_rows", 0,
+            ),
+            _sha256(item["timestamp_sha256"],
+                    f"{label}.timestamp_sha256"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseCoverage:
+    phase: str
+    series: tuple[SeriesCoverage, ...]
+
+    @property
+    def counts(self) -> tuple[tuple[str, int, int], ...]:
+        return tuple(
+            (item.series, item.train_rows, item.validation_rows)
+            for item in self.series
+        )
+
+    @property
+    def evaluable(self) -> tuple[str, ...]:
+        return tuple(
+            item.series for item in self.series if item.validation_rows
+        )
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(
+            item.series for item in self.series if not item.validation_rows
+        )
+
+    @classmethod
+    def parse(cls, value: object, index: int) -> PhaseCoverage:
+        label = f"coverage[{index}]"
+        item = _object(value, {"phase", "series"}, label)
+        raw_series = item["series"]
+        if not isinstance(raw_series, list) or len(raw_series) != 55:
+            raise ValueError(f"{label}.series must contain 55 records")
+        return cls(
+            _string(item["phase"], f"{label}.phase"),
+            tuple(
+                SeriesCoverage.parse(
+                    record, f"{label}.series[{series_index}]",
+                )
+                for series_index, record in enumerate(raw_series)
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScalingCoverage:
+    phases: tuple[PhaseCoverage, ...]
+
+    @property
+    def master(self) -> tuple[str, ...]:
+        return tuple(item.series for item in self.phases[0].series)
+
+    @property
+    def unseen_missing(self) -> tuple[str, ...]:
+        unseen = set(self.master[44:])
+        return tuple(
+            name for name in self.phases[-1].missing if name in unseen
+        )
+
+    @property
+    def promotable(self) -> bool:
+        return tuple(item.phase for item in self.phases) == PHASES and \
+            not self.unseen_missing
+
+    def require_promotable(self) -> None:
+        if tuple(item.phase for item in self.phases) != PHASES:
+            raise ValueError("scaling coverage phases are incomplete")
+        if not self.promotable:
+            raise ValueError(
+                "unseen calibration coverage is incomplete: " +
+                ", ".join(self.unseen_missing)
+            )
+
+    @classmethod
+    def parse(cls, value: object) -> ScalingCoverage:
+        if not isinstance(value, list) or len(value) != len(PHASES):
+            raise ValueError("coverage must contain three phases")
+        phases = tuple(
+            PhaseCoverage.parse(item, index)
+            for index, item in enumerate(value)
+        )
+        if tuple(item.phase for item in phases) != PHASES:
+            raise ValueError("coverage phase order is invalid")
+        master = tuple(item.series for item in phases[0].series)
+        if len(set(master)) != len(master) or any(
+            tuple(item.series for item in phase.series) != master
+            for phase in phases[1:]
+        ):
+            raise ValueError("coverage series order is invalid")
+        empty = timestamp_grid_sha256(())
+        if any(
+            (item.validation_rows == 0) !=
+            (item.timestamp_sha256 == empty)
+            for phase in phases for item in phase.series
+        ):
+            raise ValueError("coverage timestamp grid is inconsistent")
+        missing = tuple(set(phase.missing) for phase in phases)
+        if tuple(map(len, missing)) != tuple(
+            len(names) for _, names in EXPECTED_MISSING
+        ) or not missing[0] < missing[1] < missing[2]:
+            raise ValueError("coverage miss identities are invalid")
+        budgets = dict(EXPECTED_BUDGETS)
+        if any(
+            fixed_update_budget(
+                sum(
+                    item.train_rows for item in phase.series[:11]
+                ),
+                budgets[phase.phase].batch_size,
+                budgets[phase.phase].checkpoints,
+            ) != budgets[phase.phase]
+            for phase in phases
+        ):
+            raise ValueError("coverage core update budget changed")
+        coverage = cls(phases)
+        coverage.require_promotable()
+        jobs = expected_fit_jobs(
+            master, {phase.phase: phase.evaluable for phase in phases},
+        )
+        if len(jobs) != EXPECTED_FIT_COUNT or len(set(jobs)) != len(jobs):
+            raise ValueError("coverage fit schedule is invalid")
+        return coverage
 
 
 def _budgets(value: object) -> tuple[tuple[str, UpdateBudget], ...]:
@@ -353,6 +546,7 @@ class ScalingAttempt:
     config: FileBinding
     protocol: Mapping[str, object]
     budgets: tuple[tuple[str, UpdateBudget], ...]
+    coverage: ScalingCoverage
     source_tree: SourceTree
     finalizer_tree: SourceTree
     primary_python: ExecutableBinding
@@ -384,9 +578,9 @@ class ScalingAttempt:
                 "schema", "status", "attempt_path", "run_id", "run_dir",
                 "implementation_commit", "selection_tree", "manifests",
                 "fetch_report", "session_calendar", "config", "protocol",
-                "budgets", "source_tree", "finalizer_tree", "primary_python",
-                "torch_argv", "torch_probe", "environment", "commands",
-                "outputs",
+                "budgets", "coverage", "source_tree", "finalizer_tree",
+                "primary_python", "torch_argv", "torch_probe", "environment",
+                "commands", "outputs",
             },
             "scaling attempt",
         )
@@ -442,6 +636,7 @@ class ScalingAttempt:
             raise ValueError("protocol does not match the frozen benchmark")
         protocol = _freeze(value["protocol"])
         budgets = _budgets(value["budgets"])
+        coverage = ScalingCoverage.parse(value["coverage"])
         source = SourceTree.parse(
             value["source_tree"], "source_tree", SOURCE_PATHS,
         )
@@ -516,8 +711,8 @@ class ScalingAttempt:
             raise ValueError("scaling commands are invalid")
         return cls(
             attempt_path, run_id, run_dir, commit, selection, manifests,
-            fetch, calendar, config, protocol, budgets, source, finalizer,
-            primary, torch_argv, torch,
+            fetch, calendar, config, protocol, budgets, coverage, source,
+            finalizer, primary, torch_argv, torch,
             MappingProxyType(dict(environment)),
             MappingProxyType(commands), MappingProxyType(outputs),
         )
