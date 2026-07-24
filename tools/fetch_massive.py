@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from tools.data_v1 import CSV_HEADER, read_csv
 from tools.float32 import f32
+from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 
 API_HOST = "api.massive.com"
 EASTERN = ZoneInfo("America/New_York")
@@ -194,6 +195,7 @@ def _timestamp(timestamp: int) -> str:
 
 def scan_regular_bars(
     bars: Sequence[Bar], minutes: int,
+    calendar: SessionCalendar | None = None,
 ) -> tuple[list[Bar], int, list[Gap]]:
     """Return observed regular bars and a deterministic internal-gap audit."""
     sessions: dict[date, list[tuple[int, Bar]]] = {}
@@ -201,17 +203,24 @@ def scan_regular_bars(
     for bar in bars:
         local = datetime.fromtimestamp(bar[0] / 1000, timezone.utc).astimezone(EASTERN)
         minute = local.hour * 60 + local.minute
-        if local.weekday() < 5 and 570 <= minute < 960:
+        bounds = (
+            (570, 960) if calendar is None and local.weekday() < 5
+            else calendar.session(local.date()) if calendar is not None
+            else None
+        )
+        if bounds is not None and bounds[0] <= minute and \
+           minute + minutes <= bounds[1]:
             if bar[0] <= previous:
                 raise ValueError("Massive regular-session bars are not chronological")
             previous = bar[0]
-            if local.second or local.microsecond or (minute - 570) % minutes:
+            if local.second or local.microsecond or \
+               (minute - bounds[0]) % minutes:
                 raise ValueError("Massive bar is not aligned to the requested interval")
             sessions.setdefault(local.date(), []).append((minute, bar))
     selected: list[Bar] = []
     gaps: list[Gap] = []
     for day, session in sessions.items():
-        if session[0][0] != 570:
+        if calendar is None and session[0][0] != 570:
             raise ValueError("Massive regular session has an internal gap")
         for left, right in zip(session, session[1:]):
             distance = right[0] - left[0]
@@ -228,9 +237,12 @@ def scan_regular_bars(
     return selected, len(sessions), gaps
 
 
-def regular_bars(bars: Sequence[Bar], minutes: int) -> tuple[list[Bar], int]:
+def regular_bars(
+    bars: Sequence[Bar], minutes: int,
+    calendar: SessionCalendar | None = None,
+) -> tuple[list[Bar], int]:
     """Keep regular hours and reject internal gaps in each observed session."""
-    selected, sessions, gaps = scan_regular_bars(bars, minutes)
+    selected, sessions, gaps = scan_regular_bars(bars, minutes, calendar)
     if gaps:
         raise ValueError("Massive regular session has an internal gap")
     return selected, sessions
@@ -262,6 +274,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("output", type=Path)
     parser.add_argument("--minutes", type=int, default=30)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    parser.add_argument("--calendar", type=Path, default=DEFAULT_CALENDAR)
     parser.add_argument("--unadjusted", action="store_true")
     parser.add_argument("--all-sessions", action="store_true")
     return parser.parse_args(argv)
@@ -270,12 +283,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     try:
+        calendar = (
+            None if args.all_sessions else SessionCalendar.read(args.calendar)
+        )
+        if calendar is not None and (
+            args.start < calendar.start or args.end > calendar.end
+        ):
+            raise ValueError("session calendar does not cover the request")
         key = api_key(args.env_file)
         url = aggregate_url(args.ticker, args.start, args.end,
                             args.minutes, not args.unadjusted)
         source = fetch_bars(url, key, args.ticker)
-        bars, sessions = ((list(source), 0) if args.all_sessions else
-                          regular_bars(source, args.minutes))
+        bars, sessions = (
+            (list(source), 0) if args.all_sessions else
+            regular_bars(source, args.minutes, calendar)
+        )
         write_csv(args.output, bars)
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error

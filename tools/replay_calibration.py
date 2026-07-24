@@ -27,6 +27,7 @@ from tools.files import (
 
 def _sources(
     manifest: Path, run_dir: Path, model: str, output: Path,
+    session_calendar: Path | None,
 ) -> tuple[
     list[Path], tuple[Path, ...], Path, DirectoryMembership,
 ]:
@@ -35,7 +36,8 @@ def _sources(
         raise ValueError("model must be transformer, mlp, or linear")
     membership = directory_membership(run_dir)
     fixed = (
-        manifest, run_dir / "fetch-report.json",
+        manifest, *((session_calendar,) if session_calendar is not None else ()),
+        run_dir / "fetch-report.json",
         run_dir / "experiment.json", run_dir / "calibration.jsonl",
         run_dir / f"policy-{model}.json",
     )
@@ -51,6 +53,7 @@ def replay(
     experiment_input: FrozenInput, ledger_input: FrozenInput,
     policy_input: FrozenInput, csv_inputs: Sequence[FrozenInput],
     run_dir: Path, model: str,
+    session_calendar_input: FrozenInput | None = None,
 ) -> dict[str, object]:
     manifest = UniverseManifest.read(manifest_input.snapshot)
     names = tuple(item.ticker for item in manifest.series)
@@ -70,7 +73,9 @@ def replay(
         for name, path in zip(names, expected, strict=True)
     }
     fetch = read_json(fetch_input.snapshot, canonical=True)
-    validate_fetch(fetch, manifest, manifest_input, bars)
+    validate_fetch(
+        fetch, manifest, manifest_input, bars, session_calendar_input,
+    )
     forecasts = read_ledger(ledger_input)
     experiment = read_json(experiment_input.snapshot, canonical=True)
     validate_experiment(
@@ -92,6 +97,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("model")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--session-calendar", type=Path)
     return parser.parse_args(argv)
 
 
@@ -100,6 +106,7 @@ def main() -> None:
     try:
         sources, csv_paths, output, membership = _sources(
             args.manifest, args.run_dir, args.model, args.output,
+            args.session_calendar,
         )
         with freeze_inputs(sources) as frozen:
             by_source = dict(zip(sources, frozen, strict=True))
@@ -111,6 +118,10 @@ def main() -> None:
                 by_source[args.run_dir / f"policy-{args.model}.json"],
                 tuple(by_source[path] for path in csv_paths),
                 args.run_dir, args.model,
+                (
+                    by_source[args.session_calendar]
+                    if args.session_calendar is not None else None
+                ),
             )
             verify_frozen(frozen)
             verify_membership(args.run_dir, membership)

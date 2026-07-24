@@ -133,12 +133,12 @@ Five requests per minute matches the current Stocks Basic limit. Paid
 unlimited tiers may use the unpaced default, `0`; pacing does not guarantee
 that the provider will complete a fetch.
 
-The downloader follows pagination, keeps regular-session bars, verifies that
-each observed session starts at 09:30 US Eastern with no internal interval
-gaps, converts timestamps to canonical UTC, and atomically writes the runtime's
-six-column CSV. Missing sessions cannot be distinguished from exchange holidays
-without an exchange calendar, so retain the provider and query parameters with
-every experiment.
+The downloader follows pagination, applies the frozen exchange calendar,
+retains complete core-session interval bins, converts timestamps to canonical
+UTC, and atomically writes the runtime's six-column CSV. Universe fetch reports
+bind the calendar by path and SHA-256. The gap audit covers only missing bins
+between observed bars; it does not prove that every expected session is
+complete.
 
 Create an isolated environment and install PyTorch for the machine's CPU or
 accelerator:

@@ -29,11 +29,13 @@ from tools.backtest import (
 from tools.data_v1 import EXECUTABLE_RETURN_TARGET
 from tools.fetch_massive import Bar, scan_regular_bars
 from tools.fetch_universe import (
-    FETCH_SCHEMA, GAP_POLICY, GAP_SCOPE, UniverseManifest,
+    FETCH_SCHEMA, GAP_POLICY, GAP_SCOPE, PREVIOUS_FETCH_SCHEMA,
+    UniverseManifest,
 )
 from tools.files import (
     FrozenInput, freeze_inputs, require_disjoint, verify_frozen, write_json,
 )
+from tools.session_calendar import SessionCalendar
 
 MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
 POLICY_MODELS = ("transformer", "mlp", "linear")
@@ -272,6 +274,7 @@ def _manifest_names(manifest: UniverseManifest) -> tuple[str, ...]:
 
 def _gap_audit(
     timestamps: Sequence[str], minutes: int,
+    calendar: SessionCalendar | None = None,
 ) -> tuple[int, dict[str, object]]:
     observed: list[Bar] = [
         (
@@ -282,7 +285,7 @@ def _gap_audit(
         )
         for timestamp in timestamps
     ]
-    selected, sessions, gaps = scan_regular_bars(observed, minutes)
+    selected, sessions, gaps = scan_regular_bars(observed, minutes, calendar)
     if len(selected) != len(observed):
         raise ValueError("audited CSV contains non-regular bars")
     return sessions, {
@@ -299,21 +302,39 @@ def _gap_audit(
 def validate_fetch(
     value: Mapping[str, object], manifest: UniverseManifest,
     manifest_input: FrozenInput, bars: Mapping[str, Bars],
+    calendar_input: FrozenInput | None = None,
 ) -> None:
     legacy_fields = {
         "schema", "purpose", "declared_on", "eligibility_date", "start", "end",
         "interval_minutes", "adjusted", "session", "manifest", "series",
     }
-    audited = "fetch_schema" in value
-    expected_fields = legacy_fields | (
-        {"fetch_schema", "gap_policy"} if audited else set()
-    )
-    if set(value) != expected_fields or audited and (
-        type(value["fetch_schema"]) is not int or \
-        value["fetch_schema"] != FETCH_SCHEMA or \
-        value["gap_policy"] != GAP_POLICY
+    version = value.get("fetch_schema")
+    if version is not None and (
+        type(version) is not int or
+        version not in (PREVIOUS_FETCH_SCHEMA, FETCH_SCHEMA)
     ):
         raise ValueError("fetch report fields are invalid")
+    audited = version is not None
+    calendar_aware = version == FETCH_SCHEMA
+    expected_fields = legacy_fields | (
+        {"fetch_schema", "gap_policy"} if audited else set()
+    ) | ({"session_calendar"} if calendar_aware else set())
+    if set(value) != expected_fields or \
+       audited and value["gap_policy"] != GAP_POLICY:
+        raise ValueError("fetch report fields are invalid")
+    calendar = None
+    if calendar_aware:
+        if calendar_input is None:
+            raise ValueError("schema-3 fetch requires a session calendar")
+        calendar = SessionCalendar.read(calendar_input.snapshot)
+        if manifest.start < calendar.start or manifest.end > calendar.end or \
+           value["session_calendar"] != {
+               "path": str(calendar_input.source),
+               "sha256": calendar_input.sha256,
+           }:
+            raise ValueError("fetch report does not match its session calendar")
+    elif calendar_input is not None:
+        raise ValueError("legacy fetch does not use a session calendar")
     metadata = {
         "schema": manifest.schema,
         "purpose": manifest.purpose,
@@ -341,12 +362,23 @@ def validate_fetch(
         } or record["ticker"] != spec.ticker or \
            record["stratum"] != spec.stratum:
             raise ValueError("fetch report series order is invalid")
+        reference_value = record["reference"]
+        primary_exchange = (
+            reference_value.get("primary_exchange")
+            if isinstance(reference_value, Mapping) and calendar is not None
+            else None
+        )
+        if calendar is not None and primary_exchange not in calendar.venues:
+            raise ValueError("fetch reference exchange is invalid")
         reference = {
             "path": f"/v3/reference/tickers/{quote(spec.ticker)}",
             "query": {"date": str(manifest.eligibility_date)},
             "active": True, "market": "stocks", "locale": "us",
             "type": "CS", "currency_name": "usd",
-        }
+        } | (
+            {"primary_exchange": primary_exchange}
+            if calendar is not None else {}
+        )
         aggregate = {
             "path": (
                 f"/v2/aggs/ticker/{quote(spec.ticker)}/range/"
@@ -373,7 +405,7 @@ def validate_fetch(
             raise ValueError("fetch request or CSV contract is invalid")
         if audited:
             sessions, audit = _gap_audit(
-                series_bars.timestamps, manifest.interval_minutes,
+                series_bars.timestamps, manifest.interval_minutes, calendar,
             )
             supplied = json.dumps(
                 csv["gap_audit"], allow_nan=False,
@@ -1057,7 +1089,9 @@ def analyze(
         for name in names
     }
     fetch = read_json(named["fetch"].snapshot, canonical=True)
-    validate_fetch(fetch, manifest, manifest_input, bars)
+    validate_fetch(
+        fetch, manifest, manifest_input, bars, named.get("session_calendar"),
+    )
     ledger = read_ledger(named["ledger"])
     experiment = read_json(named["experiment"].snapshot, canonical=True)
     validate_experiment(
@@ -1093,6 +1127,12 @@ def analyze(
         "fetch_report": {
             "path": str(named["fetch"].source), "sha256": named["fetch"].sha256,
         },
+        **({
+            "session_calendar": {
+                "path": str(named["session_calendar"].source),
+                "sha256": named["session_calendar"].sha256,
+            },
+        } if "session_calendar" in named else {}),
         "experiment": {
             "path": str(named["experiment"].source),
             "sha256": named["experiment"].sha256,
@@ -1122,7 +1162,7 @@ def analyze(
     }
     passed = bool(gates["all_pass"])
     return {
-        "schema": 1,
+        "schema": 2 if "session_calendar" in named else 1,
         "status": "pass" if passed else "gate-failure",
         "inputs": input_report,
         "protocol": {
@@ -1147,6 +1187,7 @@ def analyze(
 
 def _sources(
     manifest: Path, config: Path, run_dir: Path, output: Path,
+    session_calendar: Path | None,
 ) -> tuple[
     list[Path], tuple[Path, ...], Path, DirectoryMembership,
 ]:
@@ -1158,7 +1199,9 @@ def _sources(
         raise ValueError("run directory has missing or extra artifacts")
     csv_paths = tuple(sorted(path for path, _identity_ in membership.csv_files))
     sources = [
-        manifest, config, *(run_dir / name for name in REPORT_FILES),
+        manifest, config, *(
+            (session_calendar,) if session_calendar is not None else ()
+        ), *(run_dir / name for name in REPORT_FILES),
         *csv_paths,
     ]
     regular_file_identities(sources)
@@ -1172,6 +1215,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("config", type=Path)
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--session-calendar", type=Path)
     return parser.parse_args(argv)
 
 
@@ -1180,6 +1224,7 @@ def main() -> None:
     try:
         sources, csv_paths, output, membership = _sources(
             args.manifest, args.config, args.run_dir, args.output,
+            args.session_calendar,
         )
         with freeze_inputs(sources) as frozen:
             by_source = dict(zip(sources, frozen, strict=True))
@@ -1198,6 +1243,9 @@ def main() -> None:
                         by_source[args.run_dir / f"backtest-{model}.json"]
                     for model in POLICY_MODELS
                 },
+                **({
+                    "session_calendar": by_source[args.session_calendar],
+                } if args.session_calendar is not None else {}),
             }
             report, passed = analyze(
                 by_source[args.manifest], by_source[args.config], named,

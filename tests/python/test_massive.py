@@ -36,6 +36,7 @@ from tools.files import (
     ExclusiveTemp, file_sha256, rename_noreplace, write_json,
     write_json_exclusive,
 )
+from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 from tools.select_universe import (
     Candidate, DailyRow, Reference, SelectionPolicy, SourceArchive,
     SourceBundle, _candidate_value, _canonical_sha256, _decimal_text,
@@ -69,6 +70,60 @@ def timestamp(value: str) -> int:
 def aggregate(value: str, close: float) -> dict[str, object]:
     return {"t": timestamp(value), "o": close - 0.25, "h": close + 0.5,
             "l": close - 0.5, "c": close, "v": 1000}
+
+
+def calendar_value() -> dict[str, object]:
+    return json.loads(DEFAULT_CALENDAR.read_text(encoding="utf-8"))
+
+
+def test_session_calendar(directory: Path) -> None:
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    assert tuple(map(str, calendar.closed_dates)) == (
+        "2024-09-02", "2024-11-28", "2024-12-25", "2025-01-01",
+        "2025-01-09",
+        "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+        "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27",
+        "2025-12-25", "2026-01-01", "2026-01-19", "2026-02-16",
+        "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+    )
+    assert tuple((str(day), close) for day, close in calendar.early_closes) == (
+        ("2024-11-29", 780), ("2024-12-24", 780),
+        ("2025-07-03", 780), ("2025-11-28", 780),
+        ("2025-12-24", 780),
+    )
+    assert calendar.session(date(2024, 11, 1)) == (570, 960)
+    assert calendar.session(date(2024, 11, 29)) == (570, 780)
+    assert calendar.session(date(2025, 1, 9)) is None
+    assert calendar.session(date(2026, 7, 4)) is None
+    raises(ValueError, calendar.session, date(2024, 7, 21))
+
+    day, sessions, bins = calendar.start, 0, 0
+    while day <= calendar.end:
+        bounds = calendar.session(day)
+        if bounds is not None:
+            sessions += 1
+            bins += (bounds[1] - bounds[0]) // 30
+        day += timedelta(days=1)
+    assert (sessions, bins) == (501, 6483)
+
+    path = directory / "session-calendar.json"
+    for change in (
+        lambda value: value.update({"timezone": "UTC"}),
+        lambda value: value.update({"open_minute": True}),
+        lambda value: value.update({"start": "2024-11-01T00:00:00"}),
+        lambda value: value.update({"venues": ["XNYS", "XNAS"]}),
+        lambda value: value["closed_dates"].reverse(),
+        lambda value: value["early_closes"].update({"2025-01-09": 780}),
+        lambda value: value["early_closes"].update({"2025-07-05": 780}),
+        lambda value: value.update({"sources": []}),
+        lambda value: value.update({"sources": [[]]}),
+    ):
+        value = calendar_value()
+        change(value)
+        write_json(path, value)
+        raises(ValueError, SessionCalendar.read, path)
+    path.write_text('{"schema":1,"schema":1}\n', encoding="ascii")
+    raises(ValueError, SessionCalendar.read, path)
 
 
 def raises(
@@ -2012,7 +2067,7 @@ def manifest_value() -> dict[str, object]:
     return {
         "adjusted": True,
         "declared_on": "2026-07-23",
-        "eligibility_date": "2024-07-22",
+        "eligibility_date": "2024-10-31",
         "end": "2026-07-21",
         "interval_minutes": 30,
         "purpose": "Offline universe test",
@@ -2022,7 +2077,7 @@ def manifest_value() -> dict[str, object]:
             {"stratum": "generic", "ticker": "MSFT"},
         ],
         "session": "regular",
-        "start": "2024-07-22",
+        "start": "2024-11-01",
     }
 
 
@@ -2054,18 +2109,18 @@ def test_manifest_contract(directory: Path) -> None:
     manifest = UniverseManifest.read(path)
     assert path.read_bytes() == original
     assert manifest == UniverseManifest(
-        1, "Offline universe test", date(2026, 7, 23), date(2024, 7, 22),
-        date(2024, 7, 22), date(2026, 7, 21), 30, True, "regular",
+        1, "Offline universe test", date(2026, 7, 23), date(2024, 10, 31),
+        date(2024, 11, 1), date(2026, 7, 21), 30, True, "regular",
         (SeriesSpec("AAPL", "generic"), SeriesSpec("MSFT", "generic")),
     )
     assert manifest.series[0].stratum == manifest.series[1].stratum
 
     value = manifest_value()
-    value["eligibility_date"] = "2024-07-21"
+    value["eligibility_date"] = "2024-10-30"
     write_manifest(path, value)
-    assert UniverseManifest.read(path).eligibility_date == date(2024, 7, 21)
+    assert UniverseManifest.read(path).eligibility_date == date(2024, 10, 30)
 
-    value["eligibility_date"] = "2024-07-23"
+    value["eligibility_date"] = "2024-11-02"
     write_manifest(path, value)
     assert_manifest_error(path)
 
@@ -2107,8 +2162,8 @@ def test_manifest_contract(directory: Path) -> None:
 
     invalid = (
         ("schema", True), ("schema", 2), ("purpose", ""), ("purpose", " "),
-        ("declared_on", "2024-07-21"), ("declared_on", "not-a-date"),
-        ("end", "2024-07-21"), ("interval_minutes", 0),
+        ("declared_on", "2024-10-30"), ("declared_on", "not-a-date"),
+        ("end", "2024-10-31"), ("interval_minutes", 0),
         ("interval_minutes", 60), ("interval_minutes", True),
         ("interval_minutes", 30.0), ("adjusted", 1),
         ("adjusted", "true"), ("session", "extended"),
@@ -2314,12 +2369,13 @@ def fake_requester(requested: list[str],
                 "results": {
                     "ticker": ticker, "active": True, "market": "stocks",
                     "locale": "us", "type": "CS", "currency_name": "usd",
+                    "primary_exchange": "XNYS",
                 },
             }
         ticker = unquote(parts.path.split("/ticker/", 1)[1].split("/", 1)[0])
         return {
             "status": "OK", "ticker": ticker,
-            "results": [aggregate("2024-07-22T13:30:00+00:00", 100.0)],
+            "results": [aggregate("2024-11-01T13:30:00+00:00", 100.0)],
         }
     return request
 
@@ -2352,8 +2408,9 @@ def test_universe_fetch(directory: Path) -> None:
             resolved_output / f"{ticker}-30m.csv"
             for ticker in ("aapl", "msft")
         )
-        assert events[-3:] == [
+        assert events[-4:] == [
             ("hash", manifest_path),
+            ("hash", DEFAULT_CALENDAR),
             ("hash", csvs[0]),
             ("hash", csvs[1]),
         ]
@@ -2375,12 +2432,16 @@ def test_universe_fetch(directory: Path) -> None:
     assert set(report) == {
         "fetch_schema", "schema", "purpose", "declared_on",
         "eligibility_date", "start", "end", "interval_minutes", "adjusted",
-        "session", "gap_policy", "manifest", "series",
+        "session", "gap_policy", "manifest", "session_calendar", "series",
     }
-    assert report["fetch_schema"] == 2
+    assert report["fetch_schema"] == 3
     assert report["manifest"] == {
         "path": str(manifest_path),
         "sha256": hashlib.sha256(frozen_bytes).hexdigest(),
+    }
+    assert report["session_calendar"] == {
+        "path": str(DEFAULT_CALENDAR),
+        "sha256": file_sha256(DEFAULT_CALENDAR),
     }
     series = report["series"]
     assert isinstance(series, list)
@@ -2395,16 +2456,17 @@ def test_universe_fetch(directory: Path) -> None:
         aggregate_contract = item["aggregate"]
         assert reference == {
             "path": f"/v3/reference/tickers/{ticker}",
-            "query": {"date": "2024-07-22"},
+            "query": {"date": "2024-10-31"},
             "active": True, "market": "stocks", "locale": "us",
             "type": "CS", "currency_name": "usd",
+            "primary_exchange": "XNYS",
         }
         assert aggregate_contract["query"] == {
             "adjusted": "true", "sort": "asc", "limit": "50000",
         }
         assert aggregate_contract["path"] == (
             f"/v2/aggs/ticker/{ticker}/range/30/minute/"
-            "2024-07-22/2026-07-21"
+            "2024-11-01/2026-07-21"
         )
         csv = item["csv"]
         path = Path(csv["path"])
@@ -2467,13 +2529,13 @@ def test_observed_bar_gaps(directory: Path) -> None:
     value["series"] = [{"ticker": "AAPL", "stratum": "generic"}]
     write_manifest(manifest, value)
     results = [
-        aggregate("2024-07-22T13:00:00+00:00", 99.0),
-        aggregate("2024-07-22T13:30:00+00:00", 100.0),
-        aggregate("2024-07-22T14:30:00+00:00", 101.0),
-        aggregate("2024-07-22T16:00:00+00:00", 102.0),
-        aggregate("2024-07-22T20:00:00+00:00", 999.0),
-        aggregate("2024-07-23T13:30:00+00:00", 103.0),
-        aggregate("2024-07-23T15:00:00+00:00", 104.0),
+        aggregate("2024-11-01T13:00:00+00:00", 99.0),
+        aggregate("2024-11-01T13:30:00+00:00", 100.0),
+        aggregate("2024-11-01T14:30:00+00:00", 101.0),
+        aggregate("2024-11-01T16:00:00+00:00", 102.0),
+        aggregate("2024-11-01T20:00:00+00:00", 999.0),
+        aggregate("2024-11-04T14:30:00+00:00", 103.0),
+        aggregate("2024-11-04T16:00:00+00:00", 104.0),
     ]
     source = fetch_bars(
         aggregate_url("AAPL", date(2024, 7, 22), date(2024, 7, 23), 30, True),
@@ -2485,27 +2547,27 @@ def test_observed_bar_gaps(directory: Path) -> None:
     assert len(bars) == 5 and sessions == 2
     assert gaps == [
         {
-            "session": "2024-07-22",
-            "left_timestamp": "2024-07-22T13:30:00Z",
-            "right_timestamp": "2024-07-22T14:30:00Z",
+            "session": "2024-11-01",
+            "left_timestamp": "2024-11-01T13:30:00Z",
+            "right_timestamp": "2024-11-01T14:30:00Z",
             "absent_bins": 1,
         },
         {
-            "session": "2024-07-22",
-            "left_timestamp": "2024-07-22T14:30:00Z",
-            "right_timestamp": "2024-07-22T16:00:00Z",
+            "session": "2024-11-01",
+            "left_timestamp": "2024-11-01T14:30:00Z",
+            "right_timestamp": "2024-11-01T16:00:00Z",
             "absent_bins": 2,
         },
         {
-            "session": "2024-07-23",
-            "left_timestamp": "2024-07-23T13:30:00Z",
-            "right_timestamp": "2024-07-23T15:00:00Z",
+            "session": "2024-11-04",
+            "left_timestamp": "2024-11-04T14:30:00Z",
+            "right_timestamp": "2024-11-04T16:00:00Z",
             "absent_bins": 2,
         },
     ]
     misaligned = list(bars)
     misaligned[1] = (
-        timestamp("2024-07-22T14:45:00+00:00"), *misaligned[1][1:],
+        timestamp("2024-11-01T14:45:00+00:00"), *misaligned[1][1:],
     )
     for invalid in (
         misaligned, [bars[0], bars[0]], [bars[1], bars[0]],
@@ -2523,6 +2585,7 @@ def test_observed_bar_gaps(directory: Path) -> None:
                 "results": {
                     "ticker": "AAPL", "active": True, "market": "stocks",
                     "locale": "us", "type": "CS", "currency_name": "usd",
+                    "primary_exchange": "XNYS",
                 },
             }
         return {"status": "OK", "ticker": "AAPL", "results": results}
@@ -2530,7 +2593,7 @@ def test_observed_bar_gaps(directory: Path) -> None:
     report = fetch_universe(
         manifest, output, report_path, key="fake-secret", requester=request,
     )
-    assert report["fetch_schema"] == 2
+    assert report["fetch_schema"] == 3
     assert report["gap_policy"] == "retain-observed-bars"
     csv = report["series"][0]["csv"]
     assert csv["gap_audit"] == {
@@ -2542,9 +2605,9 @@ def test_observed_bar_gaps(directory: Path) -> None:
     }
     timestamps_, values = read_bars(Path(csv["path"]))
     assert timestamps_ == (
-        "2024-07-22T13:30:00Z", "2024-07-22T14:30:00Z",
-        "2024-07-22T16:00:00Z",
-        "2024-07-23T13:30:00Z", "2024-07-23T15:00:00Z",
+        "2024-11-01T13:30:00Z", "2024-11-01T14:30:00Z",
+        "2024-11-01T16:00:00Z",
+        "2024-11-04T14:30:00Z", "2024-11-04T16:00:00Z",
     )
     expected = tuple(
         value
@@ -2552,6 +2615,49 @@ def test_observed_bar_gaps(directory: Path) -> None:
         for value in (close - 0.25, close + 0.5, close - 0.5, close, 1000.0)
     )
     assert tuple(values) == expected
+
+
+def test_calendar_filtering() -> None:
+    results = [
+        aggregate("2024-11-04T15:00:00+00:00", 100.0),
+        aggregate("2024-11-04T16:00:00+00:00", 101.0),
+        aggregate("2024-11-29T17:30:00+00:00", 102.0),
+        aggregate("2024-11-29T18:00:00+00:00", 999.0),
+        aggregate("2024-11-29T18:30:00+00:00", 999.0),
+        aggregate("2025-01-09T14:30:00+00:00", 999.0),
+    ]
+    source = fetch_bars(
+        aggregate_url(
+            "AAPL", date(2024, 11, 4), date(2025, 1, 9), 30, True,
+        ),
+        "fake-secret", "AAPL",
+        lambda _url: {
+            "status": "OK", "ticker": "AAPL", "results": results,
+        },
+    )
+    bars, sessions, gaps = scan_regular_bars(
+        source, 30, SessionCalendar.read(DEFAULT_CALENDAR),
+    )
+    assert [bar[0] for bar in bars] == [
+        timestamp("2024-11-04T15:00:00+00:00"),
+        timestamp("2024-11-04T16:00:00+00:00"),
+        timestamp("2024-11-29T17:30:00+00:00"),
+    ]
+    cross_close = [bar for bar in source if bar[0] == bars[-1][0]]
+    before_close = (
+        timestamp("2024-11-29T16:45:00+00:00"), *cross_close[0][1:],
+    )
+    assert scan_regular_bars(
+        [before_close, *cross_close], 45,
+        SessionCalendar.read(DEFAULT_CALENDAR),
+    ) == ([before_close], 1, [])
+    assert sessions == 2
+    assert gaps == [{
+        "session": "2024-11-04",
+        "left_timestamp": "2024-11-04T15:00:00Z",
+        "right_timestamp": "2024-11-04T16:00:00Z",
+        "absent_bins": 1,
+    }]
 
 
 def test_universe_pagination_gate(directory: Path) -> None:
@@ -2574,13 +2680,14 @@ def test_universe_pagination_gate(directory: Path) -> None:
                 "results": {
                     "ticker": ticker, "active": True, "market": "stocks",
                     "locale": "us", "type": "CS", "currency_name": "usd",
+                    "primary_exchange": "XNYS",
                 },
             }
         ticker = unquote(parts.path.split("/ticker/", 1)[1].split("/", 1)[0])
         paginated = parts.path.endswith("/page")
         result = aggregate(
-            "2024-07-22T14:00:00+00:00" if paginated
-            else "2024-07-22T13:30:00+00:00",
+            "2024-11-01T14:00:00+00:00" if paginated
+            else "2024-11-01T13:30:00+00:00",
             101.0 if paginated else 100.0,
         )
         response: dict[str, object] = {
@@ -2598,10 +2705,10 @@ def test_universe_pagination_gate(directory: Path) -> None:
     )
     assert paths == [
         "/v3/reference/tickers/AAPL",
-        "/v2/aggs/ticker/AAPL/range/30/minute/2024-07-22/2026-07-21",
+        "/v2/aggs/ticker/AAPL/range/30/minute/2024-11-01/2026-07-21",
         "/v2/aggs/ticker/AAPL/page",
         "/v3/reference/tickers/MSFT",
-        "/v2/aggs/ticker/MSFT/range/30/minute/2024-07-22/2026-07-21",
+        "/v2/aggs/ticker/MSFT/range/30/minute/2024-11-01/2026-07-21",
     ]
     assert all(
         math.isclose(actual, index * 12.2)
@@ -2612,13 +2719,13 @@ def test_universe_pagination_gate(directory: Path) -> None:
 
 
 def test_reference_identity(directory: Path) -> None:
-    assert reference_url("AAPL", date(2024, 7, 22)) == (
-        "https://api.massive.com/v3/reference/tickers/AAPL?date=2024-07-22"
+    assert reference_url("AAPL", date(2024, 10, 31)) == (
+        "https://api.massive.com/v3/reference/tickers/AAPL?date=2024-10-31"
     )
     for ticker in ("../AAPL", ".", "..", "-", ".-"):
-        raises(ValueError, reference_url, ticker, date(2024, 7, 22))
+        raises(ValueError, reference_url, ticker, date(2024, 10, 31))
     for ticker in ("BRK.B", "BF-B"):
-        assert urlsplit(reference_url(ticker, date(2024, 7, 22))).path == (
+        assert urlsplit(reference_url(ticker, date(2024, 10, 31))).path == (
             f"/v3/reference/tickers/{ticker}"
         )
 
@@ -2629,6 +2736,7 @@ def test_reference_identity(directory: Path) -> None:
     valid = {
         "ticker": "AAPL", "active": True, "market": "stocks",
         "locale": "us", "type": "CS", "currency_name": "usd",
+        "primary_exchange": "XNYS",
     }
     invalid = (
         {"status": "ERROR", "results": valid},
@@ -2640,6 +2748,8 @@ def test_reference_identity(directory: Path) -> None:
         {"status": "OK", "results": valid | {"locale": "global"}},
         {"status": "OK", "results": valid | {"type": "ETF"}},
         {"status": "OK", "results": valid | {"currency_name": "eur"}},
+        {"status": "OK", "results": valid | {"primary_exchange": "XASE"}},
+        {"status": "OK", "results": valid | {"primary_exchange": 1}},
     )
     for index, response in enumerate(invalid):
         output = directory / f"identity-output-{index}"
@@ -2667,6 +2777,26 @@ def test_mutations(directory: Path) -> None:
     raises(ValueError, fetch_universe, manifest, output, report,
            key="fake-secret",
            requester=fake_requester([], mutate_manifest))
+    assert mutated and not os.path.lexists(report)
+
+    write_manifest(manifest, value)
+    calendar = directory / "mutable-calendar.json"
+    calendar.write_bytes(DEFAULT_CALENDAR.read_bytes())
+    output = directory / "calendar-mutation-output"
+    report = directory / "calendar-mutation-report.json"
+    mutated = False
+
+    def mutate_calendar(_url: str) -> None:
+        nonlocal mutated
+        if not mutated:
+            calendar.write_text('{"mutated":true}\n', encoding="ascii")
+            mutated = True
+
+    raises(
+        ValueError, fetch_universe, manifest, output, report,
+        calendar_path=calendar, key="fake-secret",
+        requester=fake_requester([], mutate_calendar),
+    )
     assert mutated and not os.path.lexists(report)
 
     write_manifest(manifest, value)
@@ -2793,6 +2923,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="compose-mini-massive-") as name:
         directory = Path(name)
         test_request_gate()
+        test_session_calendar(directory)
         test_selection_policy(directory)
         test_pure_selection()
         test_universe_sources()
@@ -2811,6 +2942,7 @@ def main() -> None:
         test_rate_validation(directory)
         test_universe_fetch(directory)
         test_observed_bar_gaps(directory)
+        test_calendar_filtering()
         test_universe_pagination_gate(directory)
         test_reference_identity(directory)
         test_mutations(directory)

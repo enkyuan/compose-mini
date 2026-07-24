@@ -22,13 +22,15 @@ from tools.fetch_massive import (
     fetch_bars, request_gate, request_json, scan_regular_bars, write_csv,
 )
 from tools.files import file_sha256, freeze_inputs, write_json
+from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 
 MANIFEST_FIELDS = {
     "schema", "purpose", "declared_on", "eligibility_date", "start", "end",
     "interval_minutes", "adjusted", "session", "series",
 }
 SERIES_FIELDS = {"ticker", "stratum"}
-FETCH_SCHEMA = 2
+FETCH_SCHEMA = 3
+PREVIOUS_FETCH_SCHEMA = 2
 GAP_POLICY = "retain-observed-bars"
 GAP_SCOPE = "internal-between-observed-bars"
 
@@ -191,6 +193,7 @@ def _contract(url: str) -> dict[str, object]:
 def _reference(
     ticker: str,
     eligibility_date: date,
+    venues: Sequence[str],
     key: str,
     requester: Requester,
 ) -> dict[str, object]:
@@ -207,10 +210,12 @@ def _reference(
     }
     if not isinstance(payload, Mapping) or payload.get("status") != "OK" or \
        not isinstance(result, Mapping) or result.get("active") is not True or \
-       any(result.get(name) != value for name, value in expected.items()):
+       any(result.get(name) != value for name, value in expected.items()) or \
+       result.get("primary_exchange") not in venues:
         raise ValueError("Massive returned an ineligible reference ticker")
     contract = _contract(url)
     contract.update((name, result[name]) for name in expected if name != "ticker")
+    contract["primary_exchange"] = result["primary_exchange"]
     return contract
 
 
@@ -224,6 +229,7 @@ def fetch_universe(
     output_dir: Path,
     report_path: Path,
     *,
+    calendar_path: Path = DEFAULT_CALENDAR,
     key: str | None = None,
     requester: Requester | None = None,
     requests_per_minute: int = 0,
@@ -236,10 +242,16 @@ def fetch_universe(
     if not os.path.lexists(manifest_path) or manifest_path.is_symlink() or \
        not manifest_path.is_file():
         raise ValueError("universe manifest must be a regular file")
+    if not os.path.lexists(calendar_path) or calendar_path.is_symlink() or \
+       not calendar_path.is_file():
+        raise ValueError("session calendar must be a regular file")
 
-    with freeze_inputs((manifest_path,)) as inputs:
-        frozen = inputs[0]
+    with freeze_inputs((manifest_path, calendar_path)) as inputs:
+        frozen, calendar_input = inputs
         manifest = UniverseManifest.read(frozen.snapshot)
+        calendar = SessionCalendar.read(calendar_input.snapshot)
+        if manifest.start < calendar.start or manifest.end > calendar.end:
+            raise ValueError("session calendar does not cover the universe")
         csv_paths = tuple(
             output_dir / (
                 f"{item.ticker.lower()}-{manifest.interval_minutes}m.csv"
@@ -271,7 +283,8 @@ def fetch_universe(
         records = []
         for item, path in zip(manifest.series, csv_paths, strict=True):
             reference = _reference(
-                item.ticker, manifest.eligibility_date, secret, transport,
+                item.ticker, manifest.eligibility_date, calendar.venues,
+                secret, transport,
             )
             aggregate = aggregate_url(
                 item.ticker, manifest.start, manifest.end,
@@ -280,7 +293,7 @@ def fetch_universe(
             aggregate_contract = _contract(aggregate)
             source = fetch_bars(aggregate, secret, item.ticker, transport)
             bars, sessions, gaps = scan_regular_bars(
-                source, manifest.interval_minutes,
+                source, manifest.interval_minutes, calendar,
             )
             write_csv(path, bars)
             rows = len(read_csv(path)) // FEATURE_COUNT
@@ -327,6 +340,10 @@ def fetch_universe(
                 "path": str(manifest_path),
                 "sha256": frozen.sha256,
             },
+            "session_calendar": {
+                "path": str(calendar_path),
+                "sha256": calendar_input.sha256,
+            },
             "series": records,
         }
 
@@ -334,6 +351,9 @@ def fetch_universe(
         _regular_file(manifest_path, "universe manifest")
         if file_sha256(manifest_path) != frozen.sha256:
             raise ValueError("universe manifest changed during the fetch")
+        _regular_file(calendar_path, "session calendar")
+        if file_sha256(calendar_path) != calendar_input.sha256:
+            raise ValueError("session calendar changed during the fetch")
         for path, record in zip(csv_paths, records, strict=True):
             _regular_file(path, "universe CSV")
             csv = record["csv"]
@@ -349,6 +369,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--session-calendar", type=Path, default=DEFAULT_CALENDAR)
     parser.add_argument("--requests-per-minute", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -358,6 +379,7 @@ def main() -> None:
     try:
         report = fetch_universe(
             args.manifest, args.output_dir, args.report,
+            calendar_path=args.session_calendar,
             requests_per_minute=args.requests_per_minute,
         )
     except (OSError, ValueError) as error:

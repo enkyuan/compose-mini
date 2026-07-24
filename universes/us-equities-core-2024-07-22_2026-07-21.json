@@ -1,0 +1,49 @@
+{
+  "close_minute": 960,
+  "closed_dates": [
+    "2024-09-02",
+    "2024-11-28",
+    "2024-12-25",
+    "2025-01-01",
+    "2025-01-09",
+    "2025-01-20",
+    "2025-02-17",
+    "2025-04-18",
+    "2025-05-26",
+    "2025-06-19",
+    "2025-07-04",
+    "2025-09-01",
+    "2025-11-27",
+    "2025-12-25",
+    "2026-01-01",
+    "2026-01-19",
+    "2026-02-16",
+    "2026-04-03",
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-03"
+  ],
+  "early_closes": {
+    "2024-11-29": 780,
+    "2024-12-24": 780,
+    "2025-07-03": 780,
+    "2025-11-28": 780,
+    "2025-12-24": 780
+  },
+  "end": "2026-07-21",
+  "open_minute": 570,
+  "purpose": "Freeze XNAS and XNYS core sessions for the 55-stock scaling benchmark.",
+  "schema": 1,
+  "sources": [
+    "https://ir.theice.com/press/news-details/2023/NYSE-Group-Announces-2024-2025-and-2026-Holiday-and-Early-Closings-Calendar/default.aspx",
+    "https://ir.theice.com/press/news-details/2024/The-New-York-Stock-Exchange-Will-Close-Markets-on-January-9-to-Honor-the-Passing-of-Former-President-Jimmy-Carter-on-National-Day-of-Mourning/default.aspx",
+    "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+    "https://ir.nasdaq.com/news-releases/news-release-details/nasdaq-announces-closure-its-us-markets-honor-national-day-0"
+  ],
+  "start": "2024-07-22",
+  "timezone": "America/New_York",
+  "venues": [
+    "XNAS",
+    "XNYS"
+  ]
+}

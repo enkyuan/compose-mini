@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from functools import cache
 from io import StringIO
 from pathlib import Path
 from statistics import fmean
@@ -36,6 +37,7 @@ from tools.backtest import (
 )
 from tools.fetch_universe import fetch_universe
 from tools.files import file_sha256, write_json
+from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 from tools.select_policy import select_policy
 
 MODELS = ("transformer", "linear", "mlp", "rolling_mean", "last_close")
@@ -131,7 +133,7 @@ def manifest_value() -> dict[str, object]:
     return {
         "adjusted": True,
         "declared_on": "2026-07-23",
-        "eligibility_date": "2024-07-22",
+        "eligibility_date": "2024-10-31",
         "end": "2026-07-21",
         "interval_minutes": 30,
         "purpose": "Synthetic common-stock universe analysis fixture.",
@@ -141,7 +143,7 @@ def manifest_value() -> dict[str, object]:
             for index in range(11)
         ],
         "session": "regular",
-        "start": "2024-07-22",
+        "start": "2024-11-01",
     }
 
 
@@ -153,12 +155,20 @@ def config_value() -> dict[str, object]:
     )
 
 
+@cache
 def timestamps() -> tuple[str, ...]:
-    start = datetime(2026, 1, 2, 14, 30, tzinfo=timezone.utc)
-    return tuple(
-        (start + timedelta(days=index)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        for index in range(50)
-    )
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    day, values = date(2025, 8, 1), []
+    while len(values) < 50:
+        if calendar.session(day) is not None:
+            values.append(
+                datetime(
+                    day.year, day.month, day.day, 13, 30,
+                    tzinfo=timezone.utc,
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+        day += timedelta(days=1)
+    return tuple(values)
 
 
 def write_csv(path: Path, stock: int) -> None:
@@ -184,8 +194,8 @@ def test_gap_audit_contract(directory: Path) -> None:
     manifest["series"] = [{"stratum": "generic", "ticker": "AAPL"}]
     write_json(manifest_path, manifest)
     values = (
-        ("2024-07-22T13:30:00+00:00", 100.0),
-        ("2024-07-22T14:30:00+00:00", 101.0),
+        ("2024-11-01T13:30:00+00:00", 100.0),
+        ("2024-11-01T14:30:00+00:00", 101.0),
     )
 
     def request(url: str) -> dict[str, object]:
@@ -195,6 +205,7 @@ def test_gap_audit_contract(directory: Path) -> None:
                 "results": {
                     "ticker": "AAPL", "active": True, "market": "stocks",
                     "locale": "us", "type": "CS", "currency_name": "usd",
+                    "primary_exchange": "XNYS",
                 },
             }
         return {
@@ -216,14 +227,36 @@ def test_gap_audit_contract(directory: Path) -> None:
     manifest_input = analysis.FrozenInput(
         manifest_path, manifest_path, file_sha256(manifest_path),
     )
+    calendar_input = analysis.FrozenInput(
+        DEFAULT_CALENDAR, DEFAULT_CALENDAR, file_sha256(DEFAULT_CALENDAR),
+    )
     bars = {"AAPL": load_bars(Path(report["series"][0]["csv"]["path"]))}
-    analysis.validate_fetch(report, parsed, manifest_input, bars)
+    analysis.validate_fetch(
+        report, parsed, manifest_input, bars, calendar_input,
+    )
+
+    previous = json.loads(json.dumps(report))
+    previous["fetch_schema"] = 2
+    del previous["session_calendar"]
+    del previous["series"][0]["reference"]["primary_exchange"]
+    analysis.validate_fetch(previous, parsed, manifest_input, bars)
+    for candidate, supplied in ((report, None), (previous, calendar_input)):
+        try:
+            analysis.validate_fetch(
+                candidate, parsed, manifest_input, bars, supplied,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("fetch accepted the wrong calendar mode")
 
     def rejected(change: Callable[[dict[str, object]], None]) -> None:
         candidate = json.loads(json.dumps(report))
         change(candidate)
         try:
-            analysis.validate_fetch(candidate, parsed, manifest_input, bars)
+            analysis.validate_fetch(
+                candidate, parsed, manifest_input, bars, calendar_input,
+            )
         except ValueError:
             return
         raise AssertionError("mutated gap audit was accepted")
@@ -232,6 +265,10 @@ def test_gap_audit_contract(directory: Path) -> None:
         lambda value: value.update({"fetch_schema": 1}),
         lambda value: value.update({"fetch_schema": 2.0}),
         lambda value: value.update({"gap_policy": "strict"}),
+        lambda value: value["session_calendar"].update({"sha256": "0" * 64}),
+        lambda value: value["series"][0]["reference"].update(
+            {"primary_exchange": "XASE"}
+        ),
         lambda value: value["series"][0]["csv"]["gap_audit"].update(
             {"scope": "all-session-bins"}
         ),
@@ -256,6 +293,30 @@ def test_gap_audit_contract(directory: Path) -> None:
     ):
         rejected(change)
 
+    csv_path = Path(report["series"][0]["csv"]["path"])
+    original = csv_path.read_text(encoding="ascii")
+    try:
+        csv_path.write_text(
+            original + "2024-11-29T18:00:00Z,1,1,1,1,1\n",
+            encoding="ascii",
+        )
+        candidate = json.loads(json.dumps(report))
+        candidate["series"][0]["csv"].update({
+            "rows": 3, "sessions": 2, "source_rows": 3,
+            "sha256": file_sha256(csv_path),
+        })
+        try:
+            analysis.validate_fetch(
+                candidate, parsed, manifest_input,
+                {"AAPL": load_bars(csv_path)}, calendar_input,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("early-close after-hours row was accepted")
+    finally:
+        csv_path.write_text(original, encoding="ascii")
+
 
 def request_contract(
     ticker: str, manifest: Mapping[str, object],
@@ -268,6 +329,7 @@ def request_contract(
         "locale": "us",
         "type": "CS",
         "currency_name": "usd",
+        "primary_exchange": "XNYS",
     }
     aggregate = {
         "path": (
@@ -333,6 +395,7 @@ class Fixture:
         self.output_dir.mkdir()
         self.manifest = manifest_value()
         self.config = config_value()
+        self.calendar_args = ("--session-calendar", DEFAULT_CALENDAR)
         write_json(self.manifest_path, self.manifest)
         write_json(self.config_path, self.config)
         self.names = tuple(
@@ -372,6 +435,7 @@ class Fixture:
                 sys.executable, REPLAYER, self.manifest_path,
                 self.cli_run_dir, model,
                 self.cli_run_dir / f"backtest-{model}.json",
+                *self.calendar_args,
             ))
 
     def _write_fetch(self) -> None:
@@ -390,6 +454,13 @@ class Fixture:
                     "sessions": 50,
                     "source_rows": 50,
                     "sha256": file_sha256(self.csv_paths[name]),
+                    "gap_audit": {
+                        "scope": "internal-between-observed-bars",
+                        "affected_sessions": 0,
+                        "internal_gap_count": 0,
+                        "internal_missing_bins": 0,
+                        "gaps": [],
+                    },
                 },
             })
         write_json(self.fetch_path, {
@@ -400,6 +471,12 @@ class Fixture:
             "manifest": {
                 "path": str(self.manifest_path),
                 "sha256": file_sha256(self.manifest_path),
+            },
+            "fetch_schema": 3,
+            "gap_policy": "retain-observed-bars",
+            "session_calendar": {
+                "path": str(DEFAULT_CALENDAR),
+                "sha256": file_sha256(DEFAULT_CALENDAR),
             },
             "series": records,
         })
@@ -546,7 +623,7 @@ class Fixture:
         assert not output.exists()
         run((
             sys.executable, ANALYZER, self.manifest_path, self.config_path,
-            self.cli_run_dir, output,
+            self.cli_run_dir, output, *self.calendar_args,
         ), expected)
         if expected not in (0, 3):
             assert not output.exists()
@@ -586,6 +663,7 @@ class Fixture:
                     sys.executable, REPLAYER, self.manifest_path,
                     self.cli_run_dir, model,
                     self.cli_run_dir / f"backtest-{model}.json",
+                    *self.calendar_args,
                 ))
             report = self.analyze(name, expected=3)
             assert report is not None
@@ -602,6 +680,7 @@ class Fixture:
         argv = [
             str(ANALYZER), str(self.manifest_path), str(self.config_path),
             str(self.cli_run_dir), str(output),
+            *(str(item) for item in self.calendar_args),
         ]
         with patch.object(sys, "argv", argv), \
              redirect_stdout(StringIO()), redirect_stderr(StringIO()):
@@ -631,6 +710,7 @@ class Fixture:
             "ledger": frozen(
                 self.cli_run_dir / "calibration.jsonl", self.ledger_path,
             ),
+            "session_calendar": frozen(DEFAULT_CALENDAR),
             **{
                 f"policy-{model}": frozen(
                     self.cli_run_dir / f"policy-{model}.json",
@@ -735,7 +815,7 @@ def actual_timestamp_mutation(fixture: Fixture) -> None:
     name = fixture.names[0]
     csv_path = fixture.csv_paths[name]
     lines = csv_path.read_text(encoding="ascii").splitlines()
-    lines[31] = lines[31].replace("T14:30:00Z", "T14:31:00Z", 1)
+    lines[31] = lines[31].replace("T13:30:00Z", "T13:31:00Z", 1)
     csv_path.write_text("\n".join(lines) + "\n", encoding="ascii")
     checksum = file_sha256(csv_path)
 
@@ -857,6 +937,11 @@ def test_valid_reports(root: Path) -> Fixture:
     passing = Fixture(root / "passing")
     report = passing.analyze("pass.json")
     assert report is not None and report["status"] == "pass"
+    assert report["schema"] == 2
+    assert report["inputs"]["session_calendar"] == {
+        "path": str(DEFAULT_CALENDAR),
+        "sha256": file_sha256(DEFAULT_CALENDAR),
+    }
     assert report["gates"]["all_pass"] is True
     assert report["protocol"]["seed_ensemble"] == \
         "arithmetic mean before stock/timestamp pairing"
@@ -915,15 +1000,40 @@ def test_valid_reports(root: Path) -> Fixture:
     return passing
 
 
+def test_calendar_cli_binding(fixture: Fixture) -> None:
+    commands = (
+        (
+            sys.executable, ANALYZER, fixture.manifest_path,
+            fixture.config_path, fixture.cli_run_dir,
+        ),
+        (
+            sys.executable, REPLAYER, fixture.manifest_path,
+            fixture.cli_run_dir, "transformer",
+        ),
+    )
+    for index, command in enumerate(commands):
+        output = fixture.output_dir / f"missing-calendar-{index}.json"
+        run((*command, output), expected=2)
+        assert not output.exists()
+
+    copy = fixture.output_dir / "calendar-copy.json"
+    copy.write_bytes(DEFAULT_CALENDAR.read_bytes())
+    output = fixture.output_dir / "wrong-calendar-path.json"
+    run((
+        *commands[0], output, "--session-calendar", copy,
+    ), expected=2)
+    assert not output.exists()
+
+
 def test_output_freshness(fixture: Fixture) -> None:
     commands = {
         "analyzer": (
             sys.executable, ANALYZER, fixture.manifest_path,
-            fixture.config_path, fixture.cli_run_dir,
+            fixture.config_path, fixture.cli_run_dir, *fixture.calendar_args,
         ),
         "replayer": (
             sys.executable, REPLAYER, fixture.manifest_path,
-            fixture.cli_run_dir, "transformer",
+            fixture.cli_run_dir, "transformer", *fixture.calendar_args,
         ),
     }
     for tool, command in commands.items():
@@ -963,7 +1073,7 @@ def test_late_membership(fixture: Fixture) -> None:
         ):
             run_main(analysis.main, (
                 ANALYZER, fixture.manifest_path, fixture.config_path,
-                fixture.cli_run_dir, analyzer_output,
+                fixture.cli_run_dir, analyzer_output, *fixture.calendar_args,
             ), expected=2)
         assert not analyzer_output.exists()
     finally:
@@ -986,7 +1096,7 @@ def test_late_membership(fixture: Fixture) -> None:
         ):
             run_main(replay_tool.main, (
                 REPLAYER, fixture.manifest_path, fixture.cli_run_dir,
-                "transformer", replay_output,
+                "transformer", replay_output, *fixture.calendar_args,
             ), expected=2)
         assert not replay_output.exists()
     finally:
@@ -1015,6 +1125,7 @@ def test_hardlink_integrity(fixture: Fixture) -> None:
         run((
             sys.executable, REPLAYER, fixture.manifest_path,
             fixture.cli_run_dir, "transformer", replay_output,
+            *fixture.calendar_args,
         ), expected=2)
         assert not replay_output.exists()
     finally:
@@ -1041,7 +1152,7 @@ def test_hardlink_integrity(fixture: Fixture) -> None:
         ):
             run_main(analysis.main, (
                 ANALYZER, fixture.manifest_path, fixture.config_path,
-                fixture.cli_run_dir, output,
+                fixture.cli_run_dir, output, *fixture.calendar_args,
             ), expected=2)
         assert not output.exists()
     finally:
@@ -1192,6 +1303,7 @@ def main() -> None:
     ) as directory:
         test_gap_audit_contract(Path(directory))
         fixture = test_valid_reports(Path(directory))
+        test_calendar_cli_binding(fixture)
         test_output_freshness(fixture)
         test_late_membership(fixture)
         test_hardlink_integrity(fixture)
