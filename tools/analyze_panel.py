@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import os
-import subprocess
+import random
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,19 +26,21 @@ from tools.files import (
     write_json_exclusive,
 )
 from tools.panel_contract import (
-    HEX, NAME, PanelAttempt, PanelInputs, TorchIdentity,
-    _directory_identity, _open_directory,
+    BOOTSTRAP_BLOCKS, BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED,
+    COMPARISON_PROFILE, HEX, LEGACY_PROFILE, LOCAL_MODELS, NAME,
+    SEEDS, SERIES, PanelAttempt, PanelInputs, PanelProfile, TorchIdentity,
+    _directory_identity, _exact_json, _open_directory,
+    expected_panel_commands, expected_panel_sweep, observe_torch,
+    panel_analysis_protocol, panel_gates as _gates, panel_profile,
     read_canonical_json, read_canonical_json_lines,
-    regular_file_identities, resolve_fresh_output,
+    regular_file_identities, resolve_fresh_output, validate_panel_analysis,
 )
 
-LOCAL_MODELS = (
-    "transformer", "linear", "mlp", "rolling_mean", "last_close",
-)
-MODELS = (*LOCAL_MODELS, "panel_transformer")
-SEEDED_MODELS = frozenset(("transformer", "mlp", "panel_transformer"))
-SEEDS = (7, 19, 31, 43, 61)
-SERIES = ("AAPL", "MSFT", "SPY")
+MODELS = LEGACY_PROFILE.models
+SEEDED_MODELS = frozenset((
+    "transformer", "mlp", "panel_transformer",
+    "conditioned_panel_transformer",
+))
 METRICS = (
     "return_mse", "return_mae", "direction_accuracy", "close_mae",
     "zero_return_baseline_mae",
@@ -55,35 +57,14 @@ RECORD_FIELDS = {
 }
 TARGET_OFFSET = 29
 GAP = 12
-EXPECTED_RUNS = 162
-EXPECTED_PANEL_FITS = 15
 METRIC_REL_TOL = 1e-6
 METRIC_ABS_TOL = 1e-8
 
 
-def _expected_sweep(models: Sequence[str]) -> dict[str, object]:
-    return {
-        "alignment_horizon_bars": 13,
-        "batch_size": 128,
-        "candidates": [{
-            "feature_set": "ohlcv", "ff_dim": 32, "heads": 2, "layers": 1,
-            "learning_rate": 0.0003, "mlp_dim": 32, "model_dim": 16,
-            "name": "raw-17", "ridge": 0.001, "rolling_window": 8,
-            "seq_len": 17, "weight_decay": 0.0001,
-        }],
-        "epochs": 100,
-        "fold_fraction": 0.1,
-        "folds": 2,
-        "models": list(models),
-        "patience": 10,
-        "seeds": list(SEEDS),
-        "target_horizon_bars": 13,
-        "target_kind": EXECUTABLE_RETURN_TARGET,
-    }
-
-
-def _expected_protocol(run_count: int) -> dict[str, object]:
-    return {
+def _expected_protocol(
+    run_count: int, profile: PanelProfile | None = None,
+) -> dict[str, object]:
+    protocol = {
         "split": "embargoed expanding walk-forward by target time",
         "selection": "minimum mean validation scaled-return MSE",
         "selection_aggregation": "macro mean over series, folds, and seeds",
@@ -109,6 +90,21 @@ def _expected_protocol(run_count: int) -> dict[str, object]:
             "mlp_parameters": 8_388_608,
         },
     }
+    if profile == COMPARISON_PROFILE:
+        protocol["panel_conditioning"] = {
+            "model": "conditioned_panel_transformer",
+            "kind": "learned-series-embedding",
+            "series_order": list(SERIES),
+            "initialization": "zeros",
+            "application": "additive-before-encoder",
+        }
+    return protocol
+
+
+def _baseline_sweep() -> dict[str, object]:
+    sweep = expected_panel_sweep(LEGACY_PROFILE)
+    sweep["models"] = list(LOCAL_MODELS)
+    return sweep
 
 
 def _finite(value: object, label: str, minimum: float = 0.0,
@@ -128,21 +124,6 @@ def _integer(value: object, label: str, minimum: int = 0,
        maximum is not None and value > maximum:
         raise ValueError(f"{label} is invalid")
     return value
-
-
-def _exact_json(value: object, expected: object) -> bool:
-    if type(value) is not type(expected):
-        return False
-    if isinstance(expected, dict):
-        return value.keys() == expected.keys() and all(
-            _exact_json(value[key], item) for key, item in expected.items()
-        )
-    if isinstance(expected, list):
-        return len(value) == len(expected) and all(
-            _exact_json(item, other)
-            for item, other in zip(value, expected, strict=True)
-        )
-    return value == expected
 
 
 def _binding(frozen: FrozenInput) -> dict[str, str]:
@@ -255,25 +236,7 @@ def _grid(timestamps: Sequence[str]) -> Grid:
 
 
 def _observe_torch(attempt: PanelAttempt) -> TorchIdentity:
-    script = (
-        "from dataclasses import asdict\n"
-        "import json\n"
-        "from tools.experiment import _torch_identity\n"
-        "print(json.dumps(asdict(_torch_identity()),"
-        "allow_nan=False,sort_keys=True))\n"
-    )
-    try:
-        result = subprocess.run(
-            (*attempt.torch_argv, "-c", script),
-            cwd=attempt.source_tree.root, check=True, capture_output=True,
-            text=True, timeout=300,
-        )
-        value = json.loads(result.stdout)
-    except (
-        OSError, subprocess.SubprocessError, json.JSONDecodeError,
-    ) as error:
-        raise ValueError("cannot observe the bound Torch runtime") from error
-    return TorchIdentity.parse(value)
+    return observe_torch(attempt.torch_argv, Path(attempt.source_tree.root))
 
 
 def _validate_stage(
@@ -292,52 +255,25 @@ def _validate_stage(
 
 def _expected_commands(
     attempt_path: Path, attempt: PanelAttempt, inputs: PanelInputs,
-) -> dict[str, tuple[str, ...]]:
-    common = (
-        str(attempt_path), attempt.input_manifest.path, attempt.config.path,
+    profile: PanelProfile,
+) -> Mapping[str, tuple[str, ...]]:
+    return expected_panel_commands(
+        attempt_path, attempt.input_manifest.path, attempt.config.path,
         attempt.baseline_report.path, attempt.baseline_ledger.path,
+        attempt.outputs, inputs, profile,
     )
-    series = tuple(f"{item.name}={item.csv.path}" for item in inputs.series)
-    analyzer = "tools/analyze_panel.py"
-    return {
-        "validate_attempt": (
-            analyzer, "validate-attempt", *common, *series,
-        ),
-        "preflight": (analyzer, "preflight", *common, *series),
-        "experiment": (
-            "tools/experiment.py", attempt.config.path,
-            attempt.outputs["experiment_report"], *series,
-            "--attempt-manifest", str(attempt_path),
-            "--input-manifest", attempt.input_manifest.path,
-            "--baseline-report", attempt.baseline_report.path,
-            "--baseline-ledger", attempt.baseline_ledger.path,
-            "--device", "cpu", "--calibration-only",
-            "--calibration-predictions",
-            attempt.outputs["calibration_ledger"],
-            "--max-runs", str(EXPECTED_RUNS),
-        ),
-        "analyze": (
-            analyzer, "analyze", *common,
-            attempt.outputs["experiment_report"],
-            attempt.outputs["calibration_ledger"],
-            attempt.outputs["analysis_report"], *series,
-        ),
-        "finalizer_prefix": (
-            "tools/finalize_panel_attempt.py", str(attempt_path),
-            attempt.outputs["outcome"],
-        ),
-    }
 
 
 def _validate_attempt(
     attempt_path: Path, attempt: PanelAttempt, inputs: PanelInputs,
+    profile: PanelProfile,
 ) -> None:
     if Path(attempt.source_tree.root).resolve(strict=True) != ROOT or \
-       attempt.expected_equivalent_runs != EXPECTED_RUNS or \
-       attempt.expected_panel_fits != EXPECTED_PANEL_FITS or \
+       attempt.expected_equivalent_runs != profile.expected_runs or \
+       attempt.expected_panel_fits != profile.expected_panel_fits or \
        tuple(item.name for item in inputs.series) != SERIES or \
        dict(attempt.commands) != _expected_commands(
-           attempt_path, attempt, inputs,
+           attempt_path, attempt, inputs, profile,
        ):
         raise ValueError("attempt does not match the exact panel protocol")
 
@@ -346,6 +282,7 @@ def _validate_attempt(
 class BoundPanel:
     stage: str
     argv: tuple[str, ...]
+    profile: PanelProfile
     attempt: PanelAttempt
     inputs: PanelInputs
     attempt_input: FrozenInput
@@ -475,9 +412,8 @@ def _freeze_panel(
             if any(grid != grids[0] for grid in grids[1:]):
                 raise ValueError("panel series must share one timestamp grid")
             config = read_canonical_json(by_source[config_path].snapshot)
-            if not _exact_json(config, _expected_sweep(MODELS)):
-                raise ValueError("config does not match the exact panel sweep")
-            _validate_attempt(attempt_path, attempt, inputs)
+            profile = panel_profile(config)
+            _validate_attempt(attempt_path, attempt, inputs, profile)
             _validate_stage(attempt, stage, argv)
             attempt.validate_paths(stage)
             _output_paths(stage, attempt, paths)
@@ -487,7 +423,7 @@ def _freeze_panel(
             )
             try:
                 bound = BoundPanel(
-                    stage, tuple(argv), attempt, inputs,
+                    stage, tuple(argv), profile, attempt, inputs,
                     by_source[attempt_path], by_source[inputs_path],
                     by_source[config_path], by_source[baseline_report_path],
                     by_source[baseline_ledger_path], frozen_series, bars,
@@ -504,32 +440,32 @@ def _freeze_panel(
 
 
 def _validation_keys(
-    names: Sequence[str], panel: bool,
+    names: Sequence[str], panel_models: Sequence[str],
 ) -> list[tuple[str, str, int, int | None]]:
     keys = [
         (model, name, fold, seed)
         for name in names for fold in range(2) for model in LOCAL_MODELS
         for seed in (SEEDS if model in SEEDED_MODELS else (None,))
     ]
-    if panel:
+    for panel_model in panel_models:
         keys.extend(
-            ("panel_transformer", name, fold, seed)
+            (panel_model, name, fold, seed)
             for name in names for fold in range(2) for seed in SEEDS
         )
     return keys
 
 
 def _calibration_keys(
-    names: Sequence[str], panel: bool,
+    names: Sequence[str], panel_models: Sequence[str],
 ) -> list[tuple[str, str, int | None]]:
     keys = [
         (model, name, seed)
         for model in LOCAL_MODELS for name in names
         for seed in (SEEDS if model in SEEDED_MODELS else (None,))
     ]
-    if panel:
+    for panel_model in panel_models:
         keys.extend(
-            ("panel_transformer", name, seed)
+            (panel_model, name, seed)
             for name in names for seed in SEEDS
         )
     return keys
@@ -634,17 +570,23 @@ def _read_ledger_v3(
 def _validate_report(
     value: Mapping[str, object], models: Sequence[str],
     bound: BoundPanel, ledger_input: FrozenInput,
-    forecasts: Sequence[Forecast], *, panel: bool,
+    forecasts: Sequence[Forecast], profile: PanelProfile | None,
 ) -> tuple[Mapping[str, object], ...]:
+    panel = profile is not None
+    panel_models = () if profile is None else profile.panel_models
     fields = REPORT_FIELDS | (
         {"attempt_manifest", "input_manifest"} if panel else set()
     )
-    run_count = EXPECTED_RUNS if panel else 117
+    run_count = profile.expected_runs if profile is not None else 117
+    sweep = (
+        expected_panel_sweep(profile)
+        if profile is not None else _baseline_sweep()
+    )
     if set(value) != fields or \
        _integer(value["schema"], "report schema", 6, 6) != 6 or \
        not _exact_json(
-           value["protocol"], _expected_protocol(run_count),
-       ) or not _exact_json(value["sweep"], _expected_sweep(models)):
+           value["protocol"], _expected_protocol(run_count, profile),
+       ) or not _exact_json(value["sweep"], sweep):
         raise ValueError("experiment report protocol is invalid")
     _runtime(value["runtime"], bound.attempt if panel else None)
     if panel:
@@ -691,7 +633,7 @@ def _validate_report(
     calibration = value["calibration"]
     if not isinstance(validation, list) or not isinstance(calibration, list):
         raise ValueError("experiment records must be arrays")
-    validation_keys = _validation_keys(names, panel)
+    validation_keys = _validation_keys(names, panel_models)
     if len(validation) != len(validation_keys):
         raise ValueError("validation grid is incomplete")
     checked_validation = []
@@ -703,7 +645,7 @@ def _validate_report(
             item, (model, name, seed, fold), targets, samples, False,
         ))
 
-    calibration_keys = _calibration_keys(names, panel)
+    calibration_keys = _calibration_keys(names, panel_models)
     if len(calibration) != len(calibration_keys):
         raise ValueError("calibration grid is incomplete")
     checked_calibration = [
@@ -737,12 +679,23 @@ def _validate_report(
         raise ValueError("experiment validation summary is invalid")
 
     fingerprints = value["model_fingerprints"]
-    expected_fingerprints = sorted(
-        calibration_keys,
-        key=lambda item: (
-            item[0], item[1], -1 if item[2] is None else item[2],
-        ),
+    legacy_key = lambda item: (
+        item[0], item[1], -1 if item[2] is None else item[2],
     )
+    if profile == COMPARISON_PROFILE:
+        local_keys = [
+            key for key in calibration_keys
+            if key[0] not in panel_models
+        ]
+        expected_fingerprints = [
+            *sorted(local_keys, key=legacy_key),
+            *(
+                (model, name, seed)
+                for model in panel_models for name in names for seed in SEEDS
+            ),
+        ]
+    else:
+        expected_fingerprints = sorted(calibration_keys, key=legacy_key)
     if not isinstance(fingerprints, list) or \
        len(fingerprints) != len(expected_fingerprints):
         raise ValueError("model fingerprints are incomplete")
@@ -766,12 +719,12 @@ def _validate_report(
         "records": len(forecasts), "sha256": ledger_input.sha256,
     }):
         raise ValueError("calibration ledger provenance is invalid")
-    if panel:
+    for panel_model in panel_models:
         for fold in range(2):
             for seed in SEEDS:
                 copies = [
                     record for record in checked_validation
-                    if record["model"] == "panel_transformer" and
+                    if record["model"] == panel_model and
                     record["fold"] == fold and record["seed"] == seed
                 ]
                 shared = {
@@ -786,7 +739,7 @@ def _validate_report(
         for seed in SEEDS:
             selected = {
                 record["epochs"] for record in checked_calibration
-                if record["model"] == "panel_transformer" and
+                if record["model"] == panel_model and
                 record["seed"] == seed
             }
             if len(selected) != 1:
@@ -827,6 +780,7 @@ def _validate_ledger(
 ) -> tuple[
     dict[str, dict[str, float]],
     dict[str, dict[str, dict[str, float]]],
+    dict[str, dict[str, dict[str, dict[int | None, float]]]],
 ]:
     grids = {name: _grid(bound.bars[name].timestamps) for name in bound.bars}
     predictions: dict[
@@ -896,6 +850,9 @@ def _validate_ledger(
     ensembles = {
         model: {name: {} for name in bound.bars} for model in models
     }
+    per_seed = {
+        model: {name: {} for name in bound.bars} for model in models
+    }
     for model in models:
         seeds = SEEDS if model in SEEDED_MODELS else (None,)
         for name in bound.bars:
@@ -903,51 +860,120 @@ def _validate_ledger(
                 rows = predictions[model, name, target]
                 if tuple(seed for seed, _ in rows) != seeds:
                     raise ValueError("calibration ensemble seed grid is invalid")
+                per_seed[model][name][target] = dict(rows)
                 ensembles[model][name][target] = fmean(
                     prediction for _, prediction in rows
                 )
-    return actuals, ensembles
+    return actuals, ensembles, per_seed
 
 
 def _validation_metrics(
-    records: Sequence[Mapping[str, object]],
+    records: Sequence[Mapping[str, object]], profile: PanelProfile,
 ) -> dict[str, object]:
     macro = {
         model: fmean(
             float(record["metrics"]["return_mae"])
             for record in records if record["model"] == model
         )
-        for model in MODELS
+        for model in profile.models
     }
-    local = {
+    if profile == LEGACY_PROFILE:
+        local = {
+            (record["series"], record["fold"], record["seed"]):
+                float(record["metrics"]["return_mae"])
+            for record in records if record["model"] == profile.reference
+        }
+        deltas = {name: [] for name in SERIES}
+        ordered = []
+        for record in records:
+            if record["model"] != profile.candidate:
+                continue
+            key = record["series"], record["fold"], record["seed"]
+            delta = float(record["metrics"]["return_mae"]) - local[key]
+            deltas[str(record["series"])].append(delta)
+            ordered.append(delta)
+        if len(ordered) != 30:
+            raise ValueError("panel validation pairs are incomplete")
+        return {
+            "macro_return_mae": macro,
+            "paired_panel_minus_local_transformer": {
+                "mean_delta": fmean(ordered),
+                "wins": sum(value < 0.0 for value in ordered),
+                "ties": sum(value == 0.0 for value in ordered),
+                "losses": sum(value > 0.0 for value in ordered),
+                "per_stock_mean_delta": {
+                    name: fmean(values) for name, values in deltas.items()
+                },
+            },
+        }
+
+    reference = {
         (record["series"], record["fold"], record["seed"]):
             float(record["metrics"]["return_mae"])
-        for record in records if record["model"] == "transformer"
+        for record in records if record["model"] == profile.reference
     }
-    deltas = {
-        name: [] for name in SERIES
-    }
-    ordered = []
+    deltas: list[tuple[str, int, int, float]] = []
     for record in records:
-        if record["model"] != "panel_transformer":
+        if record["model"] != profile.candidate:
             continue
-        key = record["series"], record["fold"], record["seed"]
-        delta = float(record["metrics"]["return_mae"]) - local[key]
-        deltas[str(record["series"])].append(delta)
-        ordered.append(delta)
-    if len(ordered) != 30:
-        raise ValueError("panel validation pairs are incomplete")
+        name = str(record["series"])
+        fold = int(record["fold"])
+        seed = int(record["seed"])
+        key = name, fold, seed
+        deltas.append((
+            name, fold, seed,
+            float(record["metrics"]["return_mae"]) - reference[key],
+        ))
+    if len(deltas) != 30:
+        raise ValueError("candidate validation pairs are incomplete")
+    reference_macro = macro[profile.reference]
+    if reference_macro <= 0.0:
+        raise ValueError("validation reference MAE denominator is invalid")
+    values = [item[3] for item in deltas]
     return {
         "macro_return_mae": macro,
-        "paired_panel_minus_local_transformer": {
-            "mean_delta": fmean(ordered),
-            "wins": sum(value < 0.0 for value in ordered),
-            "ties": sum(value == 0.0 for value in ordered),
-            "losses": sum(value > 0.0 for value in ordered),
-            "per_stock_mean_delta": {
-                name: fmean(values) for name, values in deltas.items()
+        "paired_candidate_minus_reference": {
+            "candidate_model": profile.candidate,
+            "reference_model": profile.reference,
+            "relative_improvement":
+                1.0 - macro[profile.candidate] / reference_macro,
+            "mean_delta": fmean(values),
+            "wins": sum(value < 0.0 for value in values),
+            "ties": sum(value == 0.0 for value in values),
+            "losses": sum(value > 0.0 for value in values),
+            "by_stock": {
+                name: _axis_stats([
+                    value for stock, _, _, value in deltas if stock == name
+                ])
+                for name in SERIES
+            },
+            "by_fold": {
+                str(fold): _axis_stats([
+                    value for _, item_fold, _, value in deltas
+                    if item_fold == fold
+                ])
+                for fold in range(2)
+            },
+            "by_seed": {
+                str(seed): _axis_stats([
+                    value for _, _, item_seed, value in deltas
+                    if item_seed == seed
+                ])
+                for seed in SEEDS
             },
         },
+    }
+
+
+def _axis_stats(values: Sequence[float]) -> dict[str, object]:
+    if not values:
+        raise ValueError("paired axis is empty")
+    return {
+        "count": len(values),
+        "mean": fmean(values),
+        "stddev": pstdev(values),
+        "minimum": min(values),
+        "maximum": max(values),
     }
 
 
@@ -959,7 +985,17 @@ def _calibration_metrics(
     actuals: Mapping[str, Mapping[str, float]],
     predictions: Mapping[str, Mapping[str, Mapping[str, float]]],
     bars: Mapping[str, Bars],
+    seed_predictions: Mapping[
+        str, Mapping[str, Mapping[str, Mapping[int | None, float]]]
+    ] | None = None,
+    profile: PanelProfile = LEGACY_PROFILE,
 ) -> dict[str, object]:
+    if profile == COMPARISON_PROFILE:
+        if seed_predictions is None:
+            raise ValueError("comparison seed predictions are missing")
+        return _comparison_calibration_metrics(
+            actuals, predictions, seed_predictions, bars, profile,
+        )
     per_stock: dict[str, object] = {}
     macro = {model: [] for model in MODELS}
     macro_direction = {model: [] for model in MODELS}
@@ -1046,109 +1082,264 @@ def _calibration_metrics(
     }
 
 
-def _comparators(values: Mapping[str, float]) -> dict[str, float]:
-    return {
-        "local_transformer": values["transformer"],
-        "mlp": values["mlp"],
-        "linear": values["linear"],
-        "rolling_mean": values["rolling_mean"],
-        "zero_return": values["last_close"],
-    }
+def _block_indexes(
+    size: int, block: int, rng: random.Random,
+) -> tuple[int, ...]:
+    if size < block:
+        raise ValueError("calibration grid is shorter than one block")
+    result: list[int] = []
+    while len(result) < size:
+        start = rng.randrange(size - block + 1)
+        result.extend(range(start, start + block))
+    return tuple(result[:size])
 
 
-def _gates(
-    validation: Mapping[str, object], calibration: Mapping[str, object],
+def _lower_025(values: Sequence[float]) -> float:
+    if not values:
+        raise ValueError("bootstrap distribution is empty")
+    return sorted(values)[math.ceil(0.025 * len(values)) - 1]
+
+
+def _sampled_metrics(
+    actuals: Mapping[str, Mapping[str, float]],
+    predictions: Mapping[str, Mapping[str, Mapping[str, float]]],
+    model: str, indexes: Sequence[int],
+) -> tuple[float, float]:
+    maes, directions = [], []
+    for name in SERIES:
+        targets = tuple(actuals[name])
+        values = [actuals[name][targets[index]] for index in indexes]
+        predicted = [
+            predictions[model][name][targets[index]] for index in indexes
+        ]
+        maes.append(fmean(
+            abs(prediction - actual)
+            for prediction, actual in zip(predicted, values, strict=True)
+        ))
+        directions.append(fmean(
+            _sign(prediction) == _sign(actual)
+            for prediction, actual in zip(predicted, values, strict=True)
+        ))
+    return fmean(maes), fmean(directions)
+
+
+def _sampled_majority(
+    actuals: Mapping[str, Mapping[str, float]], indexes: Sequence[int],
+) -> float:
+    references = []
+    for name in SERIES:
+        targets = tuple(actuals[name])
+        values = [actuals[name][targets[index]] for index in indexes]
+        references.append(max(
+            fmean(value > 0.0 for value in values),
+            fmean(value < 0.0 for value in values),
+            fmean(value == 0.0 for value in values),
+        ))
+    return fmean(references)
+
+
+def _bootstrap_metrics(
+    actuals: Mapping[str, Mapping[str, float]],
+    predictions: Mapping[str, Mapping[str, Mapping[str, float]]],
+    profile: PanelProfile,
 ) -> dict[str, object]:
-    validation_macro = validation["macro_return_mae"]
-    validation_panel = validation_macro["panel_transformer"]
-    validation_comparators = _comparators(validation_macro)
-    validation_margin = min(validation_comparators.values()) - validation_panel
-    paired = validation["paired_panel_minus_local_transformer"]
-    per_stock_delta = paired["per_stock_mean_delta"]
-    paired_pass = paired["mean_delta"] < 0.0 and paired["wins"] >= 20 and \
-        all(value <= 0.0 for value in per_stock_delta.values())
-
-    calibration_macro = calibration["macro_return_mae"]
-    calibration_panel = calibration_macro["panel_transformer"]
-    calibration_comparators = _comparators(calibration_macro)
-    calibration_margin = min(calibration_comparators.values()) - \
-        calibration_panel
-    per_stock = calibration["per_stock"]
-    zero = {
-        name: {
-            "panel": stock["models"]["panel_transformer"]["return_mae"],
-            "zero_return": stock["zero_return_return_mae"],
-            "margin": (
-                stock["zero_return_return_mae"] -
-                stock["models"]["panel_transformer"]["return_mae"]
-            ),
+    sizes = {len(actuals[name]) for name in SERIES}
+    if len(sizes) != 1:
+        raise ValueError("calibration grids are not aligned")
+    size = sizes.pop()
+    by_block = {}
+    for block in BOOTSTRAP_BLOCKS:
+        rng = random.Random(BOOTSTRAP_SEED)
+        relative, direction_reference, direction_majority = [], [], []
+        for _ in range(BOOTSTRAP_REPLICATES):
+            indexes = _block_indexes(size, block, rng)
+            candidate_mae, candidate_direction = _sampled_metrics(
+                actuals, predictions, profile.candidate, indexes,
+            )
+            reference_mae, reference_direction = _sampled_metrics(
+                actuals, predictions, profile.reference, indexes,
+            )
+            if reference_mae <= 0.0:
+                raise ValueError(
+                    "bootstrap reference MAE denominator is invalid"
+                )
+            relative.append(1.0 - candidate_mae / reference_mae)
+            direction_reference.append(
+                candidate_direction - reference_direction
+            )
+            direction_majority.append(
+                candidate_direction - _sampled_majority(actuals, indexes)
+            )
+        by_block[str(block)] = {
+            "mae_relative_improvement_lower_025": _lower_025(relative),
+            "direction_candidate_minus_reference_lower_025":
+                _lower_025(direction_reference),
+            "direction_candidate_minus_majority_lower_025":
+                _lower_025(direction_majority),
         }
-        for name, stock in per_stock.items()
-    }
-    for value in zero.values():
-        value["pass"] = value["margin"] > 0.0
-
-    direction = calibration["macro_direction_accuracy"]["panel_transformer"]
-    majority = calibration["macro_majority_direction"]
-    stock_direction = {
-        name: {
-            "panel": stock["models"]["panel_transformer"][
-                "direction_accuracy"
-            ],
-            "minimum": 0.5,
-            "margin": stock["models"]["panel_transformer"][
-                "direction_accuracy"
-            ] - 0.5,
-        }
-        for name, stock in per_stock.items()
-    }
-    for value in stock_direction.values():
-        value["pass"] = value["margin"] >= 0.0
-    close = calibration["mean_panel_close_relative_improvement"]
-
-    gates = {
-        "validation_macro_mae": {
-            "pass": validation_margin > 0.0,
-            "panel": validation_panel,
-            "comparators": validation_comparators,
-            "margin": validation_margin,
-        },
-        "validation_paired": {
-            "pass": paired_pass,
-            "mean_delta": paired["mean_delta"],
-            "wins": paired["wins"],
-            "required_wins": 20,
-            "per_stock_mean_delta": per_stock_delta,
-        },
-        "calibration_macro_mae": {
-            "pass": calibration_margin > 0.0,
-            "panel": calibration_panel,
-            "comparators": calibration_comparators,
-            "margin": calibration_margin,
-        },
-        "calibration_per_stock_zero": {
-            "pass": all(value["pass"] for value in zero.values()),
-            "per_stock": zero,
-        },
-        "calibration_direction": {
-            "pass": direction > majority and
-                    all(value["pass"] for value in stock_direction.values()),
-            "panel_macro": direction,
-            "majority_macro": majority,
-            "macro_margin": direction - majority,
-            "per_stock": stock_direction,
-        },
-        "calibration_close_mae": {
-            "pass": close > 0.0,
-            "mean_relative_improvement": close,
-            "margin": close,
-        },
-    }
-    gates["all_pass"] = all(
-        value["pass"] for value in gates.values()
-        if isinstance(value, dict)
+    names = (
+        "mae_relative_improvement_lower_025",
+        "direction_candidate_minus_reference_lower_025",
+        "direction_candidate_minus_majority_lower_025",
     )
-    return gates
+    return {
+        "by_block_rows": by_block,
+        **{
+            name: min(by_block[str(block)][name]
+                      for block in BOOTSTRAP_BLOCKS)
+            for name in names
+        },
+    }
+
+
+def _comparison_calibration_metrics(
+    actuals: Mapping[str, Mapping[str, float]],
+    predictions: Mapping[str, Mapping[str, Mapping[str, float]]],
+    seed_predictions: Mapping[
+        str, Mapping[str, Mapping[str, Mapping[int | None, float]]]
+    ],
+    bars: Mapping[str, Bars],
+    profile: PanelProfile,
+) -> dict[str, object]:
+    full_indexes = tuple(range(len(next(iter(actuals.values())))))
+    full_reference_mae, _ = _sampled_metrics(
+        actuals, predictions, profile.reference, full_indexes,
+    )
+    if full_reference_mae <= 0.0:
+        raise ValueError("calibration reference MAE denominator is invalid")
+    per_stock: dict[str, object] = {}
+    macro = {model: [] for model in profile.models}
+    macro_direction = {model: [] for model in profile.models}
+    close_zero, close_reference = [], []
+    for name in SERIES:
+        targets = tuple(actuals[name])
+        values = [actuals[name][target] for target in targets]
+        if not targets:
+            raise ValueError("stock has no calibration targets")
+        proportions = {
+            "p_up": fmean(value > 0.0 for value in values),
+            "p_down": fmean(value < 0.0 for value in values),
+            "p_flat": fmean(value == 0.0 for value in values),
+        }
+        indexes = {
+            timestamp: index
+            for index, timestamp in enumerate(bars[name].timestamps)
+        }
+        models = {}
+        for model in profile.models:
+            predicted = [predictions[model][name][target] for target in targets]
+            return_mae = fmean(
+                abs(prediction - actual)
+                for prediction, actual in zip(predicted, values, strict=True)
+            )
+            direction = fmean(
+                _sign(prediction) == _sign(actual)
+                for prediction, actual in zip(predicted, values, strict=True)
+            )
+            close_mae = fmean(
+                abs(
+                    bars[name].opens[indexes[target] - 12] *
+                    math.exp(prediction) -
+                    bars[name].closes[indexes[target]]
+                )
+                for target, prediction in zip(
+                    targets, predicted, strict=True,
+                )
+            )
+            models[model] = {
+                "return_mae": return_mae,
+                "direction_accuracy": direction,
+                "close_mae": close_mae,
+            }
+            macro[model].append(return_mae)
+            macro_direction[model].append(direction)
+        zero_return = fmean(abs(value) for value in values)
+        zero_close = fmean(
+            abs(
+                bars[name].opens[indexes[target] - 12] -
+                bars[name].closes[indexes[target]]
+            )
+            for target in targets
+        )
+        reference_close = models[profile.reference]["close_mae"]
+        candidate_close = models[profile.candidate]["close_mae"]
+        if zero_close <= 0.0 or reference_close <= 0.0:
+            raise ValueError("close MAE denominator is invalid")
+        over_zero = 1.0 - candidate_close / zero_close
+        over_reference = 1.0 - candidate_close / reference_close
+        close_zero.append(over_zero)
+        close_reference.append(over_reference)
+        per_stock[name] = {
+            "samples": len(targets),
+            "models": models,
+            "majority_direction": {
+                **proportions, "reference": max(proportions.values()),
+            },
+            "zero_return_return_mae": zero_return,
+            "zero_return_close_mae": zero_close,
+            "candidate_close_relative_improvement_over_zero": over_zero,
+            "candidate_close_relative_improvement_over_reference":
+                over_reference,
+        }
+
+    macro_return = {
+        model: fmean(values) for model, values in macro.items()
+    }
+    reference_mae = macro_return[profile.reference]
+    if reference_mae <= 0.0 or reference_mae != full_reference_mae:
+        raise ValueError("calibration reference MAE denominator is invalid")
+    leave_out = {}
+    for excluded in SEEDS:
+        ensembles = {
+            model: {
+                name: {
+                    target: fmean(
+                        prediction
+                        for seed, prediction in
+                        seed_predictions[model][name][target].items()
+                        if seed != excluded
+                    )
+                    for target in actuals[name]
+                }
+                for name in SERIES
+            }
+            for model in profile.panel_models
+        }
+        indexes = tuple(range(len(next(iter(actuals.values())))))
+        candidate_mae, _ = _sampled_metrics(
+            actuals, ensembles, profile.candidate, indexes,
+        )
+        omitted_reference, _ = _sampled_metrics(
+            actuals, ensembles, profile.reference, indexes,
+        )
+        if omitted_reference <= 0.0:
+            raise ValueError(
+                "leave-one-seed-out reference MAE denominator is invalid"
+            )
+        leave_out[str(excluded)] = {
+            "relative_improvement":
+                1.0 - candidate_mae / omitted_reference,
+        }
+    return {
+        "macro_return_mae": macro_return,
+        "macro_direction_accuracy": {
+            model: fmean(values)
+            for model, values in macro_direction.items()
+        },
+        "macro_majority_direction": fmean(
+            stock["majority_direction"]["reference"]
+            for stock in per_stock.values()
+        ),
+        "relative_improvement_vs_reference":
+            1.0 - macro_return[profile.candidate] / reference_mae,
+        "leave_one_seed_out": leave_out,
+        "bootstrap": _bootstrap_metrics(actuals, predictions, profile),
+        "mean_candidate_close_relative_improvement_over_zero":
+            fmean(close_zero),
+        "mean_candidate_close_relative_improvement_over_reference":
+            fmean(close_reference),
+        "per_stock": per_stock,
+    }
 
 
 def _analysis(
@@ -1160,16 +1351,17 @@ def _analysis(
     baseline = read_canonical_json(bound.baseline_report_input.snapshot)
     baseline_calibration = _validate_report(
         baseline, LOCAL_MODELS, bound, bound.baseline_ledger_input,
-        baseline_forecasts, panel=False,
+        baseline_forecasts, None,
     )
     _validate_ledger(baseline_forecasts, baseline_calibration, bound)
 
     forecasts, lines = _read_ledger_v3(ledger_input)
     report = read_canonical_json(report_input.snapshot)
     calibration = _validate_report(
-        report, MODELS, bound, ledger_input, forecasts, panel=True,
+        report, bound.profile.models, bound, ledger_input, forecasts,
+        bound.profile,
     )
-    actuals, predictions = _validate_ledger(
+    actuals, predictions, seed_predictions = _validate_ledger(
         forecasts, calibration, bound,
     )
     local = set(LOCAL_MODELS)
@@ -1185,14 +1377,16 @@ def _analysis(
        ) != baseline_lines:
         raise ValueError("live local-model evidence differs from the baseline")
 
-    validation = _validation_metrics(report["validation"])
-    calibration_metrics = _calibration_metrics(
-        actuals, predictions, bound.bars,
+    validation = _validation_metrics(
+        report["validation"], bound.profile,
     )
-    gates = _gates(validation, calibration_metrics)
+    calibration_metrics = _calibration_metrics(
+        actuals, predictions, bound.bars, seed_predictions, bound.profile,
+    )
+    gates = _gates(validation, calibration_metrics, bound.profile)
     passed = bool(gates["all_pass"])
-    return {
-        "schema": 1,
+    analysis = {
+        "schema": bound.profile.analysis_schema,
         "status": "pass" if passed else "gate-failure",
         "inputs": {
             "run_id": bound.attempt.run_id,
@@ -1208,27 +1402,13 @@ def _analysis(
                 for name, item in bound.series
             ],
         },
-        "protocol": {
-            "candidate": "raw-17",
-            "models": list(MODELS),
-            "seeds": list(SEEDS),
-            "series": list(SERIES),
-            "folds": 2,
-            "fold_fraction": 0.1,
-            "target_horizon_bars": 13,
-            "target_kind": EXECUTABLE_RETURN_TARGET,
-            "series_equivalent_runs": EXPECTED_RUNS,
-            "physical_panel_fits": EXPECTED_PANEL_FITS,
-            "validation_pair": "stock/fold/seed",
-            "calibration_ensemble":
-                "arithmetic mean by model/stock/target before metrics",
-            "macro_unit": "stock",
-            "majority_reference": "unique actual calibration targets",
-        },
+        "protocol": panel_analysis_protocol(bound.profile),
         "validation": validation,
         "calibration": calibration_metrics,
         "gates": gates,
-    }, passed
+    }
+    validate_panel_analysis(analysis, bound.profile)
+    return analysis, passed
 
 
 def _series(value: str) -> tuple[str, Path]:
@@ -1280,6 +1460,7 @@ def main() -> None:
                 output = resolve_fresh_output(args.output)
                 if output.parent != Path(bound.attempt.run_dir).resolve():
                     raise ValueError("analysis output left the run directory")
+                validate_panel_analysis(report, bound.profile)
                 write_json_exclusive(
                     output, report, bound.run_directory_fd, bound.verify,
                 )

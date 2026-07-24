@@ -148,21 +148,25 @@ the displayed tie-free reference inapplicable.
 
 ## Locked Calibration Bootstrap
 
-Use one deterministic paired moving-block bootstrap:
+Use one deterministic paired moving-block-bootstrap sensitivity set:
 
 ```text
 replicates = 10_000
 PRNG seed = 20_260_724
-block length = 13 target rows
+block lengths = 13, 29, and 39 target rows
 quantile = nearest-rank 2.5th percentile
+reported gate statistic = minimum lower percentile across block lengths
 ```
 
-For each replicate, sample non-circular block starts uniformly from
-`0..T-13`, append 13 consecutive indexes until at least `T` indexes exist,
-then truncate to `T`. Use the same sampled indexes for both models and all
-three stocks. This preserves paired model comparisons and observed
-cross-stock dependence while respecting the mechanically overlapping
-13-bar forecast horizon.
+The three predeclared lengths cover the 13-bar output horizon, the 29-row
+mechanical dependence span induced by the 17-bar input window plus that
+horizon, and one longer sensitivity case. For each block length, reset a
+`random.Random(20_260_724)` instance, sample non-circular block starts
+uniformly from `0..T-block`, append complete consecutive blocks until at
+least `T` indexes exist, then truncate to `T`. Use the same sampled indexes
+for both models and all three stocks within every replicate. This preserves
+paired model comparisons and observed cross-stock dependence without
+pretending the forecast horizon alone determines the dependence length.
 
 The lower percentile is:
 
@@ -217,8 +221,8 @@ Every gate is conjunctive. Equality fails strict comparisons.
    - At least four of five seed-axis means are strictly negative.
 3. `calibration_macro_mae`
    - \(R_calibration >= 0.01\).
-   - The moving-block-bootstrap 2.5th percentile of
-     \(R_calibration\) is at least 0.01.
+   - For every predeclared block length, compute the moving-block-bootstrap
+     2.5th percentile of \(R_calibration\); their minimum is at least 0.01.
    - All five leave-one-seed-out ensembles have positive relative improvement.
    - Conditioned macro return MAE is strictly below every comparator listed in
      gate 1.
@@ -230,20 +234,21 @@ Every gate is conjunctive. Equality fails strict comparisons.
      macro majority-sign reference.
    - Every stock is at least 50 percent and strictly above its unconditioned
      direction.
-   - The paired bootstrap 2.5th percentile of conditioned-minus-unconditioned
-     macro direction is strictly positive.
-   - The paired bootstrap 2.5th percentile of conditioned-minus-resampled
-     majority-sign macro direction is strictly positive. Recompute each
-     stock's majority sign from that replicate's sampled actuals.
+   - For each direction statistic, compute a paired-bootstrap 2.5th
+     percentile at every predeclared block length; the minimum
+     conditioned-minus-unconditioned value is strictly positive.
+   - The minimum conditioned-minus-resampled-majority value is strictly
+     positive. Recompute each stock's majority sign from that replicate's
+     sampled actuals.
 6. `calibration_close_mae`
    - Mean per-stock relative close-MAE improvement over zero return is
      strictly positive.
    - Mean per-stock relative close-MAE improvement over the unconditioned
      panel is strictly positive.
 
-No gate, seed subset, block length, threshold, or comparator may change after
-the run starts. A failure is a valid negative result and permanently closes
-this attempt without test access or a `$100` backtest.
+No gate, seed subset, block-length set, threshold, or comparator may change
+after the run starts. A failure is a valid negative result and permanently
+closes this attempt without test access or a `$100` backtest.
 
 ---
 
@@ -533,27 +538,31 @@ Extend `_validate_ledger` to return the validated per-seed prediction mapping
 alongside actuals and full ensembles. Compute five leave-one-seed-out
 ensembles from the exact declared seed tuple.
 
-Add a standard-library moving-block helper:
+Add standard-library moving-block helpers:
 
 ```python
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20_260_724
-BOOTSTRAP_BLOCK = 13
+BOOTSTRAP_BLOCKS = (13, 29, 39)
 
 
-def _block_indexes(size: int, rng: random.Random) -> tuple[int, ...]:
-    if size < BOOTSTRAP_BLOCK:
+def _block_indexes(
+    size: int, block: int, rng: random.Random,
+) -> tuple[int, ...]:
+    if size < block:
         raise ValueError("calibration grid is shorter than one block")
     result: list[int] = []
     while len(result) < size:
-        start = rng.randrange(size - BOOTSTRAP_BLOCK + 1)
-        result.extend(range(start, start + BOOTSTRAP_BLOCK))
+        start = rng.randrange(size - block + 1)
+        result.extend(range(start, start + block))
     return tuple(result[:size])
 ```
 
-Create one bootstrap loop. For each sampled index tuple, compute
-candidate/reference macro MAEs, macro direction accuracies, and the resampled
-per-stock majority-sign macro from the same rows and append:
+Run the same bootstrap loop independently for each block length, resetting
+`random.Random(BOOTSTRAP_SEED)` at the start of each length. For every sampled
+index tuple, compute candidate/reference macro MAEs, macro direction
+accuracies, and the resampled per-stock majority-sign macro from the same rows
+and append:
 
 ```text
 1 - candidate_macro_mae / reference_macro_mae
@@ -563,8 +572,9 @@ candidate_macro_direction - resampled_majority_macro
 
 Require every reference-MAE denominator to be finite and strictly positive for
 the full ensemble, each leave-one-seed-out ensemble, and every bootstrap
-replicate. Use `_lower_025` from the locked definition. Do not bootstrap models
-independently or resample stocks independently.
+replicate. Report each block length's three lower percentiles and their
+componentwise minima. Use `_lower_025` from the locked definition. Do not
+bootstrap models independently or resample stocks independently.
 
 - [ ] **Step 7: Implement the six exact gates**
 
@@ -583,10 +593,11 @@ The schema-2 protocol must record:
   "uncertainty_interpretation": "conditional-descriptive-not-confirmatory",
   "bootstrap": {
     "kind": "paired-noncircular-moving-block",
-    "block_rows": 13,
+    "block_rows": [13, 29, 39],
     "replicates": 10000,
     "seed": 20260724,
-    "lower_percentile": 0.025
+    "lower_percentile": 0.025,
+    "gate_aggregation": "minimum-lower-percentile-across-block-lengths"
   }
 }
 ```
@@ -670,10 +681,16 @@ relative_improvement
 as a one-field object, not a bare number. `bootstrap` has exactly:
 
 ```text
+by_block_rows
 mae_relative_improvement_lower_025
 direction_candidate_minus_reference_lower_025
 direction_candidate_minus_majority_lower_025
 ```
+
+`by_block_rows` has exactly the string keys `"13"`, `"29"`, and `"39"`.
+Each maps to exactly the same three lower-percentile scalar fields. The three
+top-level scalars are the componentwise minima of those per-block values and
+are the values consumed by the gates.
 
 Each `per_stock` entry has exactly:
 
@@ -772,13 +789,15 @@ validation paired:
 
 calibration macro:
   relative >= 0.01, candidate < every comparator,
-  bootstrap lower >= 0.01, every leave-one-out relative > 0
+  every per-block lower is finite, the reported bootstrap lower equals their
+  minimum and is >= 0.01, every leave-one-out relative > 0
 
 calibration per stock:
   every reference_margin > 0 and zero_margin > 0
 
 calibration direction:
-  both macro margins > 0, both bootstrap lowers > 0,
+  both macro margins > 0, every per-block lower is finite, both reported
+  bootstrap lowers equal their per-block minima and are > 0,
   every reference_margin > 0 and minimum_margin >= 0
 
 calibration close:
@@ -810,14 +829,17 @@ Tests must cover:
 - every leave-one-seed-out relative improvement must be positive;
 - identical bootstrap draws are used across models/stocks;
 - the fixed bootstrap seed is deterministic;
-- one minimal 13-row fixture executes the unpatched 10,000-replicate path and
-  asserts its exact three lower-percentile outputs;
-- a separate greater-than-13-row fixture with a stubbed sequence of starts
-  proves end-to-end randomized block selection is nondegenerate;
+- one minimal 39-row fixture executes the unpatched three-block,
+  10,000-replicate path and asserts all nine per-block lower percentiles plus
+  the exact three componentwise minima;
+- a separate greater-than-39-row fixture with a stubbed sequence of starts
+  proves end-to-end randomized block selection is nondegenerate for every
+  declared block length;
 - 2.5th-percentile MAE equality at one percent passes, while direction
   equality at zero fails;
-- `_block_indexes` with a stub RNG returns exact contiguous 13-row blocks,
-  truncates to the requested length, never wraps, and rejects sizes below 13;
+- `_block_indexes` with a stub RNG returns exact contiguous blocks for 13,
+  29, and 39 rows, truncates to the requested length, never wraps, and rejects
+  sizes below the selected block;
 - `_lower_025` over 10,000 distinct ordered values returns the 250th order
   statistic;
 - five asymmetric seed streams produce the five exact leave-one-seed-out
@@ -1258,7 +1280,8 @@ The evidence document must state:
 - conditioned and unconditioned validation/calibration MAE and relative
   improvement;
 - 30-pair wins/ties/losses and stock/fold/seed summaries;
-- leave-one-seed-out and bootstrap lower bounds;
+- leave-one-seed-out results, all per-block bootstrap lower percentiles, and
+  their gate-controlling minima;
 - per-stock return, direction, and close-MAE comparisons;
 - every frozen gate and final status;
 - explicit calibration-only, calibration-reused-for-development,

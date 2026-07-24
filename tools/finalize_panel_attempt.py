@@ -22,7 +22,9 @@ from tools.files import (
 from tools.panel_contract import (
     FINALIZER_SOURCE_PATHS, FileBinding, PanelAttempt, PanelInputs, SourceTree,
     _directory_identity, _open_directory, _regular_identity, _regular_inputs,
-    _verify_identities, read_canonical_json, source_tree,
+    _verify_identities, expected_panel_commands, panel_profile,
+    read_canonical_json, selected_source_tree, source_tree,
+    validate_panel_analysis,
 )
 
 TRANSITIONS = {
@@ -44,11 +46,6 @@ ANALYSIS_FIELDS = {
     "schema", "status", "inputs", "protocol", "validation", "calibration",
     "gates",
 }
-GATE_NAMES = frozenset((
-    "validation_macro_mae", "validation_paired",
-    "calibration_macro_mae", "calibration_per_stock_zero",
-    "calibration_direction", "calibration_close_mae",
-))
 
 
 @dataclass(frozen=True)
@@ -180,8 +177,9 @@ def _require_equal(actual: object, expected: object, label: str) -> None:
 def _trusted_paths(attempt: PanelAttempt) -> tuple[Path, ...]:
     if Path(attempt.finalizer_tree.root) != ROOT.resolve(strict=True):
         raise ValueError("trusted finalizer root is invalid")
-    if tuple(item.path for item in attempt.finalizer_tree.files) != \
-            tuple(sorted(FINALIZER_SOURCE_PATHS)):
+    if attempt.finalizer_tree != selected_source_tree(
+        ROOT, FINALIZER_SOURCE_PATHS,
+    ):
         raise ValueError("trusted finalizer closure is invalid")
     return tuple(
         Path(attempt.finalizer_tree.root) / item.path
@@ -317,29 +315,20 @@ def _validate_provenance(
         ],
     }
     analysis = read_canonical_json(frozen[analysis_state.path].snapshot)
-    gates = analysis.get("gates")
+    config = read_canonical_json(frozen[Path(attempt.config.path)].snapshot)
+    profile = panel_profile(config)
+    if attempt.expected_equivalent_runs != profile.expected_runs or \
+       attempt.expected_panel_fits != profile.expected_panel_fits or \
+       dict(attempt.commands) != expected_panel_commands(
+           attempt_path, attempt.input_manifest.path, attempt.config.path,
+           attempt.baseline_report.path, attempt.baseline_ledger.path,
+           attempt.outputs, inputs, profile,
+       ):
+        raise ValueError("attempt profile is invalid")
+    validate_panel_analysis(analysis, profile)
+    gates = analysis["gates"]
     analysis_inputs = analysis.get("inputs")
-    gate_values = (
-        tuple(gates.get(name) for name in GATE_NAMES)
-        if isinstance(gates, Mapping) else ()
-    )
-    verdict = (
-        len(gate_values) == len(GATE_NAMES) and
-        all(
-            isinstance(gate, Mapping) and
-            type(gate.get("pass")) is bool
-            for gate in gate_values
-        ) and
-        gates.get("all_pass") == all(
-            gate["pass"] for gate in gate_values
-        )
-    )
     if set(analysis) != ANALYSIS_FIELDS or \
-       type(analysis.get("schema")) is not int or \
-       analysis["schema"] != 1 or \
-       not isinstance(gates, Mapping) or \
-       set(gates) != GATE_NAMES | {"all_pass"} or not verdict or \
-       type(gates.get("all_pass")) is not bool or \
        gates["all_pass"] != (status == "pass") or \
        not isinstance(analysis_inputs, Mapping) or \
        set(analysis_inputs) != INPUT_FIELDS or \
