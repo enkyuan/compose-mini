@@ -1,9 +1,11 @@
 """Load a passing scaling result and bind its forward selections."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
+import hashlib
+import json
 
 from tools.files import freeze_inputs, verify_frozen
 from tools.finalize_universe_scaling import (
@@ -55,6 +57,13 @@ class CheckpointSelection:
     checkpoint: int
     provenance_id: str
     model_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardFitSpec:
+    selection: CheckpointSelection
+    optimizer_updates: int
+    provenance_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,3 +355,98 @@ def resolve_prior_checkpoint(
     if len(matches) != 1:
         raise ValueError("forward checkpoint is not unique")
     return matches[0]
+
+
+def _forward_provenance_id(
+    outcome: str, members: tuple[str, ...],
+    selection: CheckpointSelection, optimizer_updates: int,
+) -> str:
+    encoded = json.dumps({
+        "cohort": FORWARD_COHORT,
+        "members": list(members),
+        "mode": FORWARD_MODE,
+        "model": FORWARD_MODEL,
+        "optimizer_updates": optimizer_updates,
+        "question": FORWARD_QUESTION,
+        "role": "forward-refit",
+        "scaling_outcome_sha256": outcome,
+        "schema": 1,
+        "seed": selection.seed,
+        "selected_checkpoint": selection.checkpoint,
+        "source_model_fingerprint": selection.model_fingerprint,
+        "source_phase": selection.source_phase,
+        "source_provenance_id": selection.provenance_id,
+        "target_phase": selection.target_phase,
+    }, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _forward_fit_specs(
+    source: PassingScalingOutcome, target_phase: str,
+) -> tuple[ForwardFitSpec, ...]:
+    """Derive one phase's refits from an authenticated PASS-reader result."""
+    axes = tuple(
+        (phase, seed) for phase in PRIOR_PHASE for seed in SEEDS
+    )
+    if not isinstance(source, PassingScalingOutcome) or \
+       type(source.selections) is not tuple or \
+       not isinstance(target_phase, str) or target_phase not in PRIOR_PHASE:
+        raise ValueError("forward fit source is invalid")
+    if len(source.selections) != len(axes) or \
+       any(type(item) is not CheckpointSelection
+           for item in source.selections) or \
+       tuple(
+           (item.target_phase, item.seed) for item in source.selections
+       ) != axes:
+        raise ValueError("forward checkpoint selections are invalid")
+    try:
+        members = source.manifest.coverage.master
+    except AttributeError as error:
+        raise ValueError("forward fit universe is invalid") from error
+    if type(members) is not tuple or len(members) != FORWARD_COHORT or \
+       any(not isinstance(member, str) or not member for member in members) or \
+       len(set(members)) != len(members):
+        raise ValueError("forward fit universe is invalid")
+    outcome = _external(source.outcome, "scaling outcome").sha256
+    budgets = dict(EXPECTED_BUDGETS)
+    specs = []
+    for seed in SEEDS:
+        selection = resolve_prior_checkpoint(source, target_phase, seed)
+        expected = FitJob(
+            "pooled", FORWARD_MODE, FORWARD_COHORT,
+            PRIOR_PHASE[target_phase], FORWARD_MODEL, seed, members,
+        )
+        limit = budgets[expected.phase].checkpoints
+        if type(selection) is not CheckpointSelection or \
+           selection.source_phase != expected.phase or \
+           selection.provenance_id != fit_provenance_id(expected) or \
+           type(selection.checkpoint) is not int or \
+           not 1 <= selection.checkpoint <= limit:
+            raise ValueError("forward checkpoint selection is invalid")
+        selection = replace(
+            selection,
+            provenance_id=_sha256(
+                selection.provenance_id, "source provenance",
+            ),
+            model_fingerprint=_sha256(
+                selection.model_fingerprint, "source model fingerprint",
+            ),
+        )
+        updates = selection.checkpoint * \
+            budgets[target_phase].updates_per_checkpoint
+        specs.append(ForwardFitSpec(
+            selection, updates,
+            _forward_provenance_id(outcome, members, selection, updates),
+        ))
+    return tuple(specs)
+
+
+def forward_fit_specs(
+    outcome: FileBinding, target_phase: str, *, root: Path,
+) -> tuple[ForwardFitSpec, ...]:
+    """Read one exact PASS and bind one authorized target phase's refits."""
+    if not isinstance(target_phase, str) or target_phase not in PRIOR_PHASE:
+        raise ValueError("forward fit phase is invalid")
+    return _forward_fit_specs(
+        read_passing_scaling_outcome(outcome, root=root), target_phase,
+    )

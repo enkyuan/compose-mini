@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the PASS-only universe-forward selection contract."""
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,11 +17,11 @@ from tools.files import file_sha256, write_json
 from tools.finalize_universe_scaling import FitClosure
 from tools.panel_contract import FileBinding
 from tools.universe_forward_contract import (
-    CheckpointSelection, read_passing_scaling_outcome,
-    resolve_prior_checkpoint,
+    CheckpointSelection, ForwardFitSpec, forward_fit_specs,
+    read_passing_scaling_outcome, resolve_prior_checkpoint,
 )
 from tools.universe_scaling_contract import (
-    SEEDS, FitJob, fit_provenance_id,
+    EXPECTED_BUDGETS, SEEDS, FitJob, fit_provenance_id,
 )
 
 MASTER = tuple(f"S{index:02}" for index in range(55))
@@ -198,7 +198,7 @@ def fixture(
 
 def read_fixture(
     expected: FileBinding, manifest: object,
-    closure: FitClosure, root: Path,
+    closure: FitClosure, root: Path, target_phase: str | None = None,
 ) -> object:
     def read_attempt(
         snapshot: Path, logical: Path, repository: Path,
@@ -223,7 +223,11 @@ def read_fixture(
     ), patch.object(
         contract, "validate_fit_ledger", side_effect=validate_fits,
     ):
-        return read_passing_scaling_outcome(expected, root=root)
+        return (
+            read_passing_scaling_outcome(expected, root=root)
+            if target_phase is None else
+            forward_fit_specs(expected, target_phase, root=root)
+        )
 
 
 def test_pass_reader() -> None:
@@ -343,10 +347,125 @@ def test_checkpoint_selection() -> None:
     raises(resolve_prior_checkpoint, object(), "fold-1", SEEDS[0])
 
 
+def test_forward_fit_specs() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        expected, manifest, closure = fixture(root)
+        source = read_fixture(expected, manifest, closure, root)
+        specs = tuple(
+            item for phase in ("fold-1", "calibration")
+            for item in read_fixture(
+                expected, manifest, closure, root, phase,
+            )
+        )
+        raises(
+            read_fixture, replace(expected, sha256=digest(90)),
+            manifest, closure, root, "fold-1",
+        )
+    budgets = dict(EXPECTED_BUDGETS)
+    assert tuple(
+        (item.selection.target_phase, item.selection.seed)
+        for item in specs
+    ) == tuple(
+        (phase, seed)
+        for phase in ("fold-1", "calibration") for seed in SEEDS
+    )
+    assert all(
+        item.optimizer_updates ==
+        item.selection.checkpoint *
+        budgets[item.selection.target_phase].updates_per_checkpoint
+        for item in specs
+    )
+    assert len({item.provenance_id for item in specs}) == len(specs)
+    assert all(
+        item.provenance_id != item.selection.provenance_id for item in specs
+    )
+
+    assert contract._forward_provenance_id(
+        digest(8), MASTER, specs[0].selection, specs[0].optimizer_updates,
+    ) == \
+        "87df33de81a8ad27776a428f717bea1390b840df63c89e6a7302db832188e60b"
+    first = specs[0]
+    selections = source.selections
+    mutations = (
+        (digest(90), MASTER, first.selection, first.optimizer_updates),
+        (
+            source.outcome.sha256, MASTER,
+            replace(first.selection, checkpoint=2),
+            2 * budgets["fold-1"].updates_per_checkpoint,
+        ),
+        (
+            source.outcome.sha256, MASTER,
+            replace(first.selection, provenance_id=digest(91)),
+            first.optimizer_updates,
+        ),
+        (
+            source.outcome.sha256, MASTER,
+            replace(first.selection, model_fingerprint=digest(92)),
+            first.optimizer_updates,
+        ),
+        (
+            source.outcome.sha256, MASTER[1:] + MASTER[:1],
+            first.selection, first.optimizer_updates,
+        ),
+    )
+    assert all(
+        contract._forward_provenance_id(*value) !=
+        first.provenance_id
+        for value in mutations
+    )
+
+    invalid_selection = replace(
+        source, selections=(
+            replace(selections[0], provenance_id=digest(91)),
+            *selections[1:],
+        ),
+    )
+    raises(contract._forward_fit_specs, invalid_selection, "fold-1")
+    for changed in (selections[:-1], (selections[0], *selections)):
+        raises(
+            contract._forward_fit_specs,
+            replace(source, selections=changed), "fold-1",
+        )
+    raises(
+        contract._forward_fit_specs,
+        replace(
+            source,
+            selections=(
+                SimpleNamespace(**asdict(selections[0])), *selections[1:],
+            ),
+        ),
+        "fold-1",
+    )
+    for manifest in (
+        SimpleNamespace(),
+        SimpleNamespace(coverage=SimpleNamespace()),
+        SimpleNamespace(coverage=SimpleNamespace(
+            master=(*MASTER[:-1], MASTER[0]),
+        )),
+    ):
+        raises(
+            contract._forward_fit_specs,
+            replace(source, manifest=manifest), "fold-1",
+        )
+
+    try:
+        first.optimizer_updates = 1  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("forward fit specification is mutable")
+    assert isinstance(first, ForwardFitSpec)
+    for target in ("fold-0", "unknown", 1):
+        raises(forward_fit_specs, source.outcome, target, root=root)
+    raises(forward_fit_specs, object(), "fold-1", root=root)
+
+
 def main() -> None:
     test_pass_reader()
     test_pass_rejections()
     test_checkpoint_selection()
+    test_forward_fit_specs()
 
 
 if __name__ == "__main__":
