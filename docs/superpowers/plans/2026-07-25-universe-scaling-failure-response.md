@@ -328,32 +328,68 @@ Require exactly:
 
 ```python
 HISTORY_LENGTHS = (17, 34, 68)
-MODELS = ("global_ridge", "global_mlp", "panel_transformer")
+PRIMARY_MODEL = "panel_transformer"
+CONTROL_MODELS = ("global_ridge", "global_mlp")
+MODELS = (*CONTROL_MODELS, PRIMARY_MODEL)
 SEEDS = (7, 19, 31, 43, 61)
+TARGET_PHASES = ("fold-1", "calibration")
+TRAINING_COHORT = 44
+EVALUATION_RANKS = tuple(range(45, 56))
+MAX_HISTORY = max(HISTORY_LENGTHS)
 ```
 
-Prove that reordering, omitting, or adding an axis fails; destinations must be
-absent; inputs must be regular files with bound hashes; and all candidates must
-share one target-cell digest per phase.
+Use runtime model names `linear`, `mlp`, and `panel_transformer` in the sweep
+file, then map the first two to the public control names above. Require
+`raw-17`, `raw-34`, and `raw-68` to be identical except for `name` and
+`seq_len`.
 
-- [ ] **Step 2: Implement canonical parsing and arming**
+Prove that reordering, omitting, or adding any model, history, seed, phase,
+training member, or evaluation rank fails. Keep this contract Torch-free:
+parse canonical JSON directly instead of importing `tools.experiment`.
+
+- [ ] **Step 2: Implement canonical parsing without arming a run**
 
 The contract binds:
 
-- the exact training, validation, and later evaluation cutoffs;
-- the shared target-cell digest;
+- source failure `h13-universe-scaling-20260724-01` and the authenticated
+  scaling ledger's prior-phase length-17 checkpoint selections;
+- the exact phase membership, training/evaluation series order, and cutoffs;
+- one 68-bar-eligible training-cell digest and one evaluation-cell digest per
+  phase, reused by every history;
 - target `executable-return-v1` and horizon `13`;
-- current feature recipe and per-stock train-only scalers;
-- identical neural checkpoint grid, optimizer, and update budget within each
-  model comparison;
-- deterministic ridge penalty and rows;
-- five neural seeds;
-- phase-scoped fit, prediction-ledger, and immutable-receipt paths;
-- output paths and no-bytecode environment; and
-- the complete candidate family before any target-phase labels are read.
+- raw OHLCV features and one per-stock scaler fit on the common 68-bar-eligible
+  training prefix, reused by every history;
+- a literal phase `updates_per_checkpoint` derived as
+  `ceil(common first-11 training samples / 128)`;
+- total neural updates equal to the bound source checkpoint multiplied by that
+  phase value, identical only across histories for the same model and seed;
+- identical neural optimizer and sampled row indices across histories for the
+  same model and seed, while acknowledging that equal updates do not imply
+  equal compute;
+- deterministic ridge penalty and rows, one unseeded ridge fit, and five fits
+  per neural model;
+- provenance over model, history, phase, seed, members, budget, common-grid
+  digests, source failure, and prior checkpoint selection.
+
+Parse synthetic phase values through one `ContextPhase` schema containing the
+ordered 44 training row counts, ordered 11 evaluation row counts and per-series
+grid digests, aggregate training/evaluation grid digests,
+`updates_per_checkpoint`, and ten prior selections: MLP and panel Transformer
+for each frozen seed. Verify each selection's source identity with the existing
+scaling `FitJob` provenance math.
 
 Do not include patching, RevIN, ticker embeddings, a probabilistic head, or
-extra model sizes.
+extra model sizes. This task freezes only the schema, family, example config,
+and expected closure. Do not publish a real attempt until the runner,
+finalizer, and armer exist and can be included in the bound source closure.
+Regular-file verification, absent destinations, output topology, environment
+binding, real grid hashes, and attempt publication belong to that later armer.
+
+Require exactly 33 fits and 363 prediction records per target phase: one ridge
+fit plus five MLP and five panel-Transformer fits at each of three histories,
+with predictions for 11 unseen series. The total closure is 66 fits and 726
+prediction records. Task 4 derives each record's value count from the filtered
+series grid and binds the resulting phase totals.
 
 - [ ] **Step 3: Verify the immutable family**
 
@@ -364,7 +400,7 @@ Run:
 make -B PYTHON="$PYTHON" check
 ```
 
-Expected: all pass and every destination remains absent.
+Expected: all pass without importing PyTorch or creating a destination.
 
 - [ ] **Step 4: Commit the checkpoint**
 
@@ -383,8 +419,11 @@ test, and Makefile hunk IDs returned by `but diff`.
 
 **Files:**
 
+- Create: `tools/arm_context_diagnostic.py`
 - Create: `tools/run_context_diagnostic.py`
 - Create: `tools/finalize_context_diagnostic.py`
+- Modify: `tools/data_v1.py`
+- Modify: `tools/train.py`
 - Test: `tests/python/test_context_diagnostic_driver.py`
 - Modify: `Makefile`
 
@@ -398,35 +437,106 @@ same-phase prediction ledger.
 
 - [ ] **Step 2: Reuse existing training primitives**
 
-Use `feature_lookback()` for each history length, the existing chronological
-sample rows, train-only scaler fit, ridge/MLP/panel fitters, prediction-ledger
-validators, stock-macro metrics, and complete-day bootstrap. Do not fork their
-math or serialization.
+Add the smallest shared primitives needed for bounded bar reads and
+training-only exact-update fitting. Use `feature_lookback()`, `PackedRows`,
+`ForwardFeatureWindows`, the existing ridge/MLP/panel fitters,
+prediction-ledger validators, stock-macro metrics, paired comparison, and
+complete-day bootstrap. Do not fork their math or serialization.
 
-For each neural model and seed, select the checkpoint using length `17` on the
-prior phase only. Reinitialize all three histories, give them that exact update
-budget, and publish predictions on the shared target cells before reading
-target-phase outcomes. Ridge fits once per phase with its frozen penalty.
+Derive the exact history-17 target timestamps from the authenticated source
+attempt, then filter that grid to cells with 68-bar eligibility. Do not rerun
+`session_samples()` with the original numeric blocks: changing history
+renumbers opportunity zero and would move target dates forward by 51 bars.
+Reuse the filtered target timestamps, training targets, row counts, and
+embargo boundaries for all histories.
+
+Fit each stock's feature and target scalers once on that common training
+prefix. Shorter candidates receive only the tail of each same scaled window,
+so history is the sole data treatment.
+
+For each neural model and seed, bind the authenticated scaling ledger's
+already-made length-17 prior-phase checkpoint selection. Define:
+
+```text
+updates(model, seed, target phase) =
+    source checkpoint(model, seed, prior phase)
+    * ceil(common first-11 target-phase training samples / 128)
+```
+
+Reinitialize every history and use the same sampled row indices across
+histories for that model and seed. Never warm-start one history from another.
+Ridge fits once per phase and history with its frozen penalty.
+
+After the runner and finalizer pass their failure-path tests, arm the attempt
+against their complete source closure. For each target phase, fit every
+candidate before publishing any same-phase prediction. Create the pre-receipt
+ledger only from bars bounded through each opportunity's `as_of` and
+label-free `ForwardFeatureWindows`.
 
 After fold-1 prediction, atomically publish a receipt that binds the fit
 closure, prediction-ledger SHA-256, target-cell digest, candidate family, and
 source tree. Only a successfully revalidated receipt may enable the fold-1
-label accessor used to select calibration's checkpoint. Apply the same receipt
-boundary to calibration before any calibration label access. An interruption
-after label access is terminal; never delete a receipt or rerun that phase.
+label accessor used for metrics and to authorize calibration's chronologically
+later training rows. It cannot alter the already-bound checkpoint selection.
+Apply the same receipt boundary to calibration before any calibration label
+access. An interruption after label access is terminal; never delete a receipt
+or rerun that phase.
 
 - [ ] **Step 3: Evaluate without post-hoc rescue**
 
-Primary comparison: paired stock-macro return MAE. A longer history advances
-only when its maximum 97.5% bootstrap upper bound against history `17` is below
-zero in both development phases. If both pass, select `34`. Direction and close
-MAE are descriptive and cannot overturn the primary result.
+Average the five neural-seed predictions per cell before computing MAE or
+bootstrap intervals; seeds are repeated fits, not independent market
+observations.
 
-More epochs or width are allowed only when a pre-frozen training diagnostic
-shows validation loss still improving at the final checkpoint without a
-widening train-validation gap.
+The primary statistic is paired stock-macro return-MAE gain:
 
-- [ ] **Step 4: Run all gates**
+```text
+abs(reference error) - abs(longer-history error)
+```
+
+Positive values favor the longer history. Compare only panel-Transformer
+histories `34` and `68` against `17`. A history qualifies only when the lower
+2.5% endpoint is positive for every frozen block width in both target phases:
+
+```python
+min(lower for phase in TARGET_PHASES for lower, _ in intervals[phase]) > 0
+```
+
+The two predeclared alternatives use the existing two-sided 95% intervals,
+giving one-sided 2.5% error per alternative and a simple 5% Bonferroni family
+bound. Select `34` when it qualifies; otherwise select `68` when it qualifies;
+otherwise retain `17`. Ridge and MLP are descriptive controls and cannot
+authorize or veto a Transformer context change.
+
+Direction, close MAE, negative R-squared, unavailable Spearman, and control
+losses remain reportable but cannot rescue the primary result. More epochs,
+width, features, or models require a separately frozen later attempt; never
+expand this family after development labels are opened.
+
+- [ ] **Step 4: Prove causality and family closure**
+
+Adversarially prove:
+
+- all histories use identical sample cells, training targets, row counts,
+  scalers, sampler indices, and budgets;
+- history `17` cannot retain earlier rows excluded by history `68`;
+- denied or mocked truth accessors are never called before receipt;
+- changing a target value strictly after every same-phase prediction `as_of`
+  leaves pre-receipt state and predictions byte-identical, while changing a
+  retained training label changes the state fingerprint;
+- changing a row after a prediction's `as_of` leaves that prediction
+  unchanged;
+- malformed data after a bounded cutoff is ignored, while malformed data at
+  or before it fails;
+- fit precedes same-phase prediction, prediction precedes receipt, and receipt
+  revalidation precedes truth access;
+- missing, duplicate, reordered, or extra records and wrong attempt, grid,
+  state, or provenance hashes fail;
+- a better longer candidate produces positive gain and passes only when every
+  lower bound is positive; and
+- control-model wins cannot change the Transformer context decision.
+
+- [ ] **Step 5: Run all gates**
 
 ```sh
 "$PYTHON" tests/python/test_context_diagnostic_driver.py
@@ -437,7 +547,7 @@ make -B PYTHON="$PYTHON" check
 
 Expected: focused and aggregate tests pass without reading reserved labels.
 
-- [ ] **Step 5: Commit the checkpoint**
+- [ ] **Step 6: Commit the checkpoint**
 
 ```sh
 but diff
@@ -445,8 +555,9 @@ but diff
 
 Use the selected-change fast path to create
 `enkyuan/context-diagnostic-runner` with message
-`feat(training): compare temporal context`. Pass only the runner, finalizer,
-test, and Makefile hunk IDs returned by `but diff`.
+`feat(training): compare temporal context`. Pass only the armer, bounded-read
+and exact-update primitives, runner, finalizer, test, and Makefile hunk IDs
+returned by `but diff`.
 
 ---
 
