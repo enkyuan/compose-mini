@@ -358,6 +358,10 @@ def execute_long(
     )
 ```
 
+Reject non-finite or nonpositive cash, reference price, and outcome price before
+performing this arithmetic; keep `Costs` validation as the single authority for
+cost parameters.
+
 The portfolio engine consumes validated, market-truth-joined opportunities:
 
 ```python
@@ -371,16 +375,24 @@ class PortfolioOpportunity:
     target_time: str
     reference_price: float
     outcome_price: float
-    actual_return: float
     prediction_mean: float | None
     prediction_pstdev: float | None
-
-
 ```
+
+Keep authorization and truth access as separate API stages.
+`validate_portfolio_phase()` consumes only the requested phase and action,
+available prediction metadata, the passing forward contract, and the
+digest-bound master manifest. It must reject protected or unbound phases and
+provenance mismatches before receiving any price or outcome accessor. For
+trading actions it also rejects manifest-map mismatches and incomplete seeds
+when forecast metadata is present. Only its validated result may be passed with
+such an accessor to `join_portfolio_truth()`, which constructs
+`PortfolioOpportunity` values. Test the phase gate with an accessor that raises
+if called.
 
 Implement
 `run_phase(opportunities: Sequence[PortfolioOpportunity], initial_cash: float,
-costs: Costs, *, action: str, safety_bps: float = 0.0,
+costs: Costs, *, phase: str, action: str, safety_bps: float = 0.0,
 disagreement_lambda: float = 0.0) -> dict[str, object]` only after the forward
 ledger schema is frozen. The forward-ledger validator aggregates the exact
 five-seed set once; policy trials reuse `prediction_mean` and
@@ -395,8 +407,17 @@ Use the existing `Costs` math with:
 - slippage: `1` basis point per side;
 - proportional fee: `0`;
 - cash yield: `0`;
-- fractional shares, no leverage, and gross exposure at most `1`;
+- fractional long-or-cash positions, no leverage, shorting, tax, or minimum
+  commission, and gross exposure at most `1`;
 - invest `100%` of available cash in the single ranked winner.
+
+This is a `$100` diagnostic, not a capacity model. Assume adjusted,
+regular-session 30-minute bars, no separate corporate-action cash flow, and
+notional too small to consume a material share of bar volume. Model both legs
+as complete fills: a market proxy at the adjusted next-bar open plus impact,
+followed by a market-on-close proxy at the adjusted target-bar close minus
+impact. Omit latency, order rejection, partial fills, participation limits,
+and size-driven impact until a separately frozen capacity experiment.
 
 For impact
 
@@ -414,6 +435,11 @@ the round-trip break-even threshold is
 + \frac{\text{safety bps}}{10000}.
 \]
 
+`safety_bps` is an additive log-return buffer. With the frozen costs,
+per-side impact is `1.5` basis points and the round-trip break-even is about
+`3` log basis points, so the four safety values produce thresholds near
+`3`, `6`, `9`, and `13` log basis points.
+
 Aggregate all five seeds at one
 `(phase, series, as_of, entry_time, target_time)` and score:
 
@@ -422,22 +448,48 @@ s = \operatorname{mean}(\hat r)
   - \lambda\operatorname{pstdev}(\hat r).
 \]
 
-Reject incomplete seed sets. Enter only when `s` strictly exceeds break-even.
-The signal is known after `as_of`; enter at `entry_time` open and exit at
-`target_time` close. Require:
+The population standard deviation measures disagreement among the five fixed
+seeds; it is not calibrated predictive uncertainty. `lambda` is dimensionless
+because both terms are log returns. Reject incomplete seed sets. Enter only
+when `s` strictly exceeds break-even. The signal is known after `as_of`; enter
+at `entry_time` open and exit at `target_time` close. Require:
 
 ```text
 as_of < entry_time <= target_time
-actual_return == log(outcome_price / reference_price)
+actual_return := log(outcome_price / reference_price)
 ```
 
 The forward ledger has its own schema; it is not legacy backtest schema `2`.
 Join it to the scaling finalizer's bound market truth before executing trades.
+Derive `actual_return` exactly once from that joined truth; do not accept it
+from a second field or file. The truth join rejects non-finite or nonpositive
+reference and outcome prices before returning any opportunity.
 
-At one entry time, rank threshold-passing candidates by descending score, then
-frozen manifest rank, then ticker. A position remains active through the target
-close, so reject every candidate with
-`candidate.entry_time <= active.target_time`.
+For either trading action, validate every metadata record's provenance, phase,
+and canonical UTC timestamps at the pre-join stage. Rows for one series may
+repeat its rank over time. Build the distinct `series -> manifest_rank` map,
+require one stable rank per series and no rank shared by two series, and require
+the whole map to equal the digest-bound, development-evaluable master-manifest
+map exactly. A unique but permuted map is invalid. Reject duplicate opportunity
+identities and duplicate `(series, entry_time)` pairs. `run_phase()` requires
+one explicit phase, groups entries, and processes those groups in chronological
+order regardless of input order.
+
+All actions require finite positive `initial_cash`. `long_above` requires
+finite nonnegative `safety_bps` and `disagreement_lambda`, finite prediction
+means, and finite nonnegative population deviations. `always_up` and `cash`
+require both policy parameters to remain zero. `always_up` requires prediction
+fields to be `None`. Both trading actions require nonempty opportunities;
+`cash` requires an empty opportunity sequence and returns without consulting
+predictions or prices. Its early path validates only phase authorization, bound
+forward-contract and manifest identity, cash and parameter invariants, and the
+empty sequence; it performs no map or truth join.
+
+If `entry_time <= active.target_time`, reject the whole entry group because the
+position remains active through the target close. Otherwise, rank
+threshold-passing candidates by descending score and then ascending manifest
+rank. Manifest ranks are unique, so equal scores deterministically choose the
+lower rank; no ticker tie-break is reachable in valid input.
 
 ### Frozen policy selection
 
@@ -447,37 +499,81 @@ Use the Cartesian grid:
 - disagreement penalty `lambda`: `(0, 0.5, 1)`
 - cash: an explicit no-trade trial
 
-Select by highest terminal log growth, then lower turnover, higher safety, and
-smaller lambda. Each selection trial may start from a notional `$100`; fold-0
-is selection-only and contributes no evidence equity. Start the one evidence
-account at `$100` on fold-1 using the fold-0-selected rule. Require all fold-1
-positions closed before its boundary. Select the calibration rule from fold-1
-after fold-1 closes, then carry that same account's terminal cash unchanged
-through the zero-yield embargo into calibration. The new rule controls only
-future calibration actions; it cannot replace or rewind the fold-1 cash path.
+Register exactly `12` forecast trials plus cash, for `13` trials total, before
+reading results. Do not expand this grid after inspection. Select by highest
+terminal log growth and then lower turnover. Cash wins an exact
+growth-and-turnover tie against a forecast trial; among forecast trials, prefer
+higher safety and then smaller lambda.
+
+For each selection trial, define gross turnover as the sum of entry and exit
+notionals divided by that trial's initial `$100`. Fold-0 is selection-only and
+contributes no evidence equity. Start one evidence account at `$100` on fold-1
+using the fold-0-selected rule. Require all fold-1 positions closed before its
+boundary. Select the calibration rule from fold-1 after fold-1 closes, then
+carry that same account's terminal cash unchanged through the zero-yield
+embargo into calibration. The new rule controls only future calibration
+actions; it cannot replace or rewind the fold-1 cash path. Combined evidence
+turnover sums both phases' notionals and divides once by the original `$100`.
 No position may cross a policy or phase boundary.
 
 The comparison controls are:
 
-- cash at `$100`, zero yield;
+- cash at `$100`, zero yield, carried across both evidence phases;
 - always-up, which enters the lowest-manifest-rank eligible genuine bar whenever
   idle on the same phase-evaluable opportunity grid, under the same collision,
-  holding-period, and cost rules.
+  holding-period, cost, and cross-phase cash-carry rules.
 
 Omit buy-and-hold until an exact multi-stock basket, missing-bar, rebalance, and
 exit contract is separately frozen.
 
 The curve contains initial equity and post-exit realized-cash events only.
-Report terminal equity, realized-event drawdown explicitly labeled as neither
+At event `t`, compute realized-event drawdown as
+`1 - C_t / max(C_u for u <= t)`. Count rejections only as
+`below_threshold`, `not_selected`, or `position_active`; invalid input raises
+instead, and count each rejected opportunity rather than each group. Report
+terminal equity, realized-event drawdown explicitly labeled as neither
 bar-close nor intratrade risk, turnover, completed trades, phase coverage, and
-rejection counts. Do not synthesize daily/weekly/monthly equity or compare this
-drawdown with legacy bar-close curves.
+those rejection counts. Do not synthesize daily/weekly/monthly equity or
+compare this drawdown with legacy bar-close curves.
 
-Test costed and frictionless execution, strict break-even comparison,
-manifest-rank and ticker tie-breaking, entry-at-exit collision rejection,
-cross-phase cash carry, cash and always-up without model records, protected
-phase rejection, and the absence of period or bar-close risk claims. One
-zero-cost synthetic path must prove two trades compound `$100 -> $110 -> $121`.
+Every report fixes `evidence_role` to
+`hypothetical-development-execution`, `cash_yield` to `0`, and `risk_scope` to
+`realized-exit-events-only`. Do not annualize results or label them expected,
+projected, live, deployable, or independently confirmed.
+
+Rejection precedence is fixed. When a position is active, count every member of
+the entry group as `position_active` without reading scores. When idle under
+`long_above`, count each threshold failure as `below_threshold`, each passing
+nonwinner as `not_selected`, and do not count the winner. Under `always_up`,
+count every nonwinner as `not_selected`; under `cash`, all three counts are
+zero.
+
+Test invalid and non-finite execution inputs, costed and frictionless execution,
+strict break-even comparison, exact 13-trial registration, equal-score
+lower-rank selection, swapped-rank-map and duplicate-series-entry rejection,
+entry-at-exit collision rejection, input-order invariance, action-specific
+numeric validation, cross-phase cash carry, cash and always-up without model
+records, protected phase rejection before truth access, and the absence of
+period or bar-close risk claims. One zero-cost synthetic path must prove two
+trades compound `$100 -> $110 -> $121`.
+
+The finite grid and chronological selection/evidence split limit, but do not
+eliminate, data-snooping risk; the result remains development evidence. This
+scope follows the concerns in the
+[backtest-overfitting](https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf)
+and [Reality Check](https://doi.org/10.1111/1468-0262.00152) literature.
+Do not claim a
+[Deflated Sharpe Ratio](https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf)
+or formal probability of overfitting from this sparse realized-event path.
+
+The fixed-impact, full-fill model is appropriate only for the registered
+`$100` diagnostic. Before increasing notional, freeze spread/quote inputs,
+volume participation, nonlinear temporary and permanent impact, latency,
+partial-fill, and implementation-shortfall accounting. These extensions are
+motivated by
+[Almgren--Chriss](https://doi.org/10.21314/JOR.2001.041) and
+[Perold](https://www.jstor.org/stable/j.ctv1mjqtwg.16), but are deliberately
+outside this checkpoint.
 
 ### Frozen promotion gate
 
@@ -497,8 +593,8 @@ Tests must prove:
 - future-phase label mutation cannot change an earlier model or policy;
 - fold-0 contributes zero evidence equity;
 - fold-1 terminal cash is calibration initial cash exactly;
-- simultaneous ties, seed completeness, manifest order, costs, and returns are
-  exact;
+- equal-score lower-rank selection, exact manifest-map validation, duplicate
+  rejection, seed completeness, costs, and returns are exact;
 - an entry at the same timestamp as the prior target is rejected;
 - exposure never exceeds one and positions never overlap or cross boundaries;
 - unrelated phase/provenance/question/mode/cohort/model records are rejected;
