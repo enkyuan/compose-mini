@@ -14,10 +14,11 @@ from tools.context_diagnostic_contract import (
     BATCH_SIZE, CONTROL_COHORT, CONTROL_MODELS, EVALUATION_RANKS,
     HISTORY_LENGTHS, MAX_HISTORY, MODELS, PHASE_RANGES, PRIMARY_MODEL,
     RUNTIME_MODELS, RUNTIME_TO_PUBLIC, SCALER_POLICY, SEEDS, TARGET_PHASES,
-    ContextPhase, ContextReceipt,
+    ContextPhase, ContextReceipt, ContextScalerInput,
     context_family_sha256, context_fit_record, context_phase_sha256,
     context_prediction_record,
-    context_provenance_id, expected_context_fits,
+    context_provenance_id, context_scaler_inputs_sha256,
+    expected_context_fits,
     expected_context_predictions, expected_context_sweep,
     parse_context_phases, validate_context_fit_records,
     validate_context_prediction_records, validate_context_sweep,
@@ -59,6 +60,16 @@ def selection_value(
     }
 
 
+def scaler_inputs(phase: str) -> tuple[ContextScalerInput, ...]:
+    return tuple(
+        ContextScalerInput(
+            series, digest(f"{series}-csv"), 200 + index,
+            digest(f"{phase}-{series}-scaler-grid"),
+        )
+        for index, series in enumerate(MASTER)
+    )
+
+
 def phase_value(phase: str) -> dict[str, object]:
     training_rows = [
         {"count": 100 + index, "series": series}
@@ -81,6 +92,9 @@ def phase_value(phase: str) -> dict[str, object]:
         ],
         "phase": phase,
         "prior_selections": selections,
+        "scaler_inputs_sha256": context_scaler_inputs_sha256(
+            MASTER, scaler_inputs(phase),
+        ),
         "source_ranges": list(map(list, PHASE_RANGES[phase])),
         "training_grid_sha256": digest(f"{phase}-training"),
         "training_rows": training_rows,
@@ -133,6 +147,44 @@ def test_exact_sweep() -> None:
     invalid = copy.deepcopy(value)
     invalid["candidates"][1]["weight_decay"] = 0.0
     raises(validate_context_sweep, invalid)
+
+
+def test_scaler_input_closure() -> None:
+    inputs = scaler_inputs(TARGET_PHASES[0])
+    original = context_scaler_inputs_sha256(MASTER, inputs)
+    assert original == context_scaler_inputs_sha256(MASTER, inputs)
+
+    for index in (0, 44, 54):
+        for field in ("csv_sha256", "training_grid_sha256"):
+            changed = list(inputs)
+            changed[index] = replace(
+                changed[index], **{field: digest(f"{index}-{field}")},
+            )
+            assert context_scaler_inputs_sha256(MASTER, changed) != original
+
+    changed = list(inputs)
+    changed[54] = replace(
+        changed[54], training_rows=changed[54].training_rows + 1,
+    )
+    assert context_scaler_inputs_sha256(MASTER, changed) != original
+
+    for invalid in (
+        inputs[:-1],
+        (*inputs, inputs[0]),
+        (inputs[1], inputs[0], *inputs[2:]),
+        (*inputs[:1], inputs[0], *inputs[2:]),
+    ):
+        raises(context_scaler_inputs_sha256, MASTER, invalid)
+    for field, value in (
+        ("csv_sha256", "invalid"),
+        ("training_grid_sha256", "invalid"),
+        ("training_rows", 0),
+        ("series", MASTER[1]),
+    ):
+        changed = list(inputs)
+        changed[0] = replace(changed[0], **{field: value})
+        raises(context_scaler_inputs_sha256, MASTER, changed)
+    raises(context_scaler_inputs_sha256, MASTER[:-1], inputs[:-1])
 
 
 def test_phase_family_and_closure() -> None:
@@ -215,6 +267,8 @@ def test_phase_rejections() -> None:
             item["prior_selections"][0],
         ),
         lambda item: item.update({"source_ranges": [[0, 1], [2, 3]]}),
+        lambda item: item.pop("scaler_inputs_sha256"),
+        lambda item: item.update({"scaler_inputs_sha256": "invalid"}),
         lambda item: item.update({"training_grid_sha256": "invalid"}),
         lambda item: item.update({"extra": True}),
     )
@@ -283,6 +337,7 @@ def test_provenance_binds_every_treatment() -> None:
     ) != original
 
     for changed in (
+        replace(phase, scaler_inputs_sha256=digest("other-scaler-inputs")),
         replace(phase, training_grid_sha256=digest("other-training-grid")),
         replace(
             phase, evaluation_grid_sha256=digest("other-evaluation-grid"),
@@ -478,13 +533,14 @@ def test_evidence_and_receipt_closure() -> None:
         phase, attempt, fit_ledger, prediction_ledger,
         digest("source-tree"), run_identity,
     )
-    changed = replace(
-        phase, training_grid_sha256=digest("other-training-grid"),
-    )
-    raises(
-        receipt.validate, changed, attempt, fit_ledger,
-        prediction_ledger, digest("source-tree"), run_identity,
-    )
+    for changed in (
+        replace(phase, scaler_inputs_sha256=digest("other-scaler-inputs")),
+        replace(phase, training_grid_sha256=digest("other-training-grid")),
+    ):
+        raises(
+            receipt.validate, changed, attempt, fit_ledger,
+            prediction_ledger, digest("source-tree"), run_identity,
+        )
     raises(
         receipt.validate, phase, attempt, fit_ledger,
         prediction_ledger, digest("source-tree"), (7, 12),
@@ -508,6 +564,7 @@ def test_evidence_and_receipt_closure() -> None:
 
 def main() -> None:
     test_exact_sweep()
+    test_scaler_input_closure()
     test_phase_family_and_closure()
     test_phase_rejections()
     test_provenance_binds_every_treatment()

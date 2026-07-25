@@ -99,6 +99,59 @@ def _items(value: object, count: int, label: str) -> list[object]:
     return value
 
 
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, allow_nan=False, separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ContextScalerInput:
+    series: str
+    csv_sha256: str
+    training_rows: int
+    training_grid_sha256: str
+
+
+def context_scaler_inputs_sha256(
+    master: Sequence[str], values: Sequence[ContextScalerInput],
+) -> str:
+    """Bind every stock's max-history training scaler inputs."""
+    names = tuple(master)
+    universe_roles(names)
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise ValueError("context scaler inputs are invalid")
+    inputs = tuple(values)
+    if len(inputs) != len(names):
+        raise ValueError("context scaler inputs must contain 55 stocks")
+    records = []
+    for index, (value, series) in enumerate(zip(
+        inputs, names, strict=True,
+    )):
+        if not isinstance(value, ContextScalerInput) or \
+           _string(value.series, f"scaler input {index} series") != series:
+            raise ValueError("context scaler input order changed")
+        records.append({
+            "csv_sha256": _sha256(
+                value.csv_sha256, f"{series} scaler csv",
+            ),
+            "series": series,
+            "training_grid_sha256": _sha256(
+                value.training_grid_sha256, f"{series} scaler grid",
+            ),
+            "training_rows": _integer(
+                value.training_rows, f"{series} scaler rows",
+            ),
+        })
+    return _json_sha256({
+        "inputs": records,
+        "max_history": MAX_HISTORY,
+        "role": "context-scaler-inputs",
+        "scaler_policy": SCALER_POLICY,
+        "schema": 1,
+    })
+
+
 @dataclass(frozen=True, slots=True)
 class PriorSelection:
     model: str
@@ -152,6 +205,7 @@ class ContextPhase:
     evaluation_rows: tuple[tuple[str, int, str], ...]
     training_grid_sha256: str
     evaluation_grid_sha256: str
+    scaler_inputs_sha256: str
     updates_per_checkpoint: int
     prior_selections: tuple[PriorSelection, ...]
 
@@ -170,7 +224,8 @@ class ContextPhase:
             {
                 "phase", "source_ranges", "training_rows", "evaluation_rows",
                 "training_grid_sha256", "evaluation_grid_sha256",
-                "updates_per_checkpoint", "prior_selections",
+                "scaler_inputs_sha256", "updates_per_checkpoint",
+                "prior_selections",
             },
             "context phase",
         )
@@ -238,11 +293,21 @@ class ContextPhase:
                 "updates per checkpoint do not match control rows",
             )
         return cls(
-            phase, expected_ranges, tuple(training_rows),
-            tuple(evaluation_rows),
-            _sha256(item["training_grid_sha256"], "training grid"),
-            _sha256(item["evaluation_grid_sha256"], "evaluation grid"),
-            updates, selections,
+            phase=phase,
+            source_ranges=expected_ranges,
+            training_rows=tuple(training_rows),
+            evaluation_rows=tuple(evaluation_rows),
+            training_grid_sha256=_sha256(
+                item["training_grid_sha256"], "training grid",
+            ),
+            evaluation_grid_sha256=_sha256(
+                item["evaluation_grid_sha256"], "evaluation grid",
+            ),
+            scaler_inputs_sha256=_sha256(
+                item["scaler_inputs_sha256"], "scaler inputs",
+            ),
+            updates_per_checkpoint=updates,
+            prior_selections=selections,
         )
 
 
@@ -255,6 +320,7 @@ def _phase_value(phase: ContextPhase) -> dict[str, object]:
         ],
         "phase": phase.phase,
         "prior_selections": list(map(asdict, phase.prior_selections)),
+        "scaler_inputs_sha256": phase.scaler_inputs_sha256,
         "source_ranges": list(map(list, phase.source_ranges)),
         "training_grid_sha256": phase.training_grid_sha256,
         "training_rows": [
@@ -393,27 +459,19 @@ def context_provenance_id(
             source_failure_sha256, "source failure",
         ),
     }
-    return hashlib.sha256(json.dumps(
-        payload, allow_nan=False, separators=(",", ":"), sort_keys=True,
-    ).encode()).hexdigest()
+    return _json_sha256(payload)
 
 
 def context_family_sha256() -> str:
     """Hash the predeclared model family independently of any run."""
-    return hashlib.sha256(json.dumps(
-        expected_context_sweep(), allow_nan=False, separators=(",", ":"),
-        sort_keys=True,
-    ).encode()).hexdigest()
+    return _json_sha256(expected_context_sweep())
 
 
 def context_phase_sha256(phase: ContextPhase) -> str:
     """Hash every frozen axis and grid in one validated target phase."""
     if not isinstance(phase, ContextPhase):
         raise ValueError("context phase digest input is invalid")
-    return hashlib.sha256(json.dumps(
-        _phase_value(phase), allow_nan=False, separators=(",", ":"),
-        sort_keys=True,
-    ).encode()).hexdigest()
+    return _json_sha256(_phase_value(phase))
 
 
 def _loss(value: object) -> float:

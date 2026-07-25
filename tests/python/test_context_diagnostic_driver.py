@@ -71,6 +71,7 @@ def phase_value(name: str = "fold-1") -> dict[str, object]:
             for index, seed in enumerate(SEEDS)
         ],
         "source_ranges": list(map(list, PHASE_RANGES[name])),
+        "scaler_inputs_sha256": digest(f"{name}-scaler-inputs"),
         "training_grid_sha256": digest(f"{name}-training"),
         "training_rows": training,
         "updates_per_checkpoint": (
