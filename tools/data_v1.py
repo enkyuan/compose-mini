@@ -18,17 +18,44 @@ TARGET_FORMULAS = {
     EXECUTABLE_RETURN_TARGET: "log(close[t + horizon] / open[t + 1])",
 }
 LINE_CAP = 512
+_TIMESTAMP_SEPARATORS = {
+    4: ord("-"),
+    7: ord("-"),
+    10: ord("T"),
+    13: ord(":"),
+    16: ord(":"),
+    19: ord("Z"),
+}
 # Delegate numeric syntax and range flags to the same libc primitive as C.
 _STRTOF = ctypes.CDLL(None, use_errno=True).strtof
 _STRTOF.argtypes = (ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p))
 _STRTOF.restype = ctypes.c_float
 
 
-def _lines(path: Path) -> Iterator[tuple[int, str]]:
+def _timestamp_shape(value: bytes) -> bool:
+    return len(value) == 20 and not any(
+        value[index] != separator
+        for index, separator in _TIMESTAMP_SEPARATORS.items()
+    ) and not any(
+        not 48 <= byte <= 57
+        for index, byte in enumerate(value)
+        if index not in _TIMESTAMP_SEPARATORS
+    )
+
+
+def _lines(path: Path, stop: bytes | None = None) -> Iterator[tuple[int, str]]:
     with path.open("rb") as file:
         number = 0
         while raw := file.readline(LINE_CAP + 1):
             number += 1
+            # Establish the bound before decoding or validating the payload.
+            timestamp = raw[:20]
+            if (
+                stop is not None
+                and _timestamp_shape(timestamp)
+                and timestamp > stop
+            ):
+                return
             terminated = raw.endswith(b"\n")
             if len(raw) > LINE_CAP or (len(raw) == LINE_CAP and not terminated) or b"\0" in raw:
                 raise ValueError(f"line {number}: invalid or overlong record")
@@ -43,11 +70,11 @@ def _lines(path: Path) -> Iterator[tuple[int, str]]:
 
 
 def _timestamp_valid(value: str) -> bool:
-    separators = {4: "-", 7: "-", 10: "T", 13: ":", 16: ":", 19: "Z"}
-    if len(value) != 20 or any(value[index] != separator
-                               for index, separator in separators.items()) or \
-       any(not byte.isascii() or not byte.isdigit()
-           for index, byte in enumerate(value) if index not in separators):
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if not _timestamp_shape(encoded):
         return False
     year, month, day = int(value[:4]), int(value[5:7]), int(value[8:10])
     hour, minute, second = int(value[11:13]), int(value[14:16]), int(value[17:19])
@@ -73,8 +100,12 @@ def _number(field: str, number: int) -> float:
     return value
 
 
-def _fields(path: Path) -> Iterator[tuple[int, str, list[str]]]:
-    lines = _lines(path)
+def _fields(
+    path: Path, stop: str | None = None
+) -> Iterator[tuple[int, str, list[str]]]:
+    if stop is not None and not _timestamp_valid(stop):
+        raise ValueError("stop must be a canonical UTC timestamp")
+    lines = _lines(path, None if stop is None else stop.encode("ascii"))
     try:
         _, header = next(lines)
     except StopIteration as error:
@@ -84,22 +115,26 @@ def _fields(path: Path) -> Iterator[tuple[int, str, list[str]]]:
 
     previous = ""
     for number, line in lines:
-        fields = line.split(",")
-        if len(fields) != FEATURE_COUNT + 1 or any(not field for field in fields):
-            raise ValueError(f"line {number}: expected exactly six fields")
-        timestamp = fields[0]
+        timestamp, separator, row = line.partition(",")
         if not _timestamp_valid(timestamp):
             raise ValueError(f"line {number}: invalid canonical UTC timestamp")
+        fields = row.split(",") if separator else []
+        if len(fields) != FEATURE_COUNT or any(not field for field in fields):
+            raise ValueError(f"line {number}: expected exactly six fields")
         if previous and timestamp <= previous:
             raise ValueError(f"line {number}: timestamps must increase")
-        yield number, timestamp, fields[1:]
+        yield number, timestamp, fields
         previous = timestamp
+    if stop is not None and previous != stop:
+        raise ValueError("stop timestamp is not present")
 
 
-def _records(path: Path) -> Iterator[tuple[str, list[float]]]:
+def _records(
+    path: Path, stop: str | None = None
+) -> Iterator[tuple[str, list[float]]]:
     if locale.setlocale(locale.LC_NUMERIC) != "C":
         raise ValueError("LC_NUMERIC must be C")
-    for number, timestamp, fields in _fields(path):
+    for number, timestamp, fields in _fields(path, stop):
         values = [_number(field, number) for field in fields]
         if values[3] <= 0.0:
             raise ValueError(f"line {number}: close must be positive")
@@ -114,13 +149,24 @@ def read_csv(path: Path) -> array:
     return rows
 
 
-def read_bars(path: Path) -> tuple[tuple[str, ...], array]:
-    """Return timestamps and flat OHLCV without duplicating CSV validation."""
+def _bars(
+    path: Path, stop: str | None = None
+) -> tuple[tuple[str, ...], array]:
     timestamps, rows = [], array("f")
-    for timestamp, values in _records(path):
+    for timestamp, values in _records(path, stop):
         timestamps.append(timestamp)
         rows.extend(values)
     return tuple(timestamps), rows
+
+
+def read_bars(path: Path) -> tuple[tuple[str, ...], array]:
+    """Return timestamps and flat OHLCV without duplicating CSV validation."""
+    return _bars(path)
+
+
+def read_bars_through(path: Path, stop: str) -> tuple[tuple[str, ...], array]:
+    """Return bars through stop without decoding later observations."""
+    return _bars(path, stop)
 
 
 def read_timestamps(path: Path) -> tuple[str, ...]:
