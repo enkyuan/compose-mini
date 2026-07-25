@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import argparse
 import json
@@ -209,6 +209,44 @@ class TrainingData(DataSplits):
     feature_set: str = "ohlcv"
     horizon_bars: int = 1
     target_kind: str = CLOSE_RETURN_TARGET
+
+
+def tail_training_data(data: TrainingData, seq_len: int) -> TrainingData:
+    """Shorten indexed histories without changing samples or fitted scalers."""
+    if not isinstance(data, TrainingData) or type(seq_len) is not int:
+        raise ValueError("tail views require indexed training data")
+    splits = (data.train, data.validation, data.test)
+    if any(not isinstance(split, Windows) or not split.indexed
+           for split in splits):
+        raise ValueError("tail views require indexed training data")
+    source = splits[0]
+    shared = ("features", "targets", "references", "outcomes")
+    if not 1 <= seq_len <= source.seq_len or any(
+        split.seq_len != source.seq_len or
+        split.feature_starts != source.feature_starts or
+        split.sample_rows != source.sample_rows or any(
+            getattr(split, name) is not getattr(source, name)
+            for name in shared
+        )
+        for split in splits
+    ):
+        raise ValueError("tail views require one common indexed preparation")
+    if seq_len == source.seq_len:
+        return data
+    starts = tuple(
+        start + source.seq_len - seq_len for start in source.feature_starts
+    )
+
+    def tail(split: Windows) -> Windows:
+        return Windows(
+            split.features, split.targets, split.references, split.outcomes,
+            seq_len, split.start, split.count, feature_starts=starts,
+            sample_rows=split.sample_rows,
+        )
+
+    return replace(data, **dict(zip(
+        ("train", "validation", "test"), map(tail, splits), strict=True,
+    )))
 
 
 @dataclass(frozen=True)

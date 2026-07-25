@@ -29,7 +29,7 @@ from tools.train import (
     DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
     evaluate, feature_values, fit_epochs, fit_model, fit_training_updates,
     fit_updates, mean_loss, parse_args, prepare_data, prepare_rows,
-    train as train_model, train_epoch,
+    tail_training_data, train as train_model, train_epoch,
 )
 
 
@@ -428,6 +428,45 @@ def verify_indexed_windows(csv: Path) -> None:
             target * data.target_scale + data.target_mean,
             torch.log(outcome / reference),
         )
+    tail = tail_training_data(data, 2)
+    assert tail_training_data(data, 3) is data
+    for name in (
+        "feature_mean", "feature_scale", "target_mean", "target_scale",
+    ):
+        assert getattr(tail, name) is getattr(data, name)
+    for name in ("train", "validation", "test"):
+        source, view = getattr(data, name), getattr(tail, name)
+        assert view.features is source.features
+        assert view.targets is source.targets
+        assert view.references is source.references
+        assert view.outcomes is source.outcomes
+        assert view.sample_rows is source.sample_rows
+        assert (view.start, view.count) == (source.start, source.count)
+        assert view.feature_starts == tuple(
+            start + 1 for start in source.feature_starts
+        )
+        assert len(view) == len(source)
+        for index in range(len(view)):
+            actual = view[index]
+            torch.testing.assert_close(actual[0], source[index][0][-2:])
+            for value, expected in zip(actual[1:], source[index][1:],
+                                       strict=True):
+                assert torch.equal(value, expected)
+    for source, value in (
+        (data, 0), (data, 4), (data, True), (object(), 2),
+    ):
+        try:
+            tail_training_data(source, value)  # type: ignore[arg-type]
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid indexed tail length was accepted")
+    try:
+        tail_training_data(prepare_data(csv, config, 0.5, 0.25), 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-indexed tail data was accepted")
 
     stationary_samples = tuple(
         SampleRows(as_of, as_of + 1, as_of + 2, ordinal)
