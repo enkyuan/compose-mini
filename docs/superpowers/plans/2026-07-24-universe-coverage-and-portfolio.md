@@ -260,6 +260,13 @@ attempt only after its bound scaling outcome has status `pass`:
    exactly that checkpoint count, never evaluate calibration during fitting,
    then predict calibration once.
 
+A PASS-bound calibration schedule may be derived early for attempt hashing,
+but derivation is not execution authorization. The runner must authenticate a
+terminal fold-1 phase outcome that binds all five fits and every expected
+prediction, with no extras, before materializing or consuming calibration
+work. A schedule, checkpoint selection, or detached ledger closure is
+insufficient.
+
 After the scaling finalizer is terminal, add one no-validation primitive beside
 `fit_epochs()` in `tools/train.py`:
 
@@ -378,6 +385,10 @@ class PortfolioOpportunity:
     prediction_mean: float | None
     prediction_pstdev: float | None
 ```
+
+`manifest_rank` is one-based: it equals `1 +` the zero-based master-manifest
+index. The coverage overlay's `master_rank` remains zero-based and must never
+enter a forward or portfolio record unchanged.
 
 Keep authorization and truth access as separate API stages.
 `validate_portfolio_phase()` consumes only the requested phase and action,

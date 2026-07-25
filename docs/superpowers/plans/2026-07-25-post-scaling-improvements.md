@@ -43,8 +43,10 @@ Use the terminal fixed-update core `11/22/33/55` and unseen-transfer
 checkpoints were selected on the phases they predict, so they cannot authorize
 an expanded universe.
 
-If the result passes, arm a separate breadth-forward attempt for every exact
-registered comparison cell. For each candidate and seed:
+If the result passes, arm a distinct breadth-forward contract and attempt for
+every exact registered comparison cell. Do not parameterize, widen, or reuse
+the fixed cohort-55 portfolio contract for this family. For each candidate and
+seed:
 
 1. use only its fold-0-selected checkpoint to reinitialize and fit the fold-1
    training range for the exact target-phase update budget;
@@ -357,7 +359,9 @@ before testing materially larger principal.
 
 ## Implementation order
 
-1. Finish the existing exact-update forward-refit and portfolio plan.
+1. Complete the exact-update forward refits and predictions; implement, test,
+   and freeze the existing 13-trial portfolio family and attempt, but do not
+   execute the portfolio runner or read its outcome.
 2. Add the breadth-forward attempt; reuse prior-phase checkpoint selection and
    the existing prediction-ledger validators for every registered comparison
    cell.
@@ -365,8 +369,10 @@ before testing materially larger principal.
    source hashes, inputs, and absent destinations.
 4. Add one-shot context execution and a terminal finalizer; reuse existing
    training, metric, prediction-ledger, and complete-day bootstrap primitives.
-5. Add and arm a small pure conformal module before the original portfolio
-   outcome is read; keep score fitting separate from later-bound application.
+5. Add and arm a small pure conformal module while the original portfolio
+   outcome remains absent; keep score fitting separate from later-bound
+   application. Only after this arm is frozen may the original portfolio
+   runner execute and its terminal outcome be read.
 6. Add family-wise analysis and cost replay after candidate ledgers are frozen.
 7. Add one architecture candidate only when its prerequisite above passes.
 
