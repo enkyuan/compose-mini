@@ -21,7 +21,7 @@ from tools import context_diagnostic_contract as contract
 from tools.context_diagnostic_contract import (
     BATCH_SIZE, PHASE_RANGES, SEEDS, ContextPhase,
 )
-from tools.files import file_sha256, freeze_inputs, verify_frozen
+from tools.files import FrozenInput, file_sha256, freeze_inputs, verify_frozen
 from tools.panel_contract import (
     ExecutableBinding, FileBinding, SourceTree, TorchIdentity,
     _tree_digest, read_canonical_json, selected_source_tree,
@@ -221,6 +221,14 @@ class ArmFixture:
             self.primary, self.torch,
         )
 
+    def derive_phases(
+        self, _attempt: object, _master: object, _csv: object, _data: object,
+        config: object,
+    ) -> tuple[ContextPhase, ...]:
+        assert isinstance(config, FrozenInput)
+        assert config.source == self.context_config_path
+        return self.phases
+
     @contextmanager
     def patched(self) -> Iterator[None]:
         with ExitStack() as stack:
@@ -237,7 +245,7 @@ class ArmFixture:
                 ),
                 _master_from_snapshot=lambda _path: MASTER,
                 _validate_summary=lambda _snapshot, _outputs: None,
-                _derive_phases=lambda *_args: self.phases,
+                _derive_phases=self.derive_phases,
                 _require_isolated_execution=lambda: None,
                 _validate_commit=lambda _commit, _tree: None,
                 source_tree=lambda _path: self.torch_identity.package_tree,

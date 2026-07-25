@@ -392,6 +392,7 @@ def _phase(
 def _derive_phases(
     attempt: ScalingAttempt, master: tuple[str, ...],
     csv: Sequence[FileBinding], data: Mapping[Path, FrozenInput],
+    config: FrozenInput,
 ) -> tuple[ContextPhase, ...]:
     closure = validate_fit_ledger(
         read_canonical_json_lines(
@@ -409,7 +410,7 @@ def _derive_phases(
         _frozen(data, ROOT / attempt.session_calendar.path).snapshot,
     )
     sweep = validate_context_sweep(read_canonical_json(
-        _frozen(data, ROOT / CONTEXT_CONFIG.path).snapshot,
+        config.snapshot,
     ))
     cutoff = context_cutoff_timestamp(
         calendar, manifest.start, manifest.end, manifest.interval_minutes,
@@ -547,7 +548,10 @@ def _bound_context(
                     _frozen(data, ROOT / outputs["summary"].path),
                     outputs,
                 )
-                phases = _derive_phases(scaling, master, csv, data)
+                phases = _derive_phases(
+                    scaling, master, csv, data,
+                    _frozen(source, ROOT / CONTEXT_CONFIG.path),
+                )
 
                 launcher = Path(os.path.abspath(torch_python))
                 runtimes = (
