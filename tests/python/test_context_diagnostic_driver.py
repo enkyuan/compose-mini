@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Verify the one-shot context phase and receipt boundary."""
 
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 import hashlib
+import json
 import os
 import tempfile
 import sys
@@ -12,14 +15,17 @@ sys.path.insert(0, str(ROOT))
 
 from tools.context_diagnostic_contract import (
     BATCH_SIZE, CONTROL_COHORT, EXPECTED_FITS_PER_PHASE,
-    EXPECTED_PREDICTIONS_PER_PHASE, PHASE_RANGES, SEEDS, ContextPhase,
+    EXPECTED_PREDICTIONS_PER_PHASE, HISTORY_LENGTHS, PHASE_RANGES, SEEDS,
+    ContextPhase, context_phase_sha256,
 )
+from tools.finalize_context_diagnostic import finalize_context_history
 from tools.files import write_json
 import tools.run_context_diagnostic as runner
 from tools.run_context_diagnostic import (
     RunClaim, claim_run, execute_phase, phase_artifacts,
     read_authorized_truth,
 )
+from tools.universe_scaling import BOOTSTRAP_BLOCK_DAYS
 from tools.universe_scaling_contract import FitJob, fit_provenance_id
 
 MASTER = tuple(f"S{index:02d}" for index in range(55))
@@ -82,6 +88,27 @@ def phase_value(name: str = "fold-1") -> dict[str, object]:
     }
 
 
+def evaluation_for(
+    phase: ContextPhase, lower: float = 0.1,
+) -> dict[str, object]:
+    return {
+        "descriptive_metrics": {},
+        "evidence_role": "development-diagnostic-not-forward-clean",
+        "phase": phase.phase,
+        "phase_sha256": context_phase_sha256(phase),
+        "primary": {
+            str(history): {
+                "intervals": {
+                    str(block): (lower, lower + 0.1)
+                    for block in BOOTSTRAP_BLOCK_DAYS
+                },
+            }
+            for history in HISTORY_LENGTHS[1:]
+        },
+        "schema": 1,
+    }
+
+
 def setup_attempt(parent: str) -> tuple[Path, Path]:
     root = (Path(parent) / "repository").resolve()
     (root / "experiments").mkdir(parents=True)
@@ -104,8 +131,11 @@ def execute_fixture(
     fail_prediction: int | None = None,
     mutate_attempt: str | None = None,
     mutate_run: bool = False,
+    mutate_access: str | None = None,
+    mutate_truth_input: str | None = None,
     truth_failure: bool = False,
-) -> tuple[list[str], object]:
+    evaluation: Mapping[str, object] | None = None,
+) -> tuple[list[str], Mapping[str, object]]:
     events: list[str] = []
     fits = 0
     predictions = 0
@@ -135,14 +165,33 @@ def execute_fixture(
             raise RuntimeError("synthetic prediction failure")
         return [predictions / 100.0] * prediction.prediction_count
 
-    def truth() -> object:
-        assert phase_artifacts(
+    def truth() -> Mapping[str, object]:
+        artifacts = phase_artifacts(
             claim.root, claim.attempt, phase,
-        ).access.exists()
+        )
+        access = artifacts.access
+        assert access.exists()
         events.append("truth")
+        if mutate_access in ("delete", "replace"):
+            access.unlink()
+            if mutate_access == "replace":
+                write_json(access, {"schema": 2})
+        if mutate_access == "in-place":
+            access.write_text('{"schema":2}\n', encoding="utf-8")
+        if mutate_truth_input == "run":
+            claim.path.rename(claim.path.with_name("truth-original-run"))
+            claim.path.mkdir()
+        elif mutate_truth_input:
+            path = (
+                claim.attempt if mutate_truth_input == "attempt"
+                else getattr(artifacts, mutate_truth_input)
+            )
+            path.write_text('{"schema":2}\n', encoding="utf-8")
         if truth_failure:
             raise RuntimeError("synthetic truth failure")
-        return {"authorized": True}
+        return (
+            {"authorized": True} if evaluation is None else evaluation
+        )
 
     result = execute_phase(
         claim, MASTER, phase, digest("source-failure"),
@@ -222,6 +271,8 @@ def test_claim_and_phase_barrier() -> None:
         ]
         assert events[-1] == "truth"
         assert all(path.exists() for path in artifacts)
+        assert artifacts.evaluation.read_text(encoding="utf-8") == \
+            '{\n  "authorized": true\n}\n'
 
         work = 0
 
@@ -247,7 +298,7 @@ def test_claim_and_phase_barrier() -> None:
 
         raises(
             read_authorized_truth,
-            claim.root, MASTER, phase, claim.attempt,
+            claim, MASTER, phase,
             digest("source-failure"), digest("config"),
             digest("source-tree"), truth,
         )
@@ -299,6 +350,40 @@ def test_failed_phase_is_not_retryable() -> None:
             assert work == 0
 
 
+def test_calibration_requires_completed_fold() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-calibration-first-", dir=ROOT,
+    ) as parent:
+        claim, _fold = setup_run(parent)
+        calibration = ContextPhase.parse(
+            phase_value("calibration"), MASTER,
+        )
+        raises(execute_fixture, claim, calibration)
+        assert not claim.started and not claim.completed
+        assert not any(path.exists() for path in phase_artifacts(
+            claim.root, claim.attempt, calibration,
+        ))
+
+    with tempfile.TemporaryDirectory(
+        prefix="context-calibration-failed-fold-", dir=ROOT,
+    ) as parent:
+        claim, fold = setup_run(parent)
+        try:
+            execute_fixture(claim, fold, fail_fit=1)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("synthetic fold failure was ignored")
+        calibration = ContextPhase.parse(
+            phase_value("calibration"), MASTER,
+        )
+        raises(execute_fixture, claim, calibration)
+        assert claim.started == {"fold-1"} and not claim.completed
+        assert not any(path.exists() for path in phase_artifacts(
+            claim.root, claim.attempt, calibration,
+        ))
+
+
 def test_attempt_mutation_blocks_publication() -> None:
     for mode in ("in-place", "replace"):
         with tempfile.TemporaryDirectory(
@@ -340,7 +425,8 @@ def test_truth_failure_is_terminal() -> None:
         else:
             raise AssertionError("synthetic truth failure was ignored")
         artifacts = phase_artifacts(claim.root, claim.attempt, phase)
-        assert all(path.exists() for path in artifacts)
+        assert all(path.exists() for path in tuple(artifacts)[:-1])
+        assert not artifacts.evaluation.exists()
 
         calls = 0
 
@@ -351,11 +437,157 @@ def test_truth_failure_is_terminal() -> None:
 
         raises(
             read_authorized_truth,
-            claim.root, MASTER, phase, claim.attempt,
+            claim, MASTER, phase,
             digest("source-failure"), digest("config"),
             digest("source-tree"), truth,
         )
         assert calls == 0
+
+
+def test_truth_access_mutation_is_terminal() -> None:
+    for mode in ("delete", "in-place", "replace"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-access-{mode}-", dir=ROOT,
+        ) as parent:
+            claim, phase = setup_run(parent)
+            raises(
+                execute_fixture, claim, phase, mutate_access=mode,
+            )
+            artifacts = phase_artifacts(
+                claim.root, claim.attempt, phase,
+            )
+            assert artifacts.access.exists()
+            assert not artifacts.evaluation.exists()
+
+            calls = 0
+
+            def truth() -> object:
+                nonlocal calls
+                calls += 1
+                return {"authorized": True}
+
+            raises(
+                read_authorized_truth,
+                claim, MASTER, phase,
+                digest("source-failure"), digest("config"),
+                digest("source-tree"), truth,
+            )
+            assert calls == 0
+
+
+def test_truth_boundary_revalidates_every_input() -> None:
+    for name in ("attempt", "fits", "predictions", "receipt", "run"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-truth-{name}-", dir=ROOT,
+        ) as parent:
+            claim, phase = setup_run(parent)
+            raises(
+                execute_fixture, claim, phase,
+                mutate_truth_input=name,
+            )
+            run = (
+                claim.path.with_name("truth-original-run")
+                if name == "run" else claim.path
+            )
+            artifacts = phase_artifacts(
+                claim.root, claim.attempt, phase,
+            )
+            assert (run / artifacts.access.name).exists()
+            assert not (run / artifacts.evaluation.name).exists()
+            assert not claim.completed
+
+
+def completed_run(
+    parent: str,
+) -> tuple[RunClaim, tuple[ContextPhase, ContextPhase]]:
+    claim, fold = setup_run(parent)
+    calibration = ContextPhase.parse(
+        phase_value("calibration"), MASTER,
+    )
+    phases = (fold, calibration)
+    for phase in phases:
+        execute_fixture(
+            claim, phase, evaluation=evaluation_for(phase),
+        )
+    return claim, phases
+
+
+def test_terminal_outcome_binds_phase_evaluations() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-outcome-", dir=ROOT,
+    ) as parent:
+        claim, phases = completed_run(parent)
+        assert tuple(claim.completed) == ("fold-1", "calibration")
+        output = finalize_context_history(claim, MASTER, phases)
+        assert output["decision"] == {
+            "qualifies": {"34": True, "68": True},
+            "selected_history": 34,
+        }
+        outcome = claim.path / "outcome.json"
+        assert json.loads(outcome.read_text(encoding="utf-8")) == output
+        raises(finalize_context_history, claim, MASTER, phases)
+
+    for mode in ("in-place", "replace"):
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-evaluation-{mode}-", dir=ROOT,
+        ) as parent:
+            claim, phases = completed_run(parent)
+            evaluation = phase_artifacts(
+                claim.root, claim.attempt, phases[0],
+            ).evaluation
+            forged = evaluation_for(phases[0], lower=-0.2)
+            if mode == "in-place":
+                evaluation.write_text(
+                    json.dumps(forged, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            else:
+                evaluation.unlink()
+                write_json(evaluation, forged)
+            raises(finalize_context_history, claim, MASTER, phases)
+            assert not (claim.path / "outcome.json").exists()
+
+
+def test_terminal_outcome_rejects_mixed_provenance() -> None:
+    fields = (
+        "source_failure_sha256", "config_sha256", "source_tree_sha256",
+    )
+    for field in fields:
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-provenance-{field}-", dir=ROOT,
+        ) as parent:
+            claim, phases = completed_run(parent)
+            evidence = claim.completed["calibration"]
+            claim.completed["calibration"] = replace(
+                evidence, **{field: digest(f"changed-{field}")},
+            )
+            raises(finalize_context_history, claim, MASTER, phases)
+            assert not (claim.path / "outcome.json").exists()
+
+
+def test_terminal_outcome_publication_is_atomic() -> None:
+    for failure, present in ((1, False), (2, True)):
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-outcome-fsync-{failure}-", dir=ROOT,
+        ) as parent:
+            claim, phases = completed_run(parent)
+            original = runner.os.fsync
+            calls = 0
+
+            def fsync(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == failure:
+                    raise OSError("synthetic outcome fsync failure")
+                original(descriptor)
+
+            runner.os.fsync = fsync
+            try:
+                raises(finalize_context_history, claim, MASTER, phases)
+            finally:
+                runner.os.fsync = original
+            assert (claim.path / "outcome.json").exists() is present
+            assert not tuple(claim.path.glob(".*.tmp"))
 
 
 def inject_fsync_failure(
@@ -379,11 +611,13 @@ def inject_fsync_failure(
 
 
 def test_publication_failures_preserve_evidence_and_clean_temps() -> None:
-    names = ("fits", "predictions", "receipt", "access")
+    names = ("fits", "predictions", "receipt", "access", "evaluation")
     expected = (
         (), ("fits",), ("fits",), ("fits", "predictions"),
         ("fits", "predictions"), ("fits", "predictions", "receipt"),
-        ("fits", "predictions", "receipt"), names,
+        ("fits", "predictions", "receipt"),
+        ("fits", "predictions", "receipt", "access"),
+        ("fits", "predictions", "receipt", "access"), names,
     )
     for failure, present in enumerate(expected, 1):
         with tempfile.TemporaryDirectory(
@@ -407,14 +641,16 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
         claim, phase = setup_run(parent)
         inject_fsync_failure(claim, phase, 7)
         artifacts = phase_artifacts(claim.root, claim.attempt, phase)
-        assert artifacts.receipt.exists() and not artifacts.access.exists()
+        assert artifacts.receipt.exists() and \
+            not artifacts.access.exists() and \
+            not artifacts.evaluation.exists()
 
         original = claim.path.with_name("original-run")
         replacement = claim.path.with_name("replacement-run")
         claim.path.rename(original)
         claim.path.mkdir()
         for path in artifacts:
-            if path != artifacts.access:
+            if path not in (artifacts.access, artifacts.evaluation):
                 path.hardlink_to(original / path.name)
 
         calls = 0
@@ -426,7 +662,7 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
 
         raises(
             read_authorized_truth,
-            claim.root, MASTER, phase, claim.attempt,
+            claim, MASTER, phase,
             digest("source-failure"), digest("config"),
             digest("source-tree"), truth,
         )
@@ -435,11 +671,12 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
         original.rename(claim.path)
 
         assert read_authorized_truth(
-            claim.root, MASTER, phase, claim.attempt,
+            claim, MASTER, phase,
             digest("source-failure"), digest("config"),
             digest("source-tree"), truth,
         ) == {"authorized": True}
-        assert calls == 1 and artifacts.access.exists()
+        assert calls == 1 and artifacts.access.exists() and \
+            artifacts.evaluation.exists()
 
 
 def main() -> None:
@@ -447,9 +684,15 @@ def main() -> None:
     test_claim_sync_failure_burns_run()
     test_claim_and_phase_barrier()
     test_failed_phase_is_not_retryable()
+    test_calibration_requires_completed_fold()
     test_attempt_mutation_blocks_publication()
     test_run_substitution_blocks_publication()
     test_truth_failure_is_terminal()
+    test_truth_access_mutation_is_terminal()
+    test_truth_boundary_revalidates_every_input()
+    test_terminal_outcome_binds_phase_evaluations()
+    test_terminal_outcome_rejects_mixed_provenance()
+    test_terminal_outcome_publication_is_atomic()
     test_publication_failures_preserve_evidence_and_clean_temps()
     test_pre_access_failure_allows_one_validated_recovery()
     print("context diagnostic driver tests passed")

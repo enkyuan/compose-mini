@@ -11,7 +11,8 @@ import json
 import os
 
 from tools.context_diagnostic_contract import (
-    ContextFit, ContextPhase, ContextPrediction, ContextReceipt,
+    TARGET_PHASES, ContextFit, ContextPhase, ContextPrediction,
+    ContextReceipt,
     context_family_sha256, context_fit_record, context_prediction_record,
     context_phase_sha256, context_provenance_id,
     expected_context_fits, expected_context_predictions,
@@ -23,27 +24,44 @@ from tools.files import (
 )
 from tools.panel_contract import (
     FileBinding, _absent, _directory_identity, _open_directory,
-    _regular_identity, _regular_inputs, _sha256, _verify_identities,
-    mkdir_nofollow, read_canonical_json, read_canonical_json_lines,
+    _exact_json, _regular_identity, _regular_inputs, _sha256,
+    _verify_identities, mkdir_nofollow, read_canonical_json,
+    read_canonical_json_lines,
 )
 
 FitOne = Callable[[ContextFit], tuple[str, float, object]]
 PredictOne = Callable[[ContextPrediction, object], Sequence[float]]
-ReadTruth = Callable[[], object]
+ReadTruth = Callable[[], Mapping[str, object]]
 Verify = Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
 class PhaseArtifacts:
-    """Name the ordered evidence and one-shot label-access marker."""
+    """Name the ordered evidence, label access, and phase evaluation."""
 
     fits: Path
     predictions: Path
     receipt: Path
     access: Path
+    evaluation: Path
 
     def __iter__(self) -> Iterator[Path]:
-        return iter((self.fits, self.predictions, self.receipt, self.access))
+        return iter((
+            self.fits, self.predictions, self.receipt,
+            self.access, self.evaluation,
+        ))
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseEvidence:
+    """Retain the exact phase files until the terminal decision is durable."""
+
+    phase: str
+    bindings: tuple[FileBinding, ...]
+    identities: tuple[tuple[int, int], ...]
+    source_failure_sha256: str
+    config_sha256: str
+    source_tree_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +76,9 @@ class RunClaim:
     directory_identity: tuple[int, int]
     started: set[str] = field(
         default_factory=set, compare=False, repr=False,
+    )
+    completed: dict[str, PhaseEvidence] = field(
+        default_factory=dict, compare=False, repr=False,
     )
 
 
@@ -102,6 +123,7 @@ def phase_artifacts(
         prefix.with_name(f"{prefix.name}-predictions.jsonl"),
         prefix.with_name(f"{prefix.name}-receipt.json"),
         prefix.with_name(f"{prefix.name}-truth-access.json"),
+        prefix.with_name(f"{prefix.name}-evaluation.json"),
     )
 
 
@@ -145,6 +167,20 @@ def _artifacts(
     return artifacts
 
 
+def _require_phase_prefix(
+    claim: RunClaim, phase: ContextPhase, *, started: bool,
+) -> None:
+    try:
+        index = TARGET_PHASES.index(phase.phase)
+    except ValueError as error:
+        raise ValueError("context phase order changed") from error
+    completed = TARGET_PHASES[:index]
+    begun = TARGET_PHASES[:index + int(started)]
+    if tuple(claim.completed) != completed or \
+       claim.started != set(begun):
+        raise ValueError("context phase order changed")
+
+
 def _start(claim: RunClaim, phase: ContextPhase) -> PhaseArtifacts:
     if not isinstance(claim, RunClaim) or \
        not isinstance(phase, ContextPhase) or \
@@ -152,8 +188,7 @@ def _start(claim: RunClaim, phase: ContextPhase) -> PhaseArtifacts:
        _directory_identity(claim.path) != claim.directory_identity:
         raise ValueError("context run claim is invalid")
     _verify_identities(((claim.attempt, claim.attempt_identity),))
-    if phase.phase in claim.started:
-        raise ValueError("context phase was already attempted")
+    _require_phase_prefix(claim, phase, started=False)
     claim.started.add(phase.phase)
     artifacts = _artifacts(claim.root, claim.attempt, phase)
     for path in artifacts:
@@ -244,7 +279,7 @@ def _binding(root: Path, frozen: FrozenInput) -> FileBinding:
     )
 
 
-def _validate_ledgers(
+def validate_context_ledgers(
     master: Sequence[str], phase: ContextPhase,
     fit_path: Path, prediction_path: Path,
     source_failure_sha256: str, config_sha256: str,
@@ -260,15 +295,34 @@ def _validate_ledgers(
     )
 
 
+def context_access_value(
+    attempt: FileBinding, receipt: FileBinding, phase: ContextPhase,
+) -> dict[str, object]:
+    return {
+        "attempt": {"path": attempt.path, "sha256": attempt.sha256},
+        "phase": phase.phase,
+        "receipt": {"path": receipt.path, "sha256": receipt.sha256},
+        "schema": 1,
+    }
+
+
 def read_authorized_truth(
-    root: Path, master: Sequence[str], phase: ContextPhase,
-    attempt: Path,
+    claim: RunClaim, master: Sequence[str], phase: ContextPhase,
     source_failure_sha256: str, config_sha256: str,
     source_tree_sha256: str, reader: ReadTruth,
-) -> object:
-    """Revalidate a receipt and durably consume its one truth access."""
+) -> Mapping[str, object]:
+    """Consume one truth access and durably publish its phase evaluation."""
+    if not isinstance(claim, RunClaim) or \
+       not isinstance(phase, ContextPhase) or \
+       claim.path != _run_path(claim.root, claim.attempt) or \
+       _directory_identity(claim.path) != claim.directory_identity or \
+       phase.phase in claim.completed:
+        raise ValueError("context run claim is invalid")
+    _require_phase_prefix(claim, phase, started=True)
+    root, attempt = claim.root, claim.attempt
     artifacts = _artifacts(root, attempt, phase)
     _absent(artifacts.access, "context truth access")
+    _absent(artifacts.evaluation, "context phase evaluation")
     hashes = tuple(map(
         _sha256,
         (source_failure_sha256, config_sha256, source_tree_sha256),
@@ -289,12 +343,15 @@ def read_authorized_truth(
         receipt_binding = _binding(
             root, _frozen(by_path, artifacts.receipt),
         )
+        access_value = context_access_value(
+            attempt_binding, receipt_binding, phase,
+        )
         run_identity = _directory_identity(artifacts.receipt.parent)
         receipt.validate(
             phase, attempt_binding, fit_binding, prediction_binding,
             hashes[2], run_identity,
         )
-        _validate_ledgers(
+        validate_context_ledgers(
             master, phase,
             _frozen(by_path, artifacts.fits).snapshot,
             _frozen(by_path, artifacts.predictions).snapshot,
@@ -308,20 +365,114 @@ def read_authorized_truth(
             verify_frozen(frozen)
 
         verify()
-        _write_json(artifacts.access, {
-            "attempt": {
-                "path": attempt_binding.path,
-                "sha256": attempt_binding.sha256,
-            },
-            "phase": phase.phase,
-            "receipt": {
-                "path": receipt_binding.path,
-                "sha256": receipt_binding.sha256,
-            },
-            "schema": 1,
-        }, verify, run_identity)
-        verify()
-    return reader()
+        _write_json(
+            artifacts.access, access_value, verify, run_identity,
+        )
+
+        def verify_run() -> None:
+            if _directory_identity(artifacts.access.parent) != run_identity:
+                raise ValueError("context run directory changed")
+
+        def restore_access() -> None:
+            # A callback cannot make consumed truth retryable by unlinking it.
+            try:
+                _absent(artifacts.access, "context truth access")
+            except ValueError:
+                return
+            _write_json(
+                artifacts.access, access_value, verify_run, run_identity,
+            )
+
+        try:
+            access_identities = _regular_inputs((artifacts.access,))
+            with freeze_inputs((artifacts.access,)) as access_frozen:
+                if not _exact_json(
+                    read_canonical_json(access_frozen[0].snapshot),
+                    access_value,
+                ):
+                    raise ValueError("context truth access changed")
+
+                def verify_access() -> None:
+                    verify()
+                    _verify_identities(access_identities)
+                    verify_frozen(access_frozen)
+
+                verify_access()
+                evaluation = reader()
+                if not isinstance(evaluation, Mapping):
+                    raise ValueError(
+                        "context phase evaluation must be an object",
+                    )
+                try:
+                    expected_evaluation = json.loads(json.dumps(
+                        evaluation, allow_nan=False,
+                    ))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "context phase evaluation is not JSON",
+                    ) from error
+                verify_access()
+                _write_json(
+                    artifacts.evaluation, evaluation,
+                    verify_access, run_identity,
+                )
+                evaluation_identities = _regular_inputs((
+                    artifacts.evaluation,
+                ))
+                with freeze_inputs((
+                    artifacts.evaluation,
+                )) as evaluation_frozen:
+                    published = read_canonical_json(
+                        evaluation_frozen[0].snapshot,
+                    )
+                    if not _exact_json(published, expected_evaluation):
+                        raise ValueError(
+                            "context phase evaluation changed",
+                        )
+
+                    def verify_evaluation() -> None:
+                        verify_access()
+                        _verify_identities(evaluation_identities)
+                        verify_frozen(evaluation_frozen)
+
+                    verify_evaluation()
+                    identity_by_path = dict((
+                        *identities, *access_identities,
+                        *evaluation_identities,
+                    ))
+                    bindings = (
+                        fit_binding, prediction_binding, receipt_binding,
+                        _binding(root, access_frozen[0]),
+                        _binding(root, evaluation_frozen[0]),
+                    )
+                    # Keep post-truth evidence live until outcome publication.
+                    claim.completed[phase.phase] = PhaseEvidence(
+                        phase.phase, bindings,
+                        tuple(
+                            identity_by_path[path] for path in artifacts
+                        ),
+                        *hashes,
+                    )
+                    evaluation = published
+        except BaseException:
+            restore_access()
+            raise
+    return evaluation
+
+
+def publish_context_outcome(
+    claim: RunClaim, value: Mapping[str, object], verify: Verify,
+) -> Path:
+    """Atomically close one live run while its phase evidence is frozen."""
+    if not isinstance(claim, RunClaim) or not isinstance(value, Mapping) or \
+       claim.path != _run_path(claim.root, claim.attempt) or \
+       _directory_identity(claim.path) != claim.directory_identity:
+        raise ValueError("context outcome claim is invalid")
+    outcome = claim.path / "outcome.json"
+    _absent(outcome, "context outcome")
+    _write_json(outcome, value, verify, claim.directory_identity)
+    verify()
+    return outcome
 
 
 def execute_phase(
@@ -329,7 +480,7 @@ def execute_phase(
     source_failure_sha256: str, config_sha256: str,
     source_tree_sha256: str, fit_one: FitOne,
     predict_one: PredictOne, truth: ReadTruth,
-) -> object:
+) -> Mapping[str, object]:
     """Fit, predict, publish, and only then authorize one phase's truth."""
     artifacts = _start(claim, phase)
     root, attempt = claim.root, claim.attempt
@@ -390,7 +541,7 @@ def execute_phase(
             prediction_binding = _binding(
                 root, _frozen(by_path, artifacts.predictions),
             )
-            _validate_ledgers(
+            validate_context_ledgers(
                 master, phase,
                 _frozen(by_path, artifacts.fits).snapshot,
                 _frozen(by_path, artifacts.predictions).snapshot,
@@ -415,5 +566,5 @@ def execute_phase(
             )
             verify()
     return read_authorized_truth(
-        root, master, phase, attempt, source, config, source_tree, truth,
+        claim, master, phase, source, config, source_tree, truth,
     )
