@@ -17,6 +17,7 @@ from tools.data_v1 import (
     read_bars_through,
     read_csv,
     read_timestamps,
+    read_timestamps_through,
 )
 from tools.float32 import f32
 
@@ -51,27 +52,32 @@ def main() -> None:
         through_last = read_bars_through(path, timestamps[-1])
         assert through_last[0] == timestamps
         assert list(through_last[1]) == list(values)
-        for missing in (
-            "2026-07-21T09:00:00Z",
-            "2026-07-21T10:30:00Z",
-            "2026-07-21T12:00:00Z",
-        ):
+        for reader in (read_bars_through, read_timestamps_through):
+            for missing in (
+                "2026-07-21T09:00:00Z",
+                "2026-07-21T10:30:00Z",
+                "2026-07-21T12:00:00Z",
+            ):
+                try:
+                    reader(path, missing)
+                except ValueError:
+                    continue
+                raise AssertionError(
+                    f"missing cutoff {missing!r} was accepted"
+                )
             try:
-                read_bars_through(path, missing)
+                reader(path, "invalid")
             except ValueError:
-                continue
-            raise AssertionError(f"missing cutoff {missing!r} was accepted")
-        try:
-            read_bars_through(path, "invalid")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("noncanonical cutoff was accepted")
+                pass
+            else:
+                raise AssertionError("noncanonical cutoff was accepted")
         with patch(
             "tools.data_v1._number",
             side_effect=AssertionError("numeric parser was called"),
         ):
             assert read_timestamps(path) == timestamps
+            assert read_timestamps_through(path, timestamps[0]) == \
+                timestamps[:1]
         prefix = f"{CSV_HEADER}\n{VALID_ROWS[0]}\n{timestamps[1]},".encode(
             "ascii"
         )
@@ -82,12 +88,17 @@ def main() -> None:
             )
             assert bounded_timestamps == timestamps[:1]
             assert list(bounded_values) == list(values[:FEATURE_COUNT])
+            assert read_timestamps_through(path, timestamps[0]) == \
+                timestamps[:1]
             for stop in (timestamps[1], "2026-07-21T12:00:00Z"):
-                try:
-                    read_bars_through(path, stop)
-                except ValueError:
-                    continue
-                raise AssertionError(f"malformed row passed cutoff {stop!r}")
+                for reader in (read_bars_through, read_timestamps_through):
+                    try:
+                        reader(path, stop)
+                    except ValueError:
+                        continue
+                    raise AssertionError(
+                        f"malformed row passed cutoff {stop!r}"
+                    )
         for row in invalid:
             path.write_bytes((CSV_HEADER + "\n" + row).encode("ascii"))
             try:

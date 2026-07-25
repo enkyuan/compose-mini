@@ -172,3 +172,8 @@ def read_bars_through(path: Path, stop: str) -> tuple[tuple[str, ...], array]:
 def read_timestamps(path: Path) -> tuple[str, ...]:
     """Return validated ordered timestamps without parsing OHLCV values."""
     return tuple(timestamp for _, timestamp, _ in _fields(path))
+
+
+def read_timestamps_through(path: Path, stop: str) -> tuple[str, ...]:
+    """Return timestamps through stop without parsing OHLCV values."""
+    return tuple(timestamp for _, timestamp, _ in _fields(path, stop))
