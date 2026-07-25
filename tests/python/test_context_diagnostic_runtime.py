@@ -7,6 +7,7 @@ from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 from unittest.mock import patch
 import hashlib
@@ -22,20 +23,44 @@ except ModuleNotFoundError as error:
     raise SystemExit("context runtime tests require PyTorch") from error
 
 from tools.context_diagnostic_contract import (
-    BATCH_SIZE, CONTROL_COHORT, PHASE_RANGES, SEEDS, ContextFit,
-    ContextPhase, ContextPrediction, expected_context_fits,
+    BATCH_SIZE, CONTROL_COHORT, MAX_HISTORY, PHASE_RANGES, SEEDS,
+    ContextAttempt, ContextFit, ContextPhase, ContextPrediction,
+    ContextPredictionEvidence, ContextScalerInput,
+    context_scaler_inputs_sha256, expected_context_fits,
     expected_context_predictions,
 )
+from tools.arm_context_diagnostic import ContextLease, ContextSnapshots
+from tools.context_diagnostic_controller import (
+    _phase_rows as derive_phase_rows, prepare_context_phase,
+)
+from tools.context_diagnostic_inputs import (
+    context_grid_sha256, timestamp_rows,
+)
+from tools.files import FrozenInput
 from tools.context_diagnostic_runtime import ContextRuntime
 from tools.session_samples import SampleRows
 from tools.train import (
     TrainingData, Windows, feature_lookback, tail_training_data,
 )
+from tools.universe_contract import PackedRows
 from tools.universe_forward_runner import ForwardFeatureWindows
-from tools.universe_scaling_contract import FitJob, fit_provenance_id
+from tools.universe_scaling_contract import (
+    FitJob, fit_provenance_id, timestamp_grid_sha256,
+)
 
 MASTER = tuple(f"S{index:02d}" for index in range(55))
 RUNTIME = hashlib.sha256(b"runtime").hexdigest()
+CONTROLLER_TIMESTAMPS = tuple(
+    f"2026-01-05T14:{30 + index:02d}:00Z" for index in range(8)
+)
+CONTROLLER_TRAIN = (
+    SampleRows(0, 1, 2, 0),
+    SampleRows(1, 2, 3, 1),
+)
+CONTROLLER_EVALUATION = (
+    SampleRows(4, 5, 6, 2),
+    SampleRows(5, 6, 7, 3),
+)
 
 
 def digest(value: str) -> str:
@@ -91,6 +116,79 @@ def phase_for(master: tuple[str, ...] = MASTER) -> ContextPhase:
             BATCH_SIZE - 1
         ) // BATCH_SIZE,
     }, master)
+
+
+def controller_fixture() -> tuple[
+    ContextAttempt, ContextPhase, ContextLease,
+    dict[str, PackedRows],
+]:
+    training_grid = timestamp_rows(
+        CONTROLLER_TIMESTAMPS, CONTROLLER_TRAIN,
+    )
+    evaluation_grid = timestamp_rows(
+        CONTROLLER_TIMESTAMPS, CONTROLLER_EVALUATION,
+    )
+    packed = {
+        series: PackedRows(
+            CONTROLLER_TRAIN + (
+                CONTROLLER_EVALUATION if series in MASTER[44:] else ()
+            ),
+            (2, 2) if series in MASTER[44:] else (2, 0),
+        )
+        for series in MASTER
+    }
+    csv = tuple(
+        (
+            series,
+            FrozenInput(
+                Path(f"{series}.csv"), Path(f"{series}.snapshot"),
+                digest(f"{series}-csv"),
+            ),
+        )
+        for series in MASTER
+    )
+    phase = replace(
+        phase_for(),
+        evaluation_rows=tuple(
+            (
+                series, len(CONTROLLER_EVALUATION),
+                timestamp_grid_sha256(evaluation_grid),
+            )
+            for series in MASTER[44:]
+        ),
+        training_grid_sha256=context_grid_sha256(
+            "training", MASTER[:44],
+            {series: training_grid for series in MASTER[:44]},
+        ),
+        evaluation_grid_sha256=context_grid_sha256(
+            "evaluation", MASTER[44:],
+            {series: evaluation_grid for series in MASTER[44:]},
+        ),
+        scaler_inputs_sha256=context_scaler_inputs_sha256(
+            MASTER, tuple(
+                ContextScalerInput(
+                    series, frozen.sha256, len(CONTROLLER_TRAIN),
+                    timestamp_grid_sha256(training_grid),
+                )
+                for series, frozen in csv
+            ),
+        ),
+    )
+    snapshots = ContextSnapshots(
+        FrozenInput(Path("config"), Path("config.snapshot"), digest("config")),
+        FrozenInput(
+            Path("manifest"), Path("manifest.snapshot"), digest("manifest"),
+        ),
+        FrozenInput(
+            Path("calendar"), Path("calendar.snapshot"), digest("calendar"),
+        ),
+        csv,
+    )
+    attempt = ContextAttempt(
+        "experiments/context-attempt.json", "context", "reports/context",
+        "0" * 40, (), None, (phase,), None, None, (), None, {},
+    )
+    return attempt, phase, ContextLease(snapshots, lambda: None), packed
 
 
 def training_data(index: int) -> TrainingData:
@@ -519,6 +617,218 @@ def test_fingerprint_binds_context() -> None:
     assert len({baseline, *values}) == len(values) + 1
 
 
+def test_controller_binds_ordered_phase_inputs() -> None:
+    attempt, phase, lease, packed = controller_fixture()
+    seen: list[str] = []
+    snapshots = {
+        frozen.snapshot: series for series, frozen in lease.snapshots.csv
+    }
+
+    def read(path: Path, stop: str) -> tuple[str, ...]:
+        assert stop == CONTROLLER_TIMESTAMPS[-1]
+        seen.append(snapshots[path])
+        return CONTROLLER_TIMESTAMPS
+
+    def pack(*args: object) -> PackedRows:
+        series = MASTER[len(seen) - 1]
+        assert args[0] == CONTROLLER_TIMESTAMPS
+        return packed[series]
+
+    sweep = SimpleNamespace(
+        target_horizon_bars=13, alignment_horizon_bars=13,
+    )
+    manifest = SimpleNamespace(
+        start=object(), end=object(), interval_minutes=30,
+    )
+    with patch(
+        "tools.context_diagnostic_controller.context_cutoff_timestamp",
+        return_value=CONTROLLER_TIMESTAMPS[-1],
+    ), patch(
+        "tools.context_diagnostic_controller.read_timestamps_until",
+        side_effect=read,
+    ), patch(
+        "tools.context_diagnostic_controller.context_phase_rows",
+        side_effect=pack,
+    ):
+        timestamps, actual = derive_phase_rows(
+            attempt, phase, lease, sweep, manifest, object(),
+        )
+
+    assert tuple(timestamps) == tuple(actual) == MASTER
+    assert seen == list(MASTER) and actual == packed
+    with patch(
+        "tools.context_diagnostic_controller.context_cutoff_timestamp",
+        return_value=CONTROLLER_TIMESTAMPS[-1],
+    ), patch(
+        "tools.context_diagnostic_controller.read_timestamps_until",
+        return_value=CONTROLLER_TIMESTAMPS,
+    ), patch(
+        "tools.context_diagnostic_controller.context_phase_rows",
+        side_effect=packed.values(),
+    ):
+        raises(
+            derive_phase_rows, attempt,
+            replace(phase, evaluation_grid_sha256=digest("changed")),
+            lease, sweep, manifest, object(),
+        )
+
+
+def test_controller_defers_truth_and_bounds_market_reads() -> None:
+    attempt, phase, lease, packed = controller_fixture()
+    reads: list[tuple[str, str]] = []
+    prepared: list[PackedRows] = []
+    forwarded: list[tuple[SampleRows, ...]] = []
+    verified: list[None] = []
+    snapshots = {
+        frozen.snapshot: series for series, frozen in lease.snapshots.csv
+    }
+    lease = ContextLease(
+        lease.snapshots, lambda: verified.append(None),
+    )
+    bars = array("f", (
+        value
+        for index in range(len(CONTROLLER_TIMESTAMPS))
+        for value in (
+            100.0 + index, 101.0 + index, 99.0 + index,
+            100.25 + index, 1_000.0 + index,
+        )
+    ))
+    data = SimpleNamespace(
+        feature_mean=torch.zeros(5), feature_scale=torch.ones(5),
+    )
+
+    def read(
+        snapshot: Path, timestamps: tuple[str, ...], stop: str,
+    ) -> array:
+        assert timestamps == CONTROLLER_TIMESTAMPS
+        reads.append((snapshots[snapshot], stop))
+        return bars
+
+    def prepare(
+        rows: array, _candidate: object, samples: PackedRows,
+        history: int, _sweep: object,
+    ) -> object:
+        assert rows is bars and history == MAX_HISTORY
+        assert samples == PackedRows(CONTROLLER_TRAIN, (2, 0))
+        prepared.append(samples)
+        return data
+
+    def forward(
+        rows: array, samples: tuple[SampleRows, ...], history: int,
+        feature_set: str, mean: torch.Tensor, scale: torch.Tensor,
+    ) -> object:
+        assert rows is bars and history == MAX_HISTORY
+        assert feature_set == "ohlcv"
+        assert mean is data.feature_mean and scale is data.feature_scale
+        forwarded.append(samples)
+        return samples
+
+    runtime = SimpleNamespace(
+        fit_one=lambda _fit: None, predict_one=lambda _prediction, _fit: (),
+    )
+    sweep = SimpleNamespace(
+        candidates=(SimpleNamespace(
+            seq_len=MAX_HISTORY, feature_set="ohlcv",
+        ),),
+        target_kind="executable-return-v1",
+    )
+    with patch(
+        "tools.context_diagnostic_controller.read_canonical_json",
+        return_value={},
+    ), patch(
+        "tools.context_diagnostic_controller.validate_context_sweep",
+    ), patch(
+        "tools.context_diagnostic_controller.Sweep.read",
+        return_value=sweep,
+    ), patch(
+        "tools.context_diagnostic_controller.UniverseManifest.read",
+        return_value=object(),
+    ), patch(
+        "tools.context_diagnostic_controller.SessionCalendar.read",
+        return_value=object(),
+    ), patch(
+        "tools.context_diagnostic_controller._phase_rows",
+        return_value=(
+            {series: CONTROLLER_TIMESTAMPS for series in MASTER}, packed,
+        ),
+    ), patch(
+        "tools.context_diagnostic_controller.context_bar_prefix",
+        side_effect=read,
+    ), patch(
+        "tools.context_diagnostic_controller.context_csv_prefix_sha256",
+        side_effect=lambda _path, _stop: digest(
+            f"{reads[-1][0]}-csv",
+        ),
+    ), patch(
+        "tools.context_diagnostic_controller._prepare_packed",
+        side_effect=prepare,
+    ), patch(
+        "tools.context_diagnostic_controller.ForwardFeatureWindows",
+        side_effect=forward,
+    ), patch(
+        "tools.context_diagnostic_controller.ContextRuntime",
+        return_value=runtime,
+    ), patch(
+        "tools.context_diagnostic_controller._runtime_sha256",
+        return_value=RUNTIME,
+    ), patch(
+        "tools.context_diagnostic_controller.torch.use_deterministic_algorithms",
+    ):
+        fit_one, predict_one, truth = prepare_context_phase(
+            attempt, phase, lease,
+        )
+        assert fit_one is runtime.fit_one and predict_one is runtime.predict_one
+        expected_reads = [
+            item
+            for series in MASTER
+            for item in (
+                (
+                    (series, CONTROLLER_TIMESTAMPS[3]),
+                    (series, CONTROLLER_TIMESTAMPS[5]),
+                )
+                if series in MASTER[44:] else
+                ((series, CONTROLLER_TIMESTAMPS[3]),)
+            )
+        ]
+        assert reads == expected_reads, reads
+        assert prepared == [
+            PackedRows(CONTROLLER_TRAIN, (2, 0))
+        ] * len(MASTER)
+        assert forwarded == [
+            CONTROLLER_EVALUATION
+        ] * len(MASTER[44:])
+
+        evidence = tuple(
+            ContextPredictionEvidence(
+                prediction, digest("provenance"), digest("state"), (0.0, 0.0),
+            )
+            for prediction in expected_context_predictions(MASTER, phase)
+        )
+        with patch(
+            "tools.finalize_context_diagnostic.evaluate_context_phase",
+            return_value={"status": "evaluated"},
+        ) as evaluate:
+            result = truth(evidence)
+
+    assert result == {"status": "evaluated"}
+    assert reads[-len(MASTER[44:]):] == [
+        (series, CONTROLLER_TIMESTAMPS[7]) for series in MASTER[44:]
+    ]
+    assert len(verified) == 4
+    master, received_phase, received, values = evaluate.call_args.args
+    assert master == MASTER and received_phase == phase
+    assert received == evidence and tuple(values) == MASTER[44:]
+    for rows in values.values():
+        assert tuple(
+            (row.as_of, row.entry_time, row.target_time)
+            for row in rows
+        ) == timestamp_rows(
+            CONTROLLER_TIMESTAMPS, CONTROLLER_EVALUATION,
+        )
+        assert tuple(row.reference_price for row in rows) == (105.0, 106.0)
+        assert tuple(row.outcome_price for row in rows) == (106.25, 107.25)
+
+
 def main() -> None:
     test_input_closure()
     test_common_views_and_fit_budgets()
@@ -526,6 +836,8 @@ def main() -> None:
     test_post_fit_mutation_is_rejected()
     test_forward_scaler_provenance_is_required()
     test_fingerprint_binds_context()
+    test_controller_binds_ordered_phase_inputs()
+    test_controller_defers_truth_and_bounds_market_reads()
     print("context diagnostic runtime tests passed")
 
 

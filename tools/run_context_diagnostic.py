@@ -3,19 +3,129 @@
 
 from __future__ import annotations
 
+import sys
+
+_BOOTSTRAP_FLAGS = ("-I", "-S", "-B")
+_BOOTSTRAP_CACHE_PREFIX: str | None = None
+
+
+def _require_isolated_execution(*, bootstrapped: bool = False) -> None:
+    flags = sys.flags
+    if not flags.isolated or not getattr(flags, "safe_path", False) or \
+       not flags.no_user_site or not flags.no_site or \
+       not flags.dont_write_bytecode or \
+       not flags.ignore_environment or not sys.dont_write_bytecode:
+        raise ValueError(
+            "context runner requires isolated bytecode-free Python",
+        )
+    if bootstrapped and (
+        _BOOTSTRAP_CACHE_PREFIX is None or
+        sys.pycache_prefix != _BOOTSTRAP_CACHE_PREFIX
+    ):
+        raise ValueError("context runner requires authenticated bootstrap")
+
+
+def _require_exact_launch(*, pristine: bool = False) -> None:
+    if pristine and ("ctypes" in sys.modules or "_ctypes" in sys.modules):
+        raise ValueError("context runner launch inspection is already loaded")
+
+    from ctypes import POINTER, byref, c_int, c_wchar_p, pythonapi
+    import os
+
+    argc = c_int()
+    argv = POINTER(c_wchar_p)()
+    get_argv = pythonapi.Py_GetArgcArgv
+    get_argv.argtypes = (POINTER(c_int), POINTER(POINTER(c_wchar_p)))
+    get_argv.restype = None
+    get_argv(byref(argc), byref(argv))
+    observed = tuple(argv[index] for index in range(argc.value))
+    canonical = lambda values: (os.path.realpath(values[0]), *values[1:])
+    expected = (
+        os.path.realpath(sys.executable), *_BOOTSTRAP_FLAGS, *sys.argv,
+    )
+    if not observed or canonical(observed) != expected or \
+       canonical(tuple(sys.orig_argv)) != expected or \
+       os.path.realpath(sys.argv[0]) != os.path.realpath(__file__):
+        raise ValueError("context runner requires the exact bound launch")
+
+
+def _bootstrap_main() -> None:
+    """Authenticate the import namespace before exposing repository code."""
+    global _BOOTSTRAP_CACHE_PREFIX
+
+    from importlib.machinery import PathFinder
+    import os
+    import stat
+    import tempfile
+
+    while True:
+        prefix = os.path.join(
+            tempfile.gettempdir(),
+            f"compose-mini-context-runner-{os.urandom(32).hex()}",
+        )
+        if not os.path.lexists(prefix):
+            break
+    sys.pycache_prefix = prefix
+    sys.dont_write_bytecode = True
+
+    tools = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(tools)
+    initializer = os.path.join(tools, "__init__.py")
+    if not stat.S_ISDIR(os.lstat(tools).st_mode) or \
+       not stat.S_ISREG(os.lstat(initializer).st_mode):
+        raise ValueError("tools namespace is not a real package")
+    for entry in os.scandir(tools):
+        mode = entry.stat(follow_symlinks=False).st_mode
+        valid = (
+            stat.S_ISDIR(mode) if entry.name == "__pycache__" else
+            entry.name.endswith(".py") and stat.S_ISREG(mode)
+        )
+        if not valid:
+            raise ValueError("tools namespace contains an unsafe entry")
+    if any(
+        name == "tools" or name.startswith("tools.") for name in sys.modules
+    ):
+        raise ValueError("tools namespace is already loaded")
+    spec = PathFinder.find_spec("tools", (*sys.path, root))
+    locations = tuple(
+        os.path.realpath(path)
+        for path in (spec.submodule_search_locations or ())
+    ) if spec is not None else ()
+    if spec is None or os.path.realpath(spec.origin or "") != \
+       os.path.realpath(initializer) or \
+       locations != (os.path.realpath(tools),):
+        raise ValueError("tools namespace resolver is unsafe")
+    sys.path.append(root)
+    import tools as package
+    if os.path.realpath(package.__file__ or "") != \
+       os.path.realpath(initializer) or tuple(
+           map(os.path.realpath, package.__path__)
+       ) != locations:
+        raise ValueError("tools namespace import is unsafe")
+    _BOOTSTRAP_CACHE_PREFIX = prefix
+
+
+if __name__ == "__main__":
+    _require_isolated_execution()
+    _require_exact_launch(pristine=True)
+    _bootstrap_main()
+
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TextIO
+import argparse
+import hashlib
 import json
 import os
-import sys
+import signal
+import stat
 
-from tools.arm_context_diagnostic import authenticate_context_attempt
+from tools.arm_context_diagnostic import ContextLease, authenticate_context_attempt
 from tools.context_diagnostic_contract import (
-    TARGET_PHASES, ContextAttempt, ContextFit, ContextPhase,
-    ContextPrediction,
+    CONTEXT_SOURCE_PATHS, TARGET_PHASES, ContextAttempt, ContextFit, ContextPhase,
+    ContextPrediction, ContextPredictionEvidence,
     ContextReceipt,
     context_family_sha256, context_fit_record, context_prediction_record,
     context_phase_sha256, context_provenance_id,
@@ -30,17 +140,44 @@ from tools.panel_contract import (
     FileBinding, _absent, _directory_identity, _open_directory,
     _exact_json, _regular_identity, _regular_inputs, _sha256,
     _verify_identities, mkdir_nofollow, read_canonical_json,
-    read_canonical_json_lines,
+    read_canonical_json_lines, selected_source_tree, source_tree,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
 
 FitOne = Callable[[ContextFit], tuple[str, float, object]]
 PredictOne = Callable[[ContextPrediction, object], Sequence[float]]
-ReadTruth = Callable[[], Mapping[str, object]]
 Verify = Callable[[], None]
-Prepare = Callable[
-    [ContextAttempt, ContextPhase],
-    tuple[FitOne, PredictOne, ReadTruth],
+ReadTruth = Callable[
+    [Sequence[ContextPredictionEvidence]], Mapping[str, object],
 ]
+
+
+class Interrupted(Exception):
+    """Carry the first process signal to the CLI exit boundary."""
+
+    def __init__(self, number: int) -> None:
+        self.number = number
+
+
+class PublicationCommitted(OSError):
+    """Report an error after an owned output reached its public name."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalOutcome:
+    path: Path
+    identity: tuple[int, int]
+    directory_identity: tuple[int, int]
+    mode: int
+    size: int
+    sha256: str
+
+
+_ACTIVE_ATTEMPT: Path | None = None
+_TERMINAL_OUTCOME: _TerminalOutcome | None = None
+_SIGNAL_NUMBER: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,8 +396,10 @@ def _start(claim: RunClaim, phase: ContextPhase) -> PhaseArtifacts:
 
 def _publish_text(
     path: Path, write: Callable[[TextIO], None], verify: Verify,
-    directory_identity: tuple[int, int],
-) -> None:
+    directory_identity: tuple[int, int], *,
+    accept_committed_error: bool = False,
+    on_committed: Callable[[ExclusiveTemp], None] | None = None,
+) -> ExclusiveTemp:
     """Publish into the claimed directory and clean only an owned temp."""
     directory, identity = _open_directory(path.parent)
     if identity != directory_identity:
@@ -268,6 +407,7 @@ def _publish_text(
         raise ValueError("context output directory changed")
     temporary: ExclusiveTemp | None = None
     completed = False
+    marked = False
 
     def capture(value: ExclusiveTemp) -> None:
         nonlocal temporary
@@ -279,6 +419,37 @@ def _publish_text(
             raise OSError("context output temporary changed")
         verify()
 
+    def committed() -> bool:
+        for retry in range(2):
+            try:
+                return temporary is not None and \
+                    _regular_identity(path) == temporary.identity and \
+                    _directory_identity(path.parent) == directory_identity
+            except Interrupted:
+                if retry:
+                    raise
+            except (OSError, ValueError):
+                return False
+        return False
+
+    def mark_committed() -> None:
+        nonlocal marked
+        if marked or on_committed is None:
+            return
+        for retry in range(2):
+            try:
+                if temporary is None:
+                    raise OSError(
+                        "context output temporary was not created",
+                    )
+                on_committed(temporary)
+                marked = True
+                return
+            except Interrupted:
+                if retry:
+                    raise
+
+    failure: BaseException | None = None
     try:
         exclusive_text(
             path, write, directory,
@@ -286,20 +457,38 @@ def _publish_text(
             on_temp_created=capture,
         )
         os.fsync(directory)
-        if temporary is None or \
-           _regular_identity(path) != temporary.identity or \
-           _directory_identity(path.parent) != directory_identity:
+        if not committed():
             raise OSError("context output changed after publication")
+        mark_committed()
         completed = True
-    finally:
-        try:
-            # Never remove a public output or a foreign replacement.
-            if not completed and temporary is not None and \
-               _owns_entry(directory, temporary, (1,)):
-                os.unlink(temporary.name, dir_fd=directory)
-                os.fsync(directory)
-        finally:
-            os.close(directory)
+    except BaseException as error:
+        failure = error
+    try:
+        # Never remove a public output or a foreign replacement.
+        if not completed and temporary is not None and \
+           _owns_entry(directory, temporary, (1,)):
+            os.unlink(temporary.name, dir_fd=directory)
+            os.fsync(directory)
+    except BaseException as error:
+        failure = error if failure is None else failure
+    try:
+        os.close(directory)
+    except BaseException as error:
+        failure = error if failure is None else failure
+    if failure is None:
+        if temporary is None:
+            raise OSError("context output temporary was not created")
+        return temporary
+    if committed():
+        mark_committed()
+        if accept_committed_error:
+            if temporary is None:
+                raise OSError("context output temporary was not created")
+            return temporary
+        raise PublicationCommitted(
+            "context output committed before publication failed",
+        ) from failure
+    raise failure
 
 
 def _write_ledger(
@@ -316,13 +505,74 @@ def _write_ledger(
 
 def _write_json(
     path: Path, value: Mapping[str, object], verify: Verify,
-    directory_identity: tuple[int, int],
-) -> None:
-    def write(file: TextIO) -> None:
-        json.dump(value, file, allow_nan=False, indent=2, sort_keys=True)
-        file.write("\n")
+    directory_identity: tuple[int, int], *,
+    accept_committed_error: bool = False,
+    on_committed: Callable[[ExclusiveTemp, str, int], None] | None = None,
+) -> tuple[ExclusiveTemp, str, int]:
+    text = json.dumps(
+        value, allow_nan=False, indent=2, sort_keys=True,
+    ) + "\n"
+    payload = text.encode()
+    digest, size = hashlib.sha256(payload).hexdigest(), len(payload)
 
-    _publish_text(path, write, verify, directory_identity)
+    def write(file: TextIO) -> None:
+        file.write(text)
+
+    def commit(binding: ExclusiveTemp) -> None:
+        if on_committed is not None:
+            on_committed(binding, digest, size)
+
+    published = _publish_text(
+        path, write, verify, directory_identity,
+        accept_committed_error=accept_committed_error,
+        on_committed=commit if on_committed is not None else None,
+    )
+    return published, digest, size
+
+
+def _verify_terminal_outcome(value: _TerminalOutcome) -> None:
+    directory, directory_identity = _open_directory(value.path.parent)
+    descriptor = None
+    try:
+        if directory_identity != value.directory_identity:
+            raise ValueError("terminal context directory changed")
+        descriptor = os.open(
+            value.path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+            dir_fd=directory,
+        )
+
+        def state(metadata: os.stat_result) -> tuple[object, ...]:
+            return (
+                (metadata.st_dev, metadata.st_ino),
+                stat.S_IFMT(metadata.st_mode),
+                metadata.st_nlink,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_size,
+            )
+
+        expected = (
+            value.identity, stat.S_IFREG, 1, value.mode, value.size,
+        )
+        if state(os.fstat(descriptor)) != expected:
+            raise ValueError("terminal context outcome changed")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1 << 16):
+            digest.update(chunk)
+        public = os.stat(
+            value.path.name, dir_fd=directory, follow_symlinks=False,
+        )
+        if state(os.fstat(descriptor)) != expected or \
+           state(public) != expected or digest.hexdigest() != value.sha256 or \
+           _directory_identity(value.path.parent) != \
+                value.directory_identity:
+            raise ValueError("terminal context outcome changed")
+    finally:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
 
 
 def _frozen(
@@ -344,13 +594,13 @@ def validate_context_ledgers(
     master: Sequence[str], phase: ContextPhase,
     fit_path: Path, prediction_path: Path,
     source_failure_sha256: str, config_sha256: str,
-) -> None:
+) -> tuple[ContextPredictionEvidence, ...]:
     fits = read_canonical_json_lines(fit_path)
     validate_context_fit_records(
         fits, master, phase,
         source_failure_sha256, config_sha256,
     )
-    validate_context_prediction_records(
+    return validate_context_prediction_records(
         read_canonical_json_lines(prediction_path), master, phase, fits,
         source_failure_sha256, config_sha256,
     )
@@ -412,7 +662,7 @@ def _authorized_truth_evidence(
             phase, attempt_binding, fit_binding, prediction_binding,
             hashes[2], run_identity,
         )
-        validate_context_ledgers(
+        predictions = validate_context_ledgers(
             master, phase,
             _frozen(by_path, artifacts.fits).snapshot,
             _frozen(by_path, artifacts.predictions).snapshot,
@@ -459,7 +709,7 @@ def _authorized_truth_evidence(
                     verify_frozen(access_frozen)
 
                 verify_access()
-                evaluation = reader()
+                evaluation = reader(predictions)
                 if not isinstance(evaluation, Mapping):
                     raise ValueError(
                         "context phase evaluation must be an object",
@@ -540,6 +790,8 @@ def publish_context_outcome(
     claim: RunClaim, value: Mapping[str, object], verify: Verify,
 ) -> Path:
     """Atomically close one live run while its phase evidence is frozen."""
+    global _TERMINAL_OUTCOME
+
     if not _registered(claim) or \
        not isinstance(value, Mapping) or \
        claim.path != _run_path(claim.root, claim.attempt) or \
@@ -547,8 +799,25 @@ def publish_context_outcome(
         raise ValueError("context outcome claim is invalid")
     outcome = claim.path / "outcome.json"
     _absent(outcome, "context outcome")
-    _write_json(outcome, value, verify, claim.directory_identity)
-    verify()
+    active = _ACTIVE_ATTEMPT == Path(os.path.abspath(claim.attempt))
+
+    def committed(
+        binding: ExclusiveTemp, digest: str, size: int,
+    ) -> None:
+        global _TERMINAL_OUTCOME
+
+        _TERMINAL_OUTCOME = _TerminalOutcome(
+            outcome, binding.identity, claim.directory_identity,
+            binding.mode, size, digest,
+        )
+
+    _write_json(
+        outcome, value, verify, claim.directory_identity,
+        accept_committed_error=True,
+        on_committed=committed if active else None,
+    )
+    if active and _TERMINAL_OUTCOME is None:
+        raise OSError("terminal context outcome was not authenticated")
     return outcome
 
 
@@ -729,12 +998,17 @@ def _validate_completed_prefix(
             verify_frozen(frozen)
 
 
-def execute_armed_phase(
-    claim: RunClaim, prepare: Prepare,
-) -> Mapping[str, object]:
-    """Execute the next armed phase without caller-supplied provenance."""
+def _prepare_context_phase(
+    attempt: ContextAttempt, phase: ContextPhase, lease: ContextLease,
+) -> tuple[FitOne, PredictOne, ReadTruth]:
+    from tools.context_diagnostic_controller import prepare_context_phase
+
+    return prepare_context_phase(attempt, phase, lease)
+
+
+def _claimed_attempt(claim: RunClaim) -> ContextAttempt:
+    """Re-read the live attempt through its immutable run claim."""
     if not _registered(claim) or not _claim_mode(claim) or \
-       not callable(prepare) or \
        claim.root != claim.root.resolve(strict=True):
         raise ValueError("armed context execution is invalid")
     attempt_identity = ((claim.attempt, claim.attempt_identity),)
@@ -748,26 +1022,236 @@ def execute_armed_phase(
         )
         _verify_identities(attempt_identity)
         verify_frozen(frozen)
-    with authenticate_context_attempt(attempt) as verify:
-        if Path(sys.executable).resolve(strict=True) != Path(
-            attempt.torch_probe.python.path,
-        ).resolve(strict=True):
-            raise ValueError("context phase requires the bound Torch Python")
-        _validate_completed_prefix(claim, attempt)
-        index = len(claim._completed)
-        if index >= len(attempt.phases):
-            raise ValueError("armed context phases are complete")
-        phase = attempt.phases[index]
-        artifacts = _start(claim, phase)
-        callbacks = prepare(attempt, phase)
-        if not isinstance(callbacks, tuple) or len(callbacks) != 3 or \
-           any(not callable(callback) for callback in callbacks):
-            raise ValueError("armed context preparation is invalid")
-        evaluation, evidence = _execute_started_phase(
-            artifacts, claim, attempt.master, phase,
-            attempt.source_binding("failure").sha256,
-            attempt.config.sha256, attempt.source_tree.sha256,
-            *callbacks, verify,
+    return attempt
+
+
+def _execute_authenticated_phase(
+    claim: RunClaim, attempt: ContextAttempt, lease: ContextLease,
+) -> tuple[Mapping[str, object], PhaseEvidence, ContextPhase]:
+    """Execute the next phase while its source-derived lease is live."""
+    if not _registered(claim) or not _claim_mode(claim) or \
+       claim.root != claim.root.resolve(strict=True) or \
+       Path(sys.executable).resolve(strict=True) != Path(
+           attempt.torch_probe.python.path,
+       ).resolve(strict=True):
+        raise ValueError("context phase requires its bound attempt and Python")
+    _validate_completed_prefix(claim, attempt)
+    index = len(claim._completed)
+    if index >= len(attempt.phases):
+        raise ValueError("armed context phases are complete")
+    phase = attempt.phases[index]
+    artifacts = _start(claim, phase)
+    callbacks = _prepare_context_phase(attempt, phase, lease)
+    if not isinstance(callbacks, tuple) or len(callbacks) != 3 or \
+       any(not callable(callback) for callback in callbacks):
+        raise ValueError("armed context preparation is invalid")
+    evaluation, evidence = _execute_started_phase(
+        artifacts, claim, attempt.master, phase,
+        attempt.source_binding("failure").sha256,
+        attempt.config.sha256, attempt.source_tree.sha256,
+        *callbacks, lease,
+    )
+    return evaluation, evidence, phase
+
+
+def execute_armed_phase(claim: RunClaim) -> Mapping[str, object]:
+    """Execute the next armed phase without caller-supplied provenance."""
+    attempt = _claimed_attempt(claim)
+    with authenticate_context_attempt(attempt) as lease:
+        evaluation, evidence, phase = _execute_authenticated_phase(
+            claim, attempt, lease,
         )
     claim._completed[phase.phase] = evidence
     return evaluation
+
+
+def _attempt_path(path: Path) -> tuple[Path, Path]:
+    absolute = path if path.is_absolute() else ROOT / path
+    try:
+        lexical = Path(os.path.abspath(absolute))
+        resolved = absolute.resolve(strict=True)
+        if lexical != resolved:
+            raise ValueError("context attempt must not contain symlinks")
+        _regular_identity(resolved)
+        logical = resolved.relative_to(ROOT.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise ValueError("context attempt must be inside the repository") \
+            from error
+    return absolute, logical
+
+
+def read_context_attempt(path: Path) -> ContextAttempt:
+    """Read one canonical attempt without claiming its run directory."""
+    absolute, logical = _attempt_path(path)
+    return ContextAttempt.read(absolute, logical, ROOT)
+
+
+def _validate_environment(attempt: ContextAttempt) -> None:
+    actual = dict(os.environ)
+    expected = dict(attempt.environment)
+    if any(
+        actual.get(name) != value for name, value in expected.items()
+    ) or set(actual) - set(expected) - {
+        "LC_CTYPE", "__CF_USER_TEXT_ENCODING",
+    }:
+        raise ValueError("context runner environment changed")
+
+
+def _validate_controller(attempt: ContextAttempt) -> None:
+    _require_isolated_execution(bootstrapped=True)
+    _require_exact_launch()
+    if tuple(sys.argv) != attempt.runner_argv or \
+       Path(sys.executable).resolve(strict=True) != Path(
+           attempt.torch_probe.python.path,
+       ).resolve(strict=True):
+        raise ValueError("context runner command changed")
+    _validate_environment(attempt)
+    attempt.torch_probe.python.validate_live("context Torch Python")
+    package = Path(attempt.torch_probe.package_tree.root)
+    if source_tree(package) != attempt.torch_probe.package_tree or \
+       selected_source_tree(ROOT, CONTEXT_SOURCE_PATHS) != \
+            attempt.source_tree:
+        raise ValueError("context runner source or Torch package changed")
+
+
+def _failure_value(
+    claim: RunClaim, stage: str,
+) -> dict[str, object]:
+    return {
+        "attempt": {
+            "path": claim.attempt_binding.path,
+            "sha256": claim.attempt_binding.sha256,
+        },
+        "stage": stage,
+        "status": "integrity-failure",
+        "schema": 1,
+    }
+
+
+def execute_context_attempt(path: Path) -> Mapping[str, object]:
+    """Run both phases sequentially and finalize exactly one terminal result."""
+    attempt = read_context_attempt(path)
+    _validate_controller(attempt)
+    from tools.run_universe_scaling import _expose_torch_package
+
+    claim = None
+    stage = "authenticate"
+
+    def verify_claim() -> None:
+        if claim is None:
+            raise ValueError("context run was not claimed")
+        if _directory_identity(claim.path) != claim.directory_identity:
+            raise ValueError("context run directory changed")
+        _verify_identities(((claim.attempt, claim.attempt_identity),))
+
+    try:
+        with authenticate_context_attempt(attempt) as lease:
+            _expose_torch_package(Path(
+                attempt.torch_probe.package_tree.root,
+            ))
+            from tools.finalize_context_diagnostic import finalize_context_history
+
+            claim = claim_run(ROOT, ROOT / attempt.attempt_path)
+            for stage in TARGET_PHASES:
+                if _claimed_attempt(claim) != attempt:
+                    raise ValueError("context attempt changed after its claim")
+                evaluation, evidence, phase = _execute_authenticated_phase(
+                    claim, attempt, lease,
+                )
+                claim._completed[phase.phase] = evidence
+        stage = "finalize"
+        return finalize_context_history(
+            claim, attempt.master, attempt.phases,
+        )
+    except BaseException:
+        if claim is not None:
+            try:
+                publish_context_outcome(
+                    claim, _failure_value(claim, stage), verify_claim,
+                )
+            except (OSError, ValueError):
+                pass
+        raise
+
+
+def parse_args(
+    argv: Sequence[str] | None = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("attempt", type=Path)
+    return parser.parse_args(argv)
+
+
+def _run(path: Path) -> int:
+    """Execute once, mapping the first process signal to its shell status."""
+    global _ACTIVE_ATTEMPT, _SIGNAL_NUMBER
+    global _TERMINAL_OUTCOME
+
+    _ACTIVE_ATTEMPT = Path(os.path.abspath(path))
+    _TERMINAL_OUTCOME = None
+    _SIGNAL_NUMBER = None
+    previous = []
+    failure: BaseException | None = None
+    completed = False
+
+    def interrupt(number: int, _frame: object) -> None:
+        global _SIGNAL_NUMBER
+
+        if _TERMINAL_OUTCOME is None and _SIGNAL_NUMBER is None:
+            _SIGNAL_NUMBER = number
+            raise Interrupted(number)
+
+    def remember(error: BaseException) -> None:
+        nonlocal failure
+        if failure is None:
+            failure = error
+
+    try:
+        for number in SIGNALS:
+            previous.append((number, signal.getsignal(number)))
+            signal.signal(number, interrupt)
+        execute_context_attempt(path)
+        completed = True
+    except BaseException as error:
+        remember(error)
+    if completed and _TERMINAL_OUTCOME is None:
+        remember(ValueError("context run returned without a terminal outcome"))
+    elif _TERMINAL_OUTCOME is not None:
+        try:
+            _verify_terminal_outcome(_TERMINAL_OUTCOME)
+        except BaseException as error:
+            remember(error)
+    for number, handler in previous:
+        try:
+            signal.signal(number, handler)
+        except Interrupted as error:
+            try:
+                signal.signal(number, handler)
+            except BaseException as retry_error:
+                remember(retry_error)
+            else:
+                if not completed:
+                    remember(error)
+        except BaseException as error:
+            remember(error)
+    _ACTIVE_ATTEMPT = _TERMINAL_OUTCOME = None
+    _SIGNAL_NUMBER = None
+    if isinstance(failure, Interrupted):
+        return 128 + failure.number
+    if failure is not None:
+        raise failure
+    return 0
+
+
+def main() -> None:
+    try:
+        code = _run(parse_args().attempt)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        print(f"context runner error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    if code:
+        raise SystemExit(code)
+
+
+if __name__ == "__main__":
+    main()

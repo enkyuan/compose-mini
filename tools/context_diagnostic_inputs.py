@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Mapping, Sequence
 from datetime import date
+from pathlib import Path
 import hashlib
 import json
 
@@ -12,10 +14,67 @@ from tools.context_diagnostic_contract import (
     HISTORY_LENGTHS, MAX_HISTORY, PHASE_RANGES, SOURCE_OPPORTUNITIES,
     TARGET_PHASES,
 )
-from tools.session_calendar import SessionCalendar
+from tools.data_v1 import read_bars_until, read_timestamps_through
+from tools.session_calendar import SessionCalendar, expected_bins
 from tools.session_samples import SampleRows, session_samples
 from tools.universe_contract import PackedRows, pack_rows
 from tools.universe_scaling_contract import timestamp_grid_sha256
+
+
+def _phase_names(phases: Sequence[str]) -> tuple[str, ...]:
+    names = tuple(phases)
+    if not names or any(name not in PHASE_RANGES for name in names) or \
+       len(set(names)) != len(names):
+        raise ValueError("context phases are invalid")
+    return names
+
+
+def context_bar_prefix(
+    path: Path, timestamps: Sequence[str], stop: str,
+) -> array:
+    """Read one numeric prefix and bind it to the derived timestamp grid."""
+    expected = tuple(timestamps)
+    observed, rows = read_bars_until(path, stop)
+    if not observed or observed[-1] != stop or \
+       observed != expected[:len(observed)]:
+        raise ValueError("context bar prefix changed")
+    return rows
+
+
+def context_csv_prefix_sha256(
+    path: Path, stop: str,
+) -> str:
+    """Hash exact CSV bytes through stop without decoding numeric values."""
+    read_timestamps_through(path, stop)
+    target = stop.encode("ascii")
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while raw := file.readline():
+            digest.update(raw)
+            if raw[:20] == target:
+                return digest.hexdigest()
+    raise ValueError("context CSV prefix changed")
+
+
+def context_cutoff_timestamp(
+    calendar: SessionCalendar, start: date, end: date, minutes: int,
+    horizon: int, alignment: int,
+    phases: Sequence[str] = TARGET_PHASES,
+) -> str:
+    """Return the last timestamp needed to derive every frozen phase."""
+    if type(horizon) is not int or type(alignment) is not int or \
+       min(horizon, alignment) < 1 or horizon > alignment:
+        raise ValueError("context horizons are invalid")
+    names = _phase_names(phases)
+    grid = tuple(expected_bins(calendar, start, end, minutes))
+    index = (
+        HISTORY_LENGTHS[0] + alignment - 2 +
+        max(PHASE_RANGES[name][-1][1] for name in names)
+    )
+    try:
+        return grid[index].timestamp
+    except IndexError as error:
+        raise ValueError("context timestamp grid is incomplete") from error
 
 
 def _context_phase_rows(
@@ -23,10 +82,7 @@ def _context_phase_rows(
     start: date, end: date, phases: Sequence[str],
     horizon: int, alignment: int,
 ) -> tuple[tuple[str, PackedRows], ...]:
-    names = tuple(phases)
-    if not names or any(name not in PHASE_RANGES for name in names) or \
-       len(set(names)) != len(names):
-        raise ValueError("context phases are invalid")
+    names = _phase_names(phases)
     stop = max(PHASE_RANGES[name][-1][1] for name in names)
     source = session_samples(
         timestamps, minutes, calendar, start, end, HISTORY_LENGTHS[0],

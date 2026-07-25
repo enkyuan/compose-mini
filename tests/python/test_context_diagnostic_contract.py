@@ -155,7 +155,9 @@ def test_scaler_input_closure() -> None:
     assert original == context_scaler_inputs_sha256(MASTER, inputs)
 
     for index in (0, 44, 54):
-        for field in ("csv_sha256", "training_grid_sha256"):
+        for field in (
+            "training_prefix_sha256", "training_grid_sha256",
+        ):
             changed = list(inputs)
             changed[index] = replace(
                 changed[index], **{field: digest(f"{index}-{field}")},
@@ -176,7 +178,7 @@ def test_scaler_input_closure() -> None:
     ):
         raises(context_scaler_inputs_sha256, MASTER, invalid)
     for field, value in (
-        ("csv_sha256", "invalid"),
+        ("training_prefix_sha256", "invalid"),
         ("training_grid_sha256", "invalid"),
         ("training_rows", 0),
         ("series", MASTER[1]),

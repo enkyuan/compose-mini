@@ -136,7 +136,9 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-if _BOOTSTRAP_CACHE_PREFIX is None:
+if _BOOTSTRAP_CACHE_PREFIX is None and str(ROOT) not in tuple(
+    map(os.path.realpath, sys.path),
+):
     sys.path.insert(0, str(ROOT))
 
 from tools.files import (

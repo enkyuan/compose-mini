@@ -3,15 +3,19 @@
 
 from datetime import date
 from pathlib import Path
+import tempfile
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.context_diagnostic_inputs import (
-    context_all_phase_rows, context_grid_sha256, context_phase_rows,
+    context_all_phase_rows, context_bar_prefix,
+    context_csv_prefix_sha256,
+    context_cutoff_timestamp, context_grid_sha256, context_phase_rows,
     timestamp_rows,
 )
+from tools.data_v1 import CSV_HEADER
 from tools.session_calendar import (
     DEFAULT_CALENDAR, SessionCalendar, expected_bins,
 )
@@ -66,6 +70,29 @@ def test_source_numbering_is_preserved() -> None:
     ))["fold-1"] == packed
 
 
+def test_cutoff_binds_the_last_required_cell() -> None:
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    assert context_cutoff_timestamp(
+        calendar, START, END, MINUTES, HORIZON, ALIGNMENT,
+    ) == "2026-05-18T18:00:00Z"
+    assert context_cutoff_timestamp(
+        calendar, START, END, MINUTES, HORIZON, ALIGNMENT, ("fold-1",),
+    ) == "2026-03-18T16:00:00Z"
+    for horizon, alignment in ((0, ALIGNMENT), (14, ALIGNMENT)):
+        raises(
+            context_cutoff_timestamp, calendar, START, END, MINUTES,
+            horizon, alignment,
+        )
+    raises(
+        context_cutoff_timestamp, calendar, START, START, MINUTES,
+        HORIZON, ALIGNMENT,
+    )
+    raises(
+        context_cutoff_timestamp, calendar, START, END, MINUTES,
+        HORIZON, ALIGNMENT, (),
+    )
+
+
 def test_missing_history_only_removes_affected_cells() -> None:
     timestamps = grid()
     calendar = SessionCalendar.read(DEFAULT_CALENDAR)
@@ -98,6 +125,61 @@ def test_missing_history_only_removes_affected_cells() -> None:
     assert evaluation == early_evaluation
     assert train - boundary_train == {3_847}
     assert evaluation - boundary_evaluation == set(range(3_871, 3_928))
+
+
+def test_training_prefix_hash_ignores_later_rows() -> None:
+    timestamps = (
+        "2026-03-18T15:30:00Z",
+        "2026-03-18T16:00:00Z",
+        "2026-05-18T18:00:00Z",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="context-digest-", dir=ROOT,
+    ) as directory:
+        path = Path(directory) / "bars.csv"
+        prefix = "\n".join((
+            CSV_HEADER,
+            f"{timestamps[0]},100,101,99,100.5,1000",
+            f"{timestamps[1]},101,102,100,101.5,1100",
+        ))
+        path.write_text(
+            f"{prefix}\n{timestamps[2]},102,103,101,102.5,1200\n",
+            encoding="ascii",
+        )
+        digest = context_csv_prefix_sha256(path, timestamps[1])
+        path.write_text(
+            f"{prefix}\n{timestamps[2]},999,1000,998,999.5,1\n",
+            encoding="ascii",
+        )
+        assert context_csv_prefix_sha256(path, timestamps[1]) == digest
+        path.write_text(
+            f"{prefix.replace('101.5', '101.75')}\n"
+            f"{timestamps[2]},999,1000,998,999.5,1\n",
+            encoding="ascii",
+        )
+        assert context_csv_prefix_sha256(path, timestamps[1]) != digest
+
+
+def test_phase_bar_reader_ignores_later_payloads() -> None:
+    timestamps = (
+        "2026-03-18T15:30:00Z",
+        "2026-03-18T16:00:00Z",
+        "2026-05-18T18:00:00Z",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="context-prefix-", dir=ROOT,
+    ) as directory:
+        path = Path(directory) / "bars.csv"
+        path.write_text("\n".join((
+            CSV_HEADER,
+            f"{timestamps[0]},100,101,99,100.5,1000",
+            f"{timestamps[1]},101,102,100,101.5,1100",
+            f"{timestamps[2]},malformed",
+        )), encoding="ascii")
+        assert len(context_bar_prefix(
+            path, timestamps, timestamps[1],
+        )) == 10
+        raises(context_bar_prefix, path, timestamps, timestamps[2])
 
 
 def test_shifted_source_grid_fails() -> None:
@@ -157,7 +239,10 @@ def test_timestamp_and_aggregate_hashes_bind_order() -> None:
 
 def main() -> None:
     test_source_numbering_is_preserved()
+    test_cutoff_binds_the_last_required_cell()
     test_missing_history_only_removes_affected_cells()
+    test_training_prefix_hash_ignores_later_rows()
+    test_phase_bar_reader_ignores_later_payloads()
     test_shifted_source_grid_fails()
     test_timestamp_and_aggregate_hashes_bind_order()
     print("context diagnostic input tests passed")

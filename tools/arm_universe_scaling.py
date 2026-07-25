@@ -85,7 +85,10 @@ def _frozen(
 
 
 def _view(value: FrozenInput, source: str) -> FrozenInput:
-    return FrozenInput(Path(source), value.snapshot, value.sha256)
+    return FrozenInput(
+        Path(source), value.snapshot, value.sha256,
+        value.snapshot_identity,
+    )
 
 
 def _require_expected_coverage(

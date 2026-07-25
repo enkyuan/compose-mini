@@ -65,10 +65,13 @@ from tools.context_diagnostic_contract import (
     HISTORY_LENGTHS, NEURAL_MODELS, PHASE_RANGES, PRIOR_PHASE, PYTHON_FLAGS,
     SOURCE_EVIDENCE, TARGET_PHASES, TRAINING_COHORT, ContextAttempt,
     ContextPhase, ContextScalerInput, context_phase_value,
-    context_scaler_inputs_sha256, validate_context_sweep,
+    context_scaler_inputs_sha256,
+    validate_context_sweep,
 )
 from tools.context_diagnostic_inputs import (
-    context_all_phase_rows, context_grid_sha256, timestamp_rows,
+    context_all_phase_rows, context_csv_prefix_sha256,
+    context_cutoff_timestamp,
+    context_grid_sha256, timestamp_rows,
 )
 from tools.data_v1 import read_timestamps_until
 from tools.fetch_universe import UniverseManifest
@@ -85,7 +88,7 @@ from tools.panel_contract import (
     _verify_identities, read_canonical_json,
     read_canonical_json_lines, selected_source_tree, source_tree,
 )
-from tools.session_calendar import SessionCalendar, expected_bins
+from tools.session_calendar import SessionCalendar
 from tools.universe_contract import PackedRows, fixed_update_budget
 from tools.universe_scaling_contract import (
     FitJob, ScalingAttempt, fit_provenance_id, timestamp_grid_sha256,
@@ -113,6 +116,27 @@ Verify = Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
+class ContextSnapshots:
+    """Expose only frozen snapshots needed by the authenticated controller."""
+
+    config: FrozenInput
+    manifest: FrozenInput
+    calendar: FrozenInput
+    csv: tuple[tuple[str, FrozenInput], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextLease:
+    """Keep source, data, and runtime identities live through one phase."""
+
+    snapshots: ContextSnapshots
+    verify: Verify = field(repr=False, compare=False)
+
+    def __call__(self) -> None:
+        self.verify()
+
+
+@dataclass(frozen=True, slots=True)
 class _BoundContext:
     """Hold one fully derived source and runtime closure while it is frozen."""
 
@@ -122,6 +146,7 @@ class _BoundContext:
     torch_argv: tuple[str, ...]
     torch: TorchIdentity
     tree: SourceTree
+    snapshots: ContextSnapshots
     verify: Verify = field(repr=False, compare=False)
 
 
@@ -308,7 +333,7 @@ def _phase(
             tuple[tuple[str, str, str], ...],
         ],
     ],
-    csv_sha256: Mapping[str, str],
+    prefix_sha256: Mapping[tuple[str, str], str],
     fit_records: Mapping[str, Mapping[str, object]],
 ) -> ContextPhase:
     training = master[:TRAINING_COHORT]
@@ -329,7 +354,8 @@ def _phase(
     ]
     scaler_inputs = tuple(
         ContextScalerInput(
-            series, csv_sha256[series], packed[name, series].counts[0],
+            series, prefix_sha256[name, series],
+            packed[name, series].counts[0],
             timestamp_grid_sha256(grids[name, series][0]),
         )
         for series in master
@@ -385,20 +411,16 @@ def _derive_phases(
     sweep = validate_context_sweep(read_canonical_json(
         _frozen(data, ROOT / CONTEXT_CONFIG.path).snapshot,
     ))
-    last = PHASE_RANGES[TARGET_PHASES[-1]][-1][1]
-    grid = tuple(expected_bins(
+    cutoff = context_cutoff_timestamp(
         calendar, manifest.start, manifest.end, manifest.interval_minutes,
-    ))
-    cutoff = grid[
-        HISTORY_LENGTHS[0] + sweep["alignment_horizon_bars"] - 2 + last
-    ].timestamp
+        sweep["target_horizon_bars"], sweep["alignment_horizon_bars"],
+    )
     packed = {}
     grids = {}
-    csv_sha256 = {}
+    prefix_sha256 = {}
     for series, binding in zip(master, csv, strict=True):
         frozen = _frozen(data, Path(binding.path))
         timestamps = read_timestamps_until(frozen.snapshot, cutoff)
-        csv_sha256[series] = frozen.sha256
         rows_by_phase = context_all_phase_rows(
             timestamps, manifest.interval_minutes, calendar,
             manifest.start, manifest.end,
@@ -407,6 +429,12 @@ def _derive_phases(
         )
         for name, rows in rows_by_phase:
             boundary = rows.counts[0]
+            training = rows.rows[:boundary]
+            if not training:
+                raise ValueError("context training prefix is empty")
+            prefix_sha256[name, series] = context_csv_prefix_sha256(
+                frozen.snapshot, timestamps[training[-1].target],
+            )
             packed[name, series] = rows
             grids[name, series] = (
                 timestamp_rows(timestamps, rows.rows[:boundary]),
@@ -414,7 +442,7 @@ def _derive_phases(
             )
     return tuple(
         _phase(
-            name, master, packed, grids, csv_sha256, records,
+            name, master, packed, grids, prefix_sha256, records,
         )
         for name in TARGET_PHASES
     )
@@ -584,9 +612,25 @@ def _bound_context(
                             )
 
                     verify()
+                    snapshots = ContextSnapshots(
+                        _frozen(source, ROOT / CONTEXT_CONFIG.path),
+                        _frozen(
+                            data,
+                            ROOT / scaling.manifests[-1].file.path,
+                        ),
+                        _frozen(
+                            data, ROOT / scaling.session_calendar.path,
+                        ),
+                        tuple(
+                            (name, _frozen(data, Path(binding.path)))
+                            for name, binding in zip(
+                                names, csv, strict=True,
+                            )
+                        ),
+                    )
                     yield _BoundContext(
                         master, phases, primary, torch_argv,
-                        torch, tree, stable,
+                        torch, tree, snapshots, verify,
                     )
                     verify()
 
@@ -594,7 +638,7 @@ def _bound_context(
 @contextmanager
 def authenticate_context_attempt(
     attempt: ContextAttempt,
-) -> Iterator[Verify]:
+) -> Iterator[ContextLease]:
     """Hold one source-derived attempt lease through execution."""
     _require_isolated_execution()
     if not isinstance(attempt, ContextAttempt):
@@ -612,7 +656,7 @@ def authenticate_context_attempt(
            attempt.source_tree != bound.tree:
             raise ValueError("context attempt is not source-derived")
         bound.verify()
-        yield bound.verify
+        yield ContextLease(bound.snapshots, bound.verify)
 
 
 def arm(

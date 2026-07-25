@@ -60,6 +60,7 @@ CONTEXT_CONFIG = FileBinding(
     "experiments/executable-h13-context.example.json",
     "4224b532e0b3b3b16d9638be7b53b59003b9b04841ce45d1ca8e998afbd89a04",
 )
+CONTEXT_RUNNER = "tools/run_context_diagnostic.py"
 SOURCE_EVIDENCE = MappingProxyType({
     "attempt": FileBinding(
         "experiments/h13-universe-scaling-20260724-01-attempt.json",
@@ -77,6 +78,7 @@ SOURCE_EVIDENCE = MappingProxyType({
 CONTEXT_SOURCE_PATHS = tuple(sorted({
     *SCALING_SOURCE_PATHS,
     "tools/arm_context_diagnostic.py",
+    "tools/context_diagnostic_controller.py",
     "tools/context_diagnostic_contract.py",
     "tools/context_diagnostic_inputs.py",
     "tools/context_diagnostic_runtime.py",
@@ -84,6 +86,12 @@ CONTEXT_SOURCE_PATHS = tuple(sorted({
     "tools/run_context_diagnostic.py",
     "tools/universe_forward_runner.py",
 }))
+
+
+def expected_context_command(attempt_path: Path) -> tuple[str, str]:
+    """Return the sole source-bound context runner invocation."""
+    path = _relative(attempt_path.as_posix(), "context attempt path")
+    return CONTEXT_RUNNER, path
 
 
 def _candidate(history: int) -> dict[str, object]:
@@ -143,7 +151,7 @@ def _json_sha256(value: object) -> str:
 @dataclass(frozen=True, slots=True)
 class ContextScalerInput:
     series: str
-    csv_sha256: str
+    training_prefix_sha256: str
     training_rows: int
     training_grid_sha256: str
 
@@ -167,8 +175,9 @@ def context_scaler_inputs_sha256(
            _string(value.series, f"scaler input {index} series") != series:
             raise ValueError("context scaler input order changed")
         records.append({
-            "csv_sha256": _sha256(
-                value.csv_sha256, f"{series} scaler csv",
+            "training_prefix_sha256": _sha256(
+                value.training_prefix_sha256,
+                f"{series} scaler training prefix",
             ),
             "series": series,
             "training_grid_sha256": _sha256(
@@ -427,6 +436,11 @@ class ContextAttempt:
             *(series for series, _ in phase.training_rows),
             *(series for series, _, _ in phase.evaluation_rows),
         )
+
+    @property
+    def runner_argv(self) -> tuple[str, str]:
+        """Derive the sole runner invocation from the bound attempt path."""
+        return expected_context_command(Path(self.attempt_path))
 
     @classmethod
     def read(

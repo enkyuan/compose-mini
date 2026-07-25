@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from math import isfinite, log
 from statistics import fmean
 
-from tools.files import freeze_inputs, verify_frozen
+from tools.files import file_sha256, freeze_inputs, verify_frozen
 from tools.context_diagnostic_contract import (
     CONTROL_MODELS, HISTORY_LENGTHS, MODELS, PRIMARY_MODEL, SEEDS,
     TARGET_PHASES, ContextPhase, ContextPredictionEvidence, ContextReceipt,
@@ -417,13 +417,21 @@ def finalize_context_history(
             "schema": 1,
         }
 
-        def verify() -> None:
-            if _directory_identity(claim.path) != claim.directory_identity:
-                raise ValueError("context run directory changed")
-            _verify_identities(observed)
-            verify_frozen(frozen)
+        if _directory_identity(claim.path) != claim.directory_identity:
+            raise ValueError("context run directory changed")
+        _verify_identities(observed)
+        verify_frozen(frozen)
 
-        verify()
-        publish_context_outcome(claim, output, verify)
-        verify()
+    def verify() -> None:
+        _verify_identities(observed)
+        if any(
+            file_sha256(path) != binding.sha256
+            for path, binding in zip(
+                paths, expected_bindings, strict=True,
+            )
+        ) or _directory_identity(claim.path) != claim.directory_identity:
+            raise ValueError("context phase evidence changed")
+        _verify_identities(observed)
+
+    publish_context_outcome(claim, output, verify)
     return output

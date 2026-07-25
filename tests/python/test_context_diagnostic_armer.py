@@ -21,10 +21,10 @@ from tools import context_diagnostic_contract as contract
 from tools.context_diagnostic_contract import (
     BATCH_SIZE, PHASE_RANGES, SEEDS, ContextPhase,
 )
-from tools.files import file_sha256
+from tools.files import file_sha256, freeze_inputs, verify_frozen
 from tools.panel_contract import (
     ExecutableBinding, FileBinding, SourceTree, TorchIdentity,
-    _tree_digest, selected_source_tree,
+    _tree_digest, read_canonical_json, selected_source_tree,
 )
 from tools.universe_scaling_contract import FitJob, fit_provenance_id
 
@@ -54,8 +54,24 @@ def raises(function: object, *args: object, **kwargs: object) -> None:
 
 
 def authenticate(attempt: object) -> None:
-    with armer.authenticate_context_attempt(attempt):  # type: ignore[arg-type]
-        pass
+    with armer.authenticate_context_attempt(
+        attempt,  # type: ignore[arg-type]
+    ) as lease:
+        assert type(lease) is armer.ContextLease
+        assert callable(lease)
+        lease()
+
+
+def test_private_snapshot_mutation_fails_verification() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-snapshot-", dir=ROOT,
+    ) as directory:
+        source = write(Path(directory) / "source", "original")
+        with freeze_inputs((source,)) as frozen:
+            snapshot = frozen[0].snapshot
+            snapshot.chmod(0o600)
+            snapshot.write_text("changed", encoding="utf-8")
+            raises(verify_frozen, frozen)
 
 
 def phase_value(name: str) -> dict[str, object]:
@@ -258,6 +274,10 @@ def test_exact_one_shot_attempt() -> None:
             )
             raises(authenticate, forged)
             assert attempt.master == MASTER
+            assert attempt.runner_argv == (
+                contract.CONTEXT_RUNNER, attempt.attempt_path,
+            )
+            assert "command" not in read_canonical_json(fixture.output_path)
             assert fixture.output_path.is_file()
             assert not (fixture.root / "reports" / fixture.run_id).exists()
             raises(fixture.arm)
@@ -404,6 +424,7 @@ def test_path_identity_is_fixed() -> None:
 
 
 def main() -> None:
+    test_private_snapshot_mutation_fails_verification()
     test_exact_one_shot_attempt()
     test_existing_destination_blocks_all_work()
     test_input_mutation_prevents_publication()

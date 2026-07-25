@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, TextIO
 import argparse
@@ -31,12 +31,16 @@ class FrozenInput:
     source: Path
     snapshot: Path
     sha256: str
+    snapshot_identity: tuple[int, int] | None = field(
+        default=None, compare=False, repr=False,
+    )
 
 
 @dataclass(frozen=True)
 class ExclusiveTemp:
     name: str
     identity: tuple[int, int]
+    mode: int
 
 
 @contextmanager
@@ -51,12 +55,32 @@ def freeze_inputs(paths: Sequence[Path]) -> Iterator[tuple[FrozenInput, ...]]:
                 while chunk := input_file.read(1 << 20):
                     output_file.write(chunk)
                     digest.update(chunk)
-            frozen.append(FrozenInput(source, snapshot, digest.hexdigest()))
+            snapshot.chmod(stat.S_IRUSR)
+            metadata = snapshot.stat(follow_symlinks=False)
+            frozen.append(FrozenInput(
+                source, snapshot, digest.hexdigest(),
+                (metadata.st_dev, metadata.st_ino),
+            ))
         yield tuple(frozen)
 
 
 def verify_frozen(inputs: Sequence[FrozenInput]) -> None:
-    if any(file_sha256(item.source) != item.sha256 for item in inputs):
+    def changed(item: FrozenInput) -> bool:
+        if file_sha256(item.source) != item.sha256:
+            return True
+        if item.snapshot_identity is None:
+            return False
+        try:
+            metadata = item.snapshot.stat(follow_symlinks=False)
+            return not stat.S_ISREG(metadata.st_mode) or \
+                (metadata.st_dev, metadata.st_ino) != \
+                item.snapshot_identity or metadata.st_nlink != 1 or \
+                metadata.st_mode & 0o222 != 0 or \
+                file_sha256(item.snapshot) != item.sha256
+        except OSError:
+            return True
+
+    if any(map(changed, inputs)):
         raise ValueError("an input changed during the command")
 
 
@@ -172,7 +196,10 @@ def exclusive_text(
             getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd,
         )
         metadata = os.fstat(descriptor)
-        binding = ExclusiveTemp(name, (metadata.st_dev, metadata.st_ino))
+        binding = ExclusiveTemp(
+            name, (metadata.st_dev, metadata.st_ino),
+            stat.S_IMODE(metadata.st_mode),
+        )
         if on_temp_created is not None:
             on_temp_created(binding)
         with os.fdopen(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the one-shot context phase and receipt boundary."""
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -9,6 +9,8 @@ from unittest.mock import patch
 import hashlib
 import json
 import os
+import signal
+import subprocess
 import tempfile
 import sys
 
@@ -129,7 +131,7 @@ def setup_run(parent: str) -> tuple[RunClaim, ContextPhase]:
     )
 
 
-def setup_armed_run(parent: str) -> RunClaim:
+def setup_armed_attempt(parent: str) -> tuple[Path, Path]:
     root, attempt = setup_attempt(parent)
     files = tuple(
         FileBinding(path, digest(path)) for path in CONTEXT_SOURCE_PATHS
@@ -181,7 +183,11 @@ def setup_armed_run(parent: str) -> RunClaim:
             "version": "synthetic",
         },
     })
-    return claim_run(root, attempt)
+    return root, attempt
+
+
+def setup_armed_run(parent: str) -> RunClaim:
+    return claim_run(*setup_armed_attempt(parent))
 
 
 def armed_callbacks(
@@ -200,7 +206,10 @@ def armed_callbacks(
         assert model == prediction.fit
         return [0.0] * prediction.prediction_count
 
-    def truth() -> Mapping[str, object]:
+    def truth(
+        predictions: Sequence[object],
+    ) -> Mapping[str, object]:
+        assert len(predictions) == EXPECTED_PREDICTIONS_PER_PHASE
         events.append(f"{phase.phase}:truth")
         return {"phase": phase.phase}
 
@@ -215,18 +224,27 @@ def test_armed_handoff_owns_phase_and_provenance() -> None:
         events: list[str] = []
 
         def prepare(
-            attempt: object, phase: ContextPhase,
+            attempt: object, phase: ContextPhase, lease: object,
         ) -> tuple[object, object, object]:
             assert claim.started == {
                 *claim.completed, phase.phase,
             }
             assert attempt.master == MASTER
+            assert callable(lease)
             events.append(f"prepare:{phase.phase}")
             return armed_callbacks(events, phase)
 
-        with patch.object(runner, "authenticate_context_attempt"):
-            fold = execute_armed_phase(claim, prepare)
-            calibration = execute_armed_phase(claim, prepare)
+        try:
+            execute_armed_phase(claim, prepare)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("armed preparation remained injectable")
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            fold = execute_armed_phase(claim)
+            calibration = execute_armed_phase(claim)
         assert fold == {"phase": "fold-1"}
         assert calibration == {"phase": "calibration"}
         assert events[0] == "prepare:fold-1"
@@ -241,8 +259,10 @@ def test_armed_handoff_owns_phase_and_provenance() -> None:
         assert receipt.source_tree_sha256 == \
             claim.completed["fold-1"].source_tree_sha256
         calls = len(events)
-        with patch.object(runner, "authenticate_context_attempt"):
-            raises(execute_armed_phase, claim, prepare)
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            raises(execute_armed_phase, claim)
         assert len(events) == calls
 
 
@@ -254,17 +274,21 @@ def test_failed_armed_preparation_is_terminal() -> None:
         calls = 0
 
         def invalid(
-            _attempt: object, _phase: ContextPhase,
+            _attempt: object, _phase: ContextPhase, _lease: object,
         ) -> tuple[object, ...]:
             nonlocal calls
             calls += 1
             return ()
 
-        with patch.object(runner, "authenticate_context_attempt"):
-            raises(execute_armed_phase, claim, invalid)
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=invalid):
+            raises(execute_armed_phase, claim)
         assert claim.started == {"fold-1"} and calls == 1
-        with patch.object(runner, "authenticate_context_attempt"):
-            raises(execute_armed_phase, claim, invalid)
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=invalid):
+            raises(execute_armed_phase, claim)
         assert calls == 1
 
 
@@ -276,7 +300,7 @@ def test_armed_handoff_rejects_forged_state_and_attempt() -> None:
         prepared = 0
 
         def prepare(
-            _attempt: object, _phase: ContextPhase,
+            _attempt: object, _phase: ContextPhase, _lease: object,
         ) -> tuple[object, ...]:
             nonlocal prepared
             prepared += 1
@@ -285,8 +309,8 @@ def test_armed_handoff_rejects_forged_state_and_attempt() -> None:
         with patch.object(
             runner, "authenticate_context_attempt",
             side_effect=ValueError("synthetic attempt"),
-        ):
-            raises(execute_armed_phase, claim, prepare)
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            raises(execute_armed_phase, claim)
         assert not claim.started and prepared == 0
 
         attempt = ContextAttempt.read(
@@ -299,8 +323,10 @@ def test_armed_handoff_rejects_forged_state_and_attempt() -> None:
             attempt.config.sha256, attempt.source_tree.sha256,
         )
         claim._started.add("fold-1")
-        with patch.object(runner, "authenticate_context_attempt"):
-            raises(execute_armed_phase, claim, prepare)
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            raises(execute_armed_phase, claim)
         assert prepared == 0
 
 
@@ -312,7 +338,7 @@ def test_failed_authentication_exit_cannot_complete_a_phase() -> None:
         prepared = 0
 
         def prepare(
-            _attempt: object, phase: ContextPhase,
+            _attempt: object, phase: ContextPhase, _lease: object,
         ) -> tuple[object, object, object]:
             nonlocal prepared
             prepared += 1
@@ -325,11 +351,13 @@ def test_failed_authentication_exit_cannot_complete_a_phase() -> None:
 
         with patch.object(
             runner, "authenticate_context_attempt", new=failing_lease,
-        ):
-            raises(execute_armed_phase, claim, prepare)
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            raises(execute_armed_phase, claim)
         assert claim.started == {"fold-1"} and not claim.completed
-        with patch.object(runner, "authenticate_context_attempt"):
-            raises(execute_armed_phase, claim, prepare)
+        with patch.object(
+            runner, "authenticate_context_attempt",
+        ), patch.object(runner, "_prepare_context_phase", new=prepare):
+            raises(execute_armed_phase, claim)
         assert prepared == 1
 
 
@@ -352,6 +380,138 @@ def test_loose_executor_cannot_complete_an_armed_attempt() -> None:
                 fit, predict, truth,
             )
         assert not claim.started and not claim.completed
+
+
+def test_controller_authenticates_before_claim_and_finalizes_after_exit() -> None:
+    root_entries = tuple(map(os.path.realpath, sys.path)).count(str(ROOT))
+    import tools.finalize_context_diagnostic as finalizer
+    import tools.run_universe_scaling as scaling_runner
+
+    assert tuple(map(os.path.realpath, sys.path)).count(str(ROOT)) == \
+        root_entries
+    with tempfile.TemporaryDirectory(
+        prefix="context-controller-", dir=ROOT,
+    ) as parent:
+        root, attempt_path = setup_armed_attempt(parent)
+        events: list[str] = []
+        original_claim = runner.claim_run
+
+        @contextmanager
+        def authenticate(_attempt: object) -> Iterator[object]:
+            events.append("authenticate")
+            yield lambda: None
+            events.append("lease-exit")
+
+        def claim(run_root: Path, path: Path) -> RunClaim:
+            assert events == ["authenticate"]
+            events.append("claim")
+            return original_claim(run_root, path)
+
+        def prepare(
+            _attempt: object, phase: ContextPhase, _lease: object,
+        ) -> tuple[object, object, object]:
+            events.append(f"prepare:{phase.phase}")
+            return armed_callbacks([], phase)
+
+        def finalize(
+            claim: RunClaim, _master: object, _phases: object,
+        ) -> dict[str, object]:
+            assert tuple(claim.completed) == ("fold-1", "calibration")
+            events.append("finalize")
+            return {"status": "complete"}
+
+        with patch.object(
+            runner, "ROOT", root,
+        ), patch.object(
+            runner, "_validate_controller",
+        ), patch.object(
+            runner, "authenticate_context_attempt", new=authenticate,
+        ), patch.object(
+            runner, "claim_run", new=claim,
+        ), patch.object(
+            runner, "_prepare_context_phase", new=prepare,
+        ), patch.object(
+            scaling_runner, "_expose_torch_package",
+        ), patch.object(
+            finalizer, "finalize_context_history", new=finalize,
+        ):
+            result = runner.execute_context_attempt(
+                attempt_path.relative_to(root),
+            )
+        assert result == {"status": "complete"}
+        assert tuple(
+            event for event in events if event.startswith("prepare:")
+        ) == ("prepare:fold-1", "prepare:calibration")
+        assert events.index("claim") > events.index("authenticate")
+        assert events.index("finalize") > events.index("lease-exit")
+
+
+def test_controller_failure_publishes_one_terminal_outcome() -> None:
+    import tools.run_universe_scaling as scaling_runner
+
+    with tempfile.TemporaryDirectory(
+        prefix="context-controller-failure-", dir=ROOT,
+    ) as parent:
+        root, attempt_path = setup_armed_attempt(parent)
+        claimed: list[RunClaim] = []
+        original_claim = runner.claim_run
+
+        @contextmanager
+        def authenticate(_attempt: object) -> Iterator[object]:
+            yield lambda: None
+
+        def claim(run_root: Path, path: Path) -> RunClaim:
+            value = original_claim(run_root, path)
+            claimed.append(value)
+            return value
+
+        def fail(*_args: object) -> object:
+            raise ValueError("synthetic preparation failure")
+
+        with patch.object(
+            runner, "ROOT", root,
+        ), patch.object(
+            runner, "_validate_controller",
+        ), patch.object(
+            runner, "authenticate_context_attempt", new=authenticate,
+        ), patch.object(
+            runner, "claim_run", new=claim,
+        ), patch.object(
+            runner, "_prepare_context_phase", new=fail,
+        ), patch.object(
+            scaling_runner, "_expose_torch_package",
+        ):
+            raises(
+                runner.execute_context_attempt,
+                attempt_path.relative_to(root),
+            )
+        assert len(claimed) == 1
+        outcome = json.loads(
+            (claimed[0].path / "outcome.json").read_text(encoding="utf-8"),
+        )
+        assert outcome["stage"] == "fold-1"
+        assert outcome["status"] == "integrity-failure"
+
+
+def test_isolated_controller_bootstrap_rejects_an_unbound_attempt() -> None:
+    result = subprocess.run(
+        (
+            sys.executable, "-I", "-S", "-B",
+            "tools/run_context_diagnostic.py",
+            "experiments/does-not-exist-attempt.json",
+        ),
+        cwd=ROOT, env={
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "reports/context-smoke/.pycache",
+        },
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "context runner error: "
+        "context attempt must be inside the repository\n"
+    )
 
 
 def execute_fixture(
@@ -394,7 +554,10 @@ def execute_fixture(
             raise RuntimeError("synthetic prediction failure")
         return [predictions / 100.0] * prediction.prediction_count
 
-    def truth() -> Mapping[str, object]:
+    def truth(
+        evidence: Sequence[object],
+    ) -> Mapping[str, object]:
+        assert len(evidence) == EXPECTED_PREDICTIONS_PER_PHASE
         artifacts = phase_artifacts(
             claim.root, claim.attempt, phase,
         )
@@ -531,13 +694,13 @@ def test_claim_and_phase_barrier() -> None:
             execute_phase,
             claim, MASTER, phase, digest("source-failure"),
             digest("config"), digest("source-tree"), fit_again,
-            lambda _prediction, _model: (), lambda: None,
+            lambda _prediction, _model: (), lambda _evidence: None,
         )
         assert work == 0
 
         calls = 0
 
-        def truth() -> object:
+        def truth(_evidence: object) -> object:
             nonlocal calls
             calls += 1
             return None
@@ -591,7 +754,7 @@ def test_failed_phase_is_not_retryable() -> None:
                 execute_phase,
                 claim, MASTER, phase, digest("source-failure"),
                 digest("config"), digest("source-tree"), fit_again,
-                lambda _prediction, _model: (), lambda: None,
+                lambda _prediction, _model: (), lambda _evidence: None,
             )
             assert work == 0
 
@@ -676,7 +839,7 @@ def test_truth_failure_is_terminal() -> None:
 
         calls = 0
 
-        def truth() -> object:
+        def truth(_evidence: object) -> object:
             nonlocal calls
             calls += 1
             return None
@@ -707,7 +870,7 @@ def test_truth_access_mutation_is_terminal() -> None:
 
             calls = 0
 
-            def truth() -> object:
+            def truth(_evidence: object) -> object:
                 nonlocal calls
                 calls += 1
                 return {"authorized": True}
@@ -829,11 +992,124 @@ def test_terminal_outcome_publication_is_atomic() -> None:
 
             runner.os.fsync = fsync
             try:
-                raises(finalize_context_history, claim, MASTER, phases)
+                if present:
+                    finalize_context_history(claim, MASTER, phases)
+                else:
+                    raises(finalize_context_history, claim, MASTER, phases)
             finally:
                 runner.os.fsync = original
             assert (claim.path / "outcome.json").exists() is present
             assert not tuple(claim.path.glob(".*.tmp"))
+
+
+def test_terminal_outcome_rejects_a_forged_commit_signal() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-outcome-forgery-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+
+        def forged() -> None:
+            raise runner.PublicationCommitted("forged")
+
+        raises(
+            runner.publish_context_outcome,
+            claim, {"schema": 1}, forged,
+        )
+        assert not (claim.path / "outcome.json").exists()
+
+
+def test_terminal_outcome_uses_the_public_link_as_signal_boundary() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-outcome-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+
+        def interrupt() -> None:
+            raise runner.Interrupted(signal.SIGTERM)
+
+        try:
+            runner.publish_context_outcome(claim, {"schema": 1}, interrupt)
+        except runner.Interrupted as error:
+            assert error.number == signal.SIGTERM
+        else:
+            raise AssertionError("pre-link signal was accepted")
+        assert not (claim.path / "outcome.json").exists()
+
+        directory, interrupted, original_open = None, False, runner._open_directory
+        original_close = runner.os.close
+
+        def open_directory(path: Path) -> tuple[int, tuple[int, int]]:
+            nonlocal directory
+            directory, identity = original_open(path)
+            return directory, identity
+
+        def close(descriptor: int) -> None:
+            nonlocal interrupted
+            original_close(descriptor)
+            if descriptor == directory and not interrupted:
+                interrupted = True
+                raise runner.Interrupted(signal.SIGTERM)
+
+        with patch.object(
+            runner, "_open_directory", new=open_directory,
+        ), patch.object(runner.os, "close", new=close):
+            runner.publish_context_outcome(claim, {"schema": 1}, lambda: None)
+        assert (claim.path / "outcome.json").exists()
+
+
+def test_terminal_outcome_rechecks_after_a_confirmation_signal() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-outcome-confirmation-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        original_fsync = runner.os.fsync
+        original_identity = runner._regular_identity
+        fsync_calls = identity_calls = 0
+
+        def fsync(descriptor: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("synthetic directory fsync failure")
+            original_fsync(descriptor)
+
+        def regular_identity(path: Path) -> tuple[int, int]:
+            nonlocal identity_calls
+            identity_calls += 1
+            if identity_calls == 1:
+                raise runner.Interrupted(signal.SIGTERM)
+            return original_identity(path)
+
+        with patch.object(
+            runner.os, "fsync", new=fsync,
+        ), patch.object(
+            runner, "_regular_identity", new=regular_identity,
+        ):
+            runner.publish_context_outcome(claim, {"schema": 1}, lambda: None)
+        assert (claim.path / "outcome.json").exists()
+
+
+def test_terminal_outcome_waits_for_snapshot_cleanup() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-outcome-cleanup-", dir=ROOT,
+    ) as parent:
+        claim, phases = completed_run(parent)
+        original = tempfile.TemporaryDirectory.cleanup
+
+        def cleanup(directory: tempfile.TemporaryDirectory[str]) -> None:
+            original(directory)
+            raise runner.Interrupted(signal.SIGTERM)
+
+        with patch.object(
+            tempfile.TemporaryDirectory, "cleanup", new=cleanup,
+        ):
+            try:
+                finalize_context_history(claim, MASTER, phases)
+            except runner.Interrupted as error:
+                assert error.number == signal.SIGTERM
+            else:
+                raise AssertionError("snapshot cleanup signal was accepted")
+        assert not (claim.path / "outcome.json").exists()
 
 
 def inject_fsync_failure(
@@ -901,7 +1177,7 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
 
         calls = 0
 
-        def truth() -> object:
+        def truth(_evidence: object) -> object:
             nonlocal calls
             calls += 1
             return {"authorized": True}
@@ -925,12 +1201,269 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
             artifacts.evaluation.exists()
 
 
+def test_first_signal_sets_the_shell_status_and_restores_handlers() -> None:
+    installed, restored = {}, []
+
+    def install(number: int, handler: object) -> object:
+        if number not in installed:
+            installed[number] = handler
+            return signal.SIG_DFL
+        restored.append((number, handler))
+        return installed[number]
+
+    def interrupt(_path: Path) -> None:
+        try:
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        except runner.Interrupted:
+            installed[signal.SIGINT](signal.SIGINT, None)
+            raise
+
+    with patch.object(
+        runner.signal, "signal", side_effect=install,
+    ), patch.object(
+        runner.signal, "getsignal", return_value=signal.SIG_DFL,
+    ), patch.object(runner, "execute_context_attempt", new=interrupt):
+        assert runner._run(Path("attempt.json")) == 128 + signal.SIGTERM
+    assert tuple(number for number, _ in restored) == runner.SIGNALS
+    assert all(handler == signal.SIG_DFL for _, handler in restored)
+
+
+def test_signal_during_handler_installation_restores_partial_state() -> None:
+    installed, restored = {}, []
+
+    def install(number: int, handler: object) -> None:
+        if handler == signal.SIG_DFL:
+            restored.append(number)
+            return
+        installed[number] = handler
+        if number == signal.SIGINT:
+            installed[signal.SIGHUP](signal.SIGHUP, None)
+
+    with patch.object(
+        runner.signal, "signal", side_effect=install,
+    ), patch.object(
+        runner.signal, "getsignal", return_value=signal.SIG_DFL,
+    ), patch.object(
+        runner, "execute_context_attempt",
+    ) as execute:
+        assert runner._run(Path("attempt.json")) == 128 + signal.SIGHUP
+        execute.assert_not_called()
+    assert tuple(restored) == (signal.SIGHUP, signal.SIGINT)
+
+
+def test_post_execution_signal_cannot_break_handler_restoration() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-restoration-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        installed, restored = {}, []
+        interrupted = False
+
+        def install(number: int, handler: object) -> None:
+            nonlocal interrupted
+            if handler != signal.SIG_DFL:
+                installed[number] = handler
+                return
+            if not interrupted:
+                interrupted = True
+                installed[signal.SIGTERM](signal.SIGTERM, None)
+            restored.append(number)
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1}, lambda: None,
+            )
+
+        with patch.object(
+            runner.signal, "signal", side_effect=install,
+        ), patch.object(
+            runner.signal, "getsignal", return_value=signal.SIG_DFL,
+        ), patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            assert runner._run(claim.attempt) == 0
+        assert tuple(restored) == runner.SIGNALS
+
+
+def test_success_requires_an_authenticated_terminal_outcome() -> None:
+    with patch.object(
+        runner, "execute_context_attempt", return_value={},
+    ):
+        raises(runner._run, Path("attempt.json"))
+
+
+def test_post_publication_signal_uses_the_terminal_outcome() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-post-publication-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        installed = {}
+
+        def install(number: int, handler: object) -> None:
+            installed[number] = handler
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1}, lambda: None,
+            )
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+        with patch.object(
+            runner.signal, "signal", side_effect=install,
+        ), patch.object(
+            runner.signal, "getsignal", return_value=signal.SIG_DFL,
+        ), patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            assert runner._run(claim.attempt) == 0
+        assert (claim.path / "outcome.json").exists()
+
+
+def test_signal_during_terminal_verification_is_ignored() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-verification-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        original = runner._verify_terminal_outcome
+
+        def verify(value: object) -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+            original(value)  # type: ignore[arg-type]
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1}, lambda: None,
+            )
+
+        with patch.object(
+            runner, "_verify_terminal_outcome", new=verify,
+        ), patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            assert runner._run(claim.attempt) == 0
+        assert (claim.path / "outcome.json").exists()
+
+
+def test_pre_link_signal_aborts_terminal_publication() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-pre-link-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1},
+                lambda: os.kill(os.getpid(), signal.SIGTERM),
+            )
+
+        with patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            assert runner._run(claim.attempt) == 128 + signal.SIGTERM
+        assert not (claim.path / "outcome.json").exists()
+
+
+def test_post_link_signal_authenticates_the_owned_outcome() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-post-link-signal-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        original = runner.exclusive_text
+
+        def exclusive(*args: object, **kwargs: object) -> None:
+            original(*args, **kwargs)  # type: ignore[arg-type]
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1}, lambda: None,
+            )
+
+        with patch.object(
+            runner, "exclusive_text", new=exclusive,
+        ), patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            assert runner._run(claim.attempt) == 0
+        assert (claim.path / "outcome.json").exists()
+
+
+def test_terminal_marker_rejects_a_post_link_replacement() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-terminal-replacement-", dir=ROOT,
+    ) as parent:
+        claim, _ = setup_run(parent)
+        original = runner._write_json
+
+        def write_json(
+            path: Path, *args: object, **kwargs: object,
+        ) -> object:
+            published = original(
+                path, *args, **kwargs,  # type: ignore[arg-type]
+            )
+            path.unlink()
+            path.write_text('{"foreign": true}\n', encoding="utf-8")
+            return published
+
+        def execute(_path: Path) -> None:
+            runner.publish_context_outcome(
+                claim, {"schema": 1}, lambda: None,
+            )
+
+        with patch.object(
+            runner, "_write_json", new=write_json,
+        ), patch.object(
+            runner, "execute_context_attempt", new=execute,
+        ):
+            raises(runner._run, claim.attempt)
+
+
+def test_terminal_marker_binds_content_mode_and_link_count() -> None:
+    def reject(name: str, mutate: object) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=f"context-terminal-{name}-", dir=ROOT,
+        ) as parent:
+            claim, _ = setup_run(parent)
+
+            def execute(_path: Path) -> None:
+                outcome = runner.publish_context_outcome(
+                    claim, {"schema": 1}, lambda: None,
+                )
+                mutate(outcome)  # type: ignore[operator]
+
+            with patch.object(
+                runner, "execute_context_attempt", new=execute,
+            ):
+                raises(runner._run, claim.attempt)
+
+    reject(
+        "content",
+        lambda path: path.write_text(
+            '{"changed": true}\n', encoding="utf-8",
+        ),
+    )
+    reject("mode", lambda path: path.chmod(0o400))
+    reject(
+        "links",
+        lambda path: path.with_name("outcome-link.json").hardlink_to(path),
+    )
+
+    def replace_with_fifo(path: Path) -> None:
+        path.unlink()
+        os.mkfifo(path)
+
+    reject("fifo", replace_with_fifo)
+
+
 def main() -> None:
     test_armed_handoff_owns_phase_and_provenance()
     test_failed_armed_preparation_is_terminal()
     test_armed_handoff_rejects_forged_state_and_attempt()
     test_failed_authentication_exit_cannot_complete_a_phase()
     test_loose_executor_cannot_complete_an_armed_attempt()
+    test_controller_authenticates_before_claim_and_finalizes_after_exit()
+    test_controller_failure_publishes_one_terminal_outcome()
+    test_isolated_controller_bootstrap_rejects_an_unbound_attempt()
     test_claim_is_parent_synced()
     test_claim_sync_failure_burns_run()
     test_claim_rejects_a_substituted_directory()
@@ -945,8 +1478,22 @@ def main() -> None:
     test_terminal_outcome_binds_phase_evaluations()
     test_terminal_outcome_rejects_mixed_provenance()
     test_terminal_outcome_publication_is_atomic()
+    test_terminal_outcome_rejects_a_forged_commit_signal()
+    test_terminal_outcome_uses_the_public_link_as_signal_boundary()
+    test_terminal_outcome_rechecks_after_a_confirmation_signal()
+    test_terminal_outcome_waits_for_snapshot_cleanup()
     test_publication_failures_preserve_evidence_and_clean_temps()
     test_pre_access_failure_allows_one_validated_recovery()
+    test_first_signal_sets_the_shell_status_and_restores_handlers()
+    test_signal_during_handler_installation_restores_partial_state()
+    test_post_execution_signal_cannot_break_handler_restoration()
+    test_success_requires_an_authenticated_terminal_outcome()
+    test_post_publication_signal_uses_the_terminal_outcome()
+    test_signal_during_terminal_verification_is_ignored()
+    test_pre_link_signal_aborts_terminal_publication()
+    test_post_link_signal_authenticates_the_owned_outcome()
+    test_terminal_marker_rejects_a_post_link_replacement()
+    test_terminal_marker_binds_content_mode_and_link_count()
     print("context diagnostic driver tests passed")
 
 
