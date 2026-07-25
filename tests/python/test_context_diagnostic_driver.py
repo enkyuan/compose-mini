@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Verify the one-shot context phase and receipt boundary."""
 
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import patch
 import hashlib
 import json
 import os
@@ -16,15 +18,17 @@ sys.path.insert(0, str(ROOT))
 from tools.context_diagnostic_contract import (
     BATCH_SIZE, CONTROL_COHORT, EXPECTED_FITS_PER_PHASE,
     EXPECTED_PREDICTIONS_PER_PHASE, HISTORY_LENGTHS, PHASE_RANGES, SEEDS,
-    ContextPhase, context_phase_sha256,
+    CONTEXT_CONFIG, CONTEXT_SOURCE_PATHS, PYTHON_FLAGS, SOURCE_EVIDENCE,
+    ContextAttempt, ContextPhase, ContextReceipt, context_phase_sha256,
 )
 from tools.finalize_context_diagnostic import finalize_context_history
 from tools.files import write_json
 import tools.run_context_diagnostic as runner
 from tools.run_context_diagnostic import (
-    RunClaim, claim_run, execute_phase, phase_artifacts,
-    read_authorized_truth,
+    PhaseEvidence, RunClaim, claim_run, execute_armed_phase, execute_phase,
+    phase_artifacts, read_authorized_truth,
 )
+from tools.panel_contract import FileBinding, SourceTree, _tree_digest
 from tools.universe_scaling import BOOTSTRAP_BLOCK_DAYS
 from tools.universe_scaling_contract import FitJob, fit_provenance_id
 
@@ -123,6 +127,231 @@ def setup_run(parent: str) -> tuple[RunClaim, ContextPhase]:
     return claim_run(root, attempt), ContextPhase.parse(
         phase_value(), MASTER,
     )
+
+
+def setup_armed_run(parent: str) -> RunClaim:
+    root, attempt = setup_attempt(parent)
+    files = tuple(
+        FileBinding(path, digest(path)) for path in CONTEXT_SOURCE_PATHS
+    )
+    package_files = (FileBinding("torch.py", digest("torch.py")),)
+    source_tree = SourceTree(
+        str(root), files, _tree_digest(files),
+    )
+    package_tree = SourceTree(
+        str(root / "torch"), package_files, _tree_digest(package_files),
+    )
+    python = str(Path(sys.executable).resolve())
+    write_json(attempt, {
+        "attempt_path": "experiments/context-run-attempt.json",
+        "config": asdict(CONTEXT_CONFIG),
+        "environment": {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "reports/context-run/.pycache",
+        },
+        "implementation_commit": "1" * 40,
+        "phases": [
+            phase_value(name) for name in ("fold-1", "calibration")
+        ],
+        "primary_python": {
+            "path": python,
+            "sha256": digest("primary"),
+            "version": "synthetic",
+        },
+        "run_dir": "reports/context-run",
+        "run_id": "context-run",
+        "schema": 1,
+        "source": {
+            name: asdict(binding)
+            for name, binding in SOURCE_EVIDENCE.items()
+        },
+        "source_tree": asdict(source_tree),
+        "status": "armed",
+        "torch_argv": [python, *PYTHON_FLAGS],
+        "torch_probe": {
+            "config": "cpu",
+            "cuda_version": None,
+            "git_version": None,
+            "package_tree": asdict(package_tree),
+            "python": {
+                "path": python,
+                "sha256": digest("torch-python"),
+                "version": "synthetic",
+            },
+            "version": "synthetic",
+        },
+    })
+    return claim_run(root, attempt)
+
+
+def armed_callbacks(
+    events: list[str], phase: ContextPhase,
+) -> tuple[object, object, object]:
+    fits = 0
+
+    def fit_one(fit: object) -> tuple[str, float, object]:
+        nonlocal fits
+        fits += 1
+        events.append(f"{phase.phase}:fit")
+        return digest(f"{phase.phase}-state-{fits}"), 0.1, fit
+
+    def predict_one(prediction: object, model: object) -> list[float]:
+        assert fits == EXPECTED_FITS_PER_PHASE
+        assert model == prediction.fit
+        return [0.0] * prediction.prediction_count
+
+    def truth() -> Mapping[str, object]:
+        events.append(f"{phase.phase}:truth")
+        return {"phase": phase.phase}
+
+    return fit_one, predict_one, truth
+
+
+def test_armed_handoff_owns_phase_and_provenance() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-armed-", dir=ROOT,
+    ) as parent:
+        claim = setup_armed_run(parent)
+        events: list[str] = []
+
+        def prepare(
+            attempt: object, phase: ContextPhase,
+        ) -> tuple[object, object, object]:
+            assert claim.started == {
+                *claim.completed, phase.phase,
+            }
+            assert attempt.master == MASTER
+            events.append(f"prepare:{phase.phase}")
+            return armed_callbacks(events, phase)
+
+        with patch.object(runner, "authenticate_context_attempt"):
+            fold = execute_armed_phase(claim, prepare)
+            calibration = execute_armed_phase(claim, prepare)
+        assert fold == {"phase": "fold-1"}
+        assert calibration == {"phase": "calibration"}
+        assert events[0] == "prepare:fold-1"
+        assert events[-1] == "calibration:truth"
+        assert tuple(claim.completed) == ("fold-1", "calibration")
+        fold_phase = ContextPhase.parse(phase_value(), MASTER)
+        receipt = ContextReceipt.parse(json.loads(
+            phase_artifacts(
+                claim.root, claim.attempt, fold_phase,
+            ).receipt.read_text(encoding="utf-8"),
+        ))
+        assert receipt.source_tree_sha256 == \
+            claim.completed["fold-1"].source_tree_sha256
+        calls = len(events)
+        with patch.object(runner, "authenticate_context_attempt"):
+            raises(execute_armed_phase, claim, prepare)
+        assert len(events) == calls
+
+
+def test_failed_armed_preparation_is_terminal() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-armed-failure-", dir=ROOT,
+    ) as parent:
+        claim = setup_armed_run(parent)
+        calls = 0
+
+        def invalid(
+            _attempt: object, _phase: ContextPhase,
+        ) -> tuple[object, ...]:
+            nonlocal calls
+            calls += 1
+            return ()
+
+        with patch.object(runner, "authenticate_context_attempt"):
+            raises(execute_armed_phase, claim, invalid)
+        assert claim.started == {"fold-1"} and calls == 1
+        with patch.object(runner, "authenticate_context_attempt"):
+            raises(execute_armed_phase, claim, invalid)
+        assert calls == 1
+
+
+def test_armed_handoff_rejects_forged_state_and_attempt() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-armed-forgery-", dir=ROOT,
+    ) as parent:
+        claim = setup_armed_run(parent)
+        prepared = 0
+
+        def prepare(
+            _attempt: object, _phase: ContextPhase,
+        ) -> tuple[object, ...]:
+            nonlocal prepared
+            prepared += 1
+            return ()
+
+        with patch.object(
+            runner, "authenticate_context_attempt",
+            side_effect=ValueError("synthetic attempt"),
+        ):
+            raises(execute_armed_phase, claim, prepare)
+        assert not claim.started and prepared == 0
+
+        attempt = ContextAttempt.read(
+            claim.attempt, claim.attempt.relative_to(claim.root),
+            claim.root,
+        )
+        claim._completed["fold-1"] = PhaseEvidence(
+            "fold-1", (), (),
+            attempt.source_binding("failure").sha256,
+            attempt.config.sha256, attempt.source_tree.sha256,
+        )
+        claim._started.add("fold-1")
+        with patch.object(runner, "authenticate_context_attempt"):
+            raises(execute_armed_phase, claim, prepare)
+        assert prepared == 0
+
+
+def test_failed_authentication_exit_cannot_complete_a_phase() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-armed-lease-", dir=ROOT,
+    ) as parent:
+        claim = setup_armed_run(parent)
+        prepared = 0
+
+        def prepare(
+            _attempt: object, phase: ContextPhase,
+        ) -> tuple[object, object, object]:
+            nonlocal prepared
+            prepared += 1
+            return armed_callbacks([], phase)
+
+        @contextmanager
+        def failing_lease(_attempt: object) -> Iterator[object]:
+            yield lambda: None
+            raise ValueError("context lease changed")
+
+        with patch.object(
+            runner, "authenticate_context_attempt", new=failing_lease,
+        ):
+            raises(execute_armed_phase, claim, prepare)
+        assert claim.started == {"fold-1"} and not claim.completed
+        with patch.object(runner, "authenticate_context_attempt"):
+            raises(execute_armed_phase, claim, prepare)
+        assert prepared == 1
+
+
+def test_loose_executor_cannot_complete_an_armed_attempt() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-armed-loose-", dir=ROOT,
+    ) as parent:
+        claim = setup_armed_run(parent)
+        attempt = ContextAttempt.read(
+            claim.attempt, claim.attempt.relative_to(claim.root),
+            claim.root,
+        )
+        phase = attempt.phases[0]
+        fit, predict, truth = armed_callbacks([], phase)
+        for candidate in (claim, replace(claim)):
+            raises(
+                execute_phase, candidate, attempt.master, phase,
+                attempt.source_binding("failure").sha256,
+                attempt.config.sha256, attempt.source_tree.sha256,
+                fit, predict, truth,
+            )
+        assert not claim.started and not claim.completed
 
 
 def execute_fixture(
@@ -248,6 +477,23 @@ def test_claim_sync_failure_burns_run() -> None:
             runner.os.fsync = original
         assert (root / "reports" / "context-run").is_dir()
         raises(claim_run, root, attempt)
+
+
+def test_claim_rejects_a_substituted_directory() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-claim-swap-", dir=ROOT,
+    ) as parent:
+        root, attempt = setup_attempt(parent)
+        create = runner.mkdir_nofollow
+
+        def swap(path: Path) -> tuple[int, int]:
+            identity = create(path)
+            path.rename(path.with_name("original-run"))
+            path.mkdir()
+            return identity
+
+        with patch.object(runner, "mkdir_nofollow", side_effect=swap):
+            raises(claim_run, root, attempt)
 
 
 def test_claim_and_phase_barrier() -> None:
@@ -558,7 +804,7 @@ def test_terminal_outcome_rejects_mixed_provenance() -> None:
         ) as parent:
             claim, phases = completed_run(parent)
             evidence = claim.completed["calibration"]
-            claim.completed["calibration"] = replace(
+            claim._completed["calibration"] = replace(
                 evidence, **{field: digest(f"changed-{field}")},
             )
             raises(finalize_context_history, claim, MASTER, phases)
@@ -680,8 +926,14 @@ def test_pre_access_failure_allows_one_validated_recovery() -> None:
 
 
 def main() -> None:
+    test_armed_handoff_owns_phase_and_provenance()
+    test_failed_armed_preparation_is_terminal()
+    test_armed_handoff_rejects_forged_state_and_attempt()
+    test_failed_authentication_exit_cannot_complete_a_phase()
+    test_loose_executor_cannot_complete_an_armed_attempt()
     test_claim_is_parent_synced()
     test_claim_sync_failure_burns_run()
+    test_claim_rejects_a_substituted_directory()
     test_claim_and_phase_barrier()
     test_failed_phase_is_not_retryable()
     test_calibration_requires_completed_fold()

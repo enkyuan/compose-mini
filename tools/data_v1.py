@@ -101,7 +101,7 @@ def _number(field: str, number: int) -> float:
 
 
 def _fields(
-    path: Path, stop: str | None = None
+    path: Path, stop: str | None = None, *, exact_stop: bool = True,
 ) -> Iterator[tuple[int, str, list[str]]]:
     if stop is not None and not _timestamp_valid(stop):
         raise ValueError("stop must be a canonical UTC timestamp")
@@ -125,16 +125,18 @@ def _fields(
             raise ValueError(f"line {number}: timestamps must increase")
         yield number, timestamp, fields
         previous = timestamp
-    if stop is not None and previous != stop:
+    if stop is not None and exact_stop and previous != stop:
         raise ValueError("stop timestamp is not present")
 
 
 def _records(
-    path: Path, stop: str | None = None
+    path: Path, stop: str | None = None, *, exact_stop: bool = True,
 ) -> Iterator[tuple[str, list[float]]]:
     if locale.setlocale(locale.LC_NUMERIC) != "C":
         raise ValueError("LC_NUMERIC must be C")
-    for number, timestamp, fields in _fields(path, stop):
+    for number, timestamp, fields in _fields(
+        path, stop, exact_stop=exact_stop,
+    ):
         values = [_number(field, number) for field in fields]
         if values[3] <= 0.0:
             raise ValueError(f"line {number}: close must be positive")
@@ -150,10 +152,12 @@ def read_csv(path: Path) -> array:
 
 
 def _bars(
-    path: Path, stop: str | None = None
+    path: Path, stop: str | None = None, *, exact_stop: bool = True,
 ) -> tuple[tuple[str, ...], array]:
     timestamps, rows = [], array("f")
-    for timestamp, values in _records(path, stop):
+    for timestamp, values in _records(
+        path, stop, exact_stop=exact_stop,
+    ):
         timestamps.append(timestamp)
         rows.extend(values)
     return tuple(timestamps), rows
@@ -169,6 +173,11 @@ def read_bars_through(path: Path, stop: str) -> tuple[tuple[str, ...], array]:
     return _bars(path, stop)
 
 
+def read_bars_until(path: Path, stop: str) -> tuple[tuple[str, ...], array]:
+    """Return bars at or before a cutoff that need not be observed."""
+    return _bars(path, stop, exact_stop=False)
+
+
 def read_timestamps(path: Path) -> tuple[str, ...]:
     """Return validated ordered timestamps without parsing OHLCV values."""
     return tuple(timestamp for _, timestamp, _ in _fields(path))
@@ -177,3 +186,12 @@ def read_timestamps(path: Path) -> tuple[str, ...]:
 def read_timestamps_through(path: Path, stop: str) -> tuple[str, ...]:
     """Return timestamps through stop without parsing OHLCV values."""
     return tuple(timestamp for _, timestamp, _ in _fields(path, stop))
+
+
+def read_timestamps_until(path: Path, stop: str) -> tuple[str, ...]:
+    """Return timestamps at or before a cutoff that need not be observed."""
+    return tuple(
+        timestamp for _, timestamp, _ in _fields(
+            path, stop, exact_stop=False,
+        )
+    )

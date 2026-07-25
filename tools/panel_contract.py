@@ -1187,7 +1187,7 @@ def _open_directory(path: Path) -> tuple[int, tuple[int, int]]:
     return descriptor, (metadata.st_dev, metadata.st_ino)
 
 
-def mkdir_nofollow(path: Path) -> None:
+def mkdir_nofollow(path: Path) -> tuple[int, int]:
     """Create one directory only through nonsymlink lexical parents."""
     try:
         with _open_parent(path) as (parent, name):
@@ -1201,6 +1201,7 @@ def mkdir_nofollow(path: Path) -> None:
     if stat.S_IFMT(metadata.st_mode) != stat.S_IFDIR or \
        _directory_identity(path) != identity:
         raise ValueError(f"created directory changed: {path}")
+    return identity
 
 
 def _regular_inputs(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 import hashlib
 import json
 import math
@@ -11,11 +12,15 @@ from types import MappingProxyType
 
 from tools.float32 import decode_f32le_base64, encode_f32le_base64
 from tools.panel_contract import (
-    FileBinding, _exact_json, _integer, _object, _sha256, _string,
+    RUN_ID, ExecutableBinding, FileBinding, SourceTree, TorchIdentity,
+    _argv, _exact_json, _integer, _object, _relative, _sha256, _string,
+    read_canonical_json,
 )
 from tools.universe_contract import fixed_update_budget, universe_roles
 from tools.universe_scaling_contract import (
-    EXPECTED_BUDGETS, FitJob, fit_provenance_id,
+    EXPECTED_BUDGETS, RUNNER_TORCH_PYTHON_FLAGS,
+    SOURCE_PATHS as SCALING_SOURCE_PATHS,
+    FitJob, fit_provenance_id,
 )
 
 HISTORY_LENGTHS = (17, 34, 68)
@@ -39,8 +44,10 @@ PHASE_RANGES = MappingProxyType({
 CONTROL_COHORT = 11
 TRAINING_COHORT = 44
 EVALUATION_RANKS = tuple(range(45, 56))
+SOURCE_OPPORTUNITIES = 5_505
 MAX_HISTORY = max(HISTORY_LENGTHS)
 BATCH_SIZE = 128
+PYTHON_FLAGS = RUNNER_TORCH_PYTHON_FLAGS
 SCALER_POLICY = "per-stock-common-68-training-prefix"
 EXPECTED_FITS_PER_PHASE = len(HISTORY_LENGTHS) * (
     1 + len(NEURAL_MODELS) * len(SEEDS)
@@ -49,6 +56,34 @@ EXPECTED_PREDICTIONS_PER_PHASE = (
     EXPECTED_FITS_PER_PHASE * len(EVALUATION_RANKS)
 )
 _SOURCE_BUDGETS = MappingProxyType(dict(EXPECTED_BUDGETS))
+CONTEXT_CONFIG = FileBinding(
+    "experiments/executable-h13-context.example.json",
+    "4224b532e0b3b3b16d9638be7b53b59003b9b04841ce45d1ca8e998afbd89a04",
+)
+SOURCE_EVIDENCE = MappingProxyType({
+    "attempt": FileBinding(
+        "experiments/h13-universe-scaling-20260724-01-attempt.json",
+        "6eae4413d2abc6409fac053ab30cd9753f4460227ac54adb79e4194d51db0750",
+    ),
+    "failure": FileBinding(
+        "experiments/h13-universe-scaling-20260724-01-outcome.json",
+        "8ff90ca089ac4e3e0836b8e76d436ff0748a547eaee21fe623e2846ab9f86db6",
+    ),
+    "fits": FileBinding(
+        "reports/h13-universe-scaling-20260724-01/fits.jsonl",
+        "a41fd3aac8807f7bab11455b0d632363f3b563a8ea691308ca3cac25e03a71c8",
+    ),
+})
+CONTEXT_SOURCE_PATHS = tuple(sorted({
+    *SCALING_SOURCE_PATHS,
+    "tools/arm_context_diagnostic.py",
+    "tools/context_diagnostic_contract.py",
+    "tools/context_diagnostic_inputs.py",
+    "tools/context_diagnostic_runtime.py",
+    "tools/finalize_context_diagnostic.py",
+    "tools/run_context_diagnostic.py",
+    "tools/universe_forward_runner.py",
+}))
 
 
 def _candidate(history: int) -> dict[str, object]:
@@ -353,6 +388,164 @@ def parse_context_phases(
     if tuple(item.phase for item in phases) != TARGET_PHASES:
         raise ValueError("context phase order changed")
     return phases
+
+
+def context_phase_value(
+    phase: ContextPhase, master: Sequence[str],
+) -> dict[str, object]:
+    """Serialize one validated phase without weakening its exact schema."""
+    return _phase_value(_validated_phase(phase, master))
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAttempt:
+    attempt_path: str
+    run_id: str
+    run_dir: str
+    implementation_commit: str
+    source: tuple[tuple[str, FileBinding], ...]
+    config: FileBinding
+    phases: tuple[ContextPhase, ...]
+    source_tree: SourceTree
+    primary_python: ExecutableBinding
+    torch_argv: tuple[str, ...]
+    torch_probe: TorchIdentity
+    environment: Mapping[str, str]
+
+    def source_binding(self, name: str) -> FileBinding:
+        """Return one required source-evidence binding by exact name."""
+        try:
+            return dict(self.source)[name]
+        except KeyError as error:
+            raise ValueError("context source evidence is missing") from error
+
+    @property
+    def master(self) -> tuple[str, ...]:
+        """Derive the ordered universe from the phase role partition."""
+        phase = self.phases[0]
+        return (
+            *(series for series, _ in phase.training_rows),
+            *(series for series, _, _ in phase.evaluation_rows),
+        )
+
+    @classmethod
+    def read(
+        cls, path: Path, logical_path: Path, repository_root: Path,
+    ) -> ContextAttempt:
+        """Parse one armed context attempt against its fixed closure."""
+        value = _object(
+            read_canonical_json(path),
+            {
+                "schema", "status", "attempt_path", "run_id", "run_dir",
+                "implementation_commit", "source", "config", "phases",
+                "source_tree", "primary_python", "torch_argv",
+                "torch_probe", "environment",
+            },
+            "context attempt",
+        )
+        if _integer(value["schema"], "context attempt schema") != 1 or \
+           value["status"] != "armed":
+            raise ValueError("context attempt must be schema 1 and armed")
+        attempt_path = _relative(
+            value["attempt_path"], "context attempt path",
+        )
+        if attempt_path != _relative(
+            logical_path.as_posix(), "logical context attempt path",
+        ):
+            raise ValueError("context attempt path changed")
+        run_id = _string(value["run_id"], "context run id")
+        run_dir = _relative(value["run_dir"], "context run directory")
+        if not RUN_ID.fullmatch(run_id) or (
+            attempt_path, run_dir
+        ) != (
+            f"experiments/{run_id}-attempt.json",
+            f"reports/{run_id}",
+        ):
+            raise ValueError("context attempt identity is invalid")
+        commit = _string(
+            value["implementation_commit"], "implementation commit",
+        )
+        if len(commit) != 40 or any(
+            byte not in "0123456789abcdef" for byte in commit
+        ):
+            raise ValueError("implementation commit is invalid")
+
+        raw_source = _object(
+            value["source"], set(SOURCE_EVIDENCE), "context source",
+        )
+        source = tuple(
+            (name, FileBinding.parse(raw_source[name], f"source.{name}"))
+            for name in SOURCE_EVIDENCE
+        )
+        if dict(source) != SOURCE_EVIDENCE:
+            raise ValueError("context source evidence changed")
+        config = FileBinding.parse(value["config"], "context config")
+        if config != CONTEXT_CONFIG:
+            raise ValueError("context config changed")
+
+        raw_phases = _items(
+            value["phases"], len(TARGET_PHASES), "context phases",
+        )
+        first = _object(
+            raw_phases[0],
+            {
+                "phase", "source_ranges", "training_rows", "evaluation_rows",
+                "training_grid_sha256", "evaluation_grid_sha256",
+                "scaler_inputs_sha256", "updates_per_checkpoint",
+                "prior_selections",
+            },
+            "context phases[0]",
+        )
+        master = tuple(
+            _string(
+                _object(row, fields, f"context master row {index}")[
+                    "series"
+                ],
+                f"context master row {index} series",
+            )
+            for fields, rows in (
+                ({"series", "count"}, _items(
+                    first["training_rows"], TRAINING_COHORT,
+                    "context training rows",
+                )),
+                ({"series", "count", "grid_sha256"}, _items(
+                    first["evaluation_rows"], len(EVALUATION_RANKS),
+                    "context evaluation rows",
+                )),
+            )
+            for index, row in enumerate(rows)
+        )
+        universe_roles(master)
+        phases = parse_context_phases(raw_phases, master)
+        source_tree = SourceTree.parse(
+            value["source_tree"], "context source tree",
+            CONTEXT_SOURCE_PATHS,
+        )
+        if source_tree.root != str(repository_root.resolve(strict=True)):
+            raise ValueError("context source root changed")
+        primary = ExecutableBinding.parse(
+            value["primary_python"], "context primary Python",
+        )
+        torch = TorchIdentity.parse(value["torch_probe"])
+        torch_argv = _argv(value["torch_argv"], "context Torch argv")
+        if torch_argv != (torch.python.path, *PYTHON_FLAGS):
+            raise ValueError("context Torch argv changed")
+        environment = _object(
+            value["environment"],
+            {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"},
+            "context environment",
+        )
+        expected_environment = {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": f"{run_dir}/.pycache",
+        }
+        if environment != expected_environment:
+            raise ValueError("context environment changed")
+        return cls(
+            attempt_path, run_id, run_dir, commit, source, config,
+            phases, source_tree, primary, torch_argv, torch,
+            MappingProxyType(dict(environment)),
+        )
 
 
 @dataclass(frozen=True, slots=True)

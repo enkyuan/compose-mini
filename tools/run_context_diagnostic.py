@@ -6,12 +6,16 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TextIO
 import json
 import os
+import sys
 
+from tools.arm_context_diagnostic import authenticate_context_attempt
 from tools.context_diagnostic_contract import (
-    TARGET_PHASES, ContextFit, ContextPhase, ContextPrediction,
+    TARGET_PHASES, ContextAttempt, ContextFit, ContextPhase,
+    ContextPrediction,
     ContextReceipt,
     context_family_sha256, context_fit_record, context_prediction_record,
     context_phase_sha256, context_provenance_id,
@@ -33,6 +37,10 @@ FitOne = Callable[[ContextFit], tuple[str, float, object]]
 PredictOne = Callable[[ContextPrediction, object], Sequence[float]]
 ReadTruth = Callable[[], Mapping[str, object]]
 Verify = Callable[[], None]
+Prepare = Callable[
+    [ContextAttempt, ContextPhase],
+    tuple[FitOne, PredictOne, ReadTruth],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,12 +82,50 @@ class RunClaim:
     attempt_binding: FileBinding
     attempt_identity: tuple[int, int]
     directory_identity: tuple[int, int]
-    started: set[str] = field(
+    _started: set[str] = field(
         default_factory=set, compare=False, repr=False,
     )
-    completed: dict[str, PhaseEvidence] = field(
+    _completed: dict[str, PhaseEvidence] = field(
         default_factory=dict, compare=False, repr=False,
     )
+
+    @property
+    def started(self) -> frozenset[str]:
+        """Expose phase starts without granting lifecycle mutation."""
+        return frozenset(self._started)
+
+    @property
+    def completed(self) -> Mapping[str, PhaseEvidence]:
+        """Expose completed evidence through a read-only live view."""
+        return MappingProxyType(self._completed)
+
+    @property
+    def armed(self) -> bool:
+        """Report the immutable module-owned execution mode."""
+        return _claim_mode(self)
+
+
+_CLAIMS: dict[int, tuple[RunClaim, bool]] = {}
+
+
+def _claim_mode(claim: RunClaim) -> bool:
+    try:
+        registered, armed = _CLAIMS[id(claim)]
+    except (KeyError, TypeError) as error:
+        raise ValueError("context run claim is not registered") from error
+    if registered is not claim:
+        raise ValueError("context run claim is not registered")
+    return armed
+
+
+def _registered(claim: object) -> bool:
+    if not isinstance(claim, RunClaim):
+        return False
+    try:
+        _claim_mode(claim)
+    except ValueError:
+        return False
+    return True
 
 
 def _logical(root: Path, path: Path, label: str) -> str:
@@ -135,9 +181,19 @@ def claim_run(root: Path, attempt: Path) -> RunClaim:
     try:
         with freeze_inputs((attempt,)) as frozen:
             binding = _binding(root, frozen[0])
-            mkdir_nofollow(run)
+            try:
+                ContextAttempt.read(
+                    frozen[0].snapshot, attempt.relative_to(root), root,
+                )
+            except ValueError:
+                armed = False
+            else:
+                armed = True
+            created_identity = mkdir_nofollow(run)
             directory, directory_identity = _open_directory(run)
             try:
+                if directory_identity != created_identity:
+                    raise ValueError("context run claim changed")
                 os.fsync(directory)
             finally:
                 os.close(directory)
@@ -149,10 +205,12 @@ def claim_run(root: Path, attempt: Path) -> RunClaim:
             verify_frozen(frozen)
     finally:
         os.close(parent)
-    return RunClaim(
+    claim = RunClaim(
         root, run, attempt, binding, identities[0][1],
         directory_identity,
     )
+    _CLAIMS[id(claim)] = (claim, armed)
+    return claim
 
 
 def _artifacts(
@@ -176,20 +234,23 @@ def _require_phase_prefix(
         raise ValueError("context phase order changed") from error
     completed = TARGET_PHASES[:index]
     begun = TARGET_PHASES[:index + int(started)]
-    if tuple(claim.completed) != completed or \
-       claim.started != set(begun):
+    if tuple(claim._completed) != completed or \
+       claim._started != set(begun) or any(
+           type(evidence) is not PhaseEvidence or evidence.phase != name
+           for name, evidence in claim._completed.items()
+       ):
         raise ValueError("context phase order changed")
 
 
 def _start(claim: RunClaim, phase: ContextPhase) -> PhaseArtifacts:
-    if not isinstance(claim, RunClaim) or \
+    if not _registered(claim) or \
        not isinstance(phase, ContextPhase) or \
        claim.path != _run_path(claim.root, claim.attempt) or \
        _directory_identity(claim.path) != claim.directory_identity:
         raise ValueError("context run claim is invalid")
     _verify_identities(((claim.attempt, claim.attempt_identity),))
     _require_phase_prefix(claim, phase, started=False)
-    claim.started.add(phase.phase)
+    claim._started.add(phase.phase)
     artifacts = _artifacts(claim.root, claim.attempt, phase)
     for path in artifacts:
         _absent(path, "context phase output")
@@ -306,17 +367,17 @@ def context_access_value(
     }
 
 
-def read_authorized_truth(
+def _authorized_truth_evidence(
     claim: RunClaim, master: Sequence[str], phase: ContextPhase,
     source_failure_sha256: str, config_sha256: str,
     source_tree_sha256: str, reader: ReadTruth,
-) -> Mapping[str, object]:
+) -> tuple[Mapping[str, object], PhaseEvidence]:
     """Consume one truth access and durably publish its phase evaluation."""
-    if not isinstance(claim, RunClaim) or \
+    if not _registered(claim) or \
        not isinstance(phase, ContextPhase) or \
        claim.path != _run_path(claim.root, claim.attempt) or \
        _directory_identity(claim.path) != claim.directory_identity or \
-       phase.phase in claim.completed:
+       phase.phase in claim._completed:
         raise ValueError("context run claim is invalid")
     _require_phase_prefix(claim, phase, started=True)
     root, attempt = claim.root, claim.attempt
@@ -445,8 +506,7 @@ def read_authorized_truth(
                         _binding(root, access_frozen[0]),
                         _binding(root, evaluation_frozen[0]),
                     )
-                    # Keep post-truth evidence live until outcome publication.
-                    claim.completed[phase.phase] = PhaseEvidence(
+                    completion = PhaseEvidence(
                         phase.phase, bindings,
                         tuple(
                             identity_by_path[path] for path in artifacts
@@ -457,6 +517,22 @@ def read_authorized_truth(
         except BaseException:
             restore_access()
             raise
+    return evaluation, completion
+
+
+def read_authorized_truth(
+    claim: RunClaim, master: Sequence[str], phase: ContextPhase,
+    source_failure_sha256: str, config_sha256: str,
+    source_tree_sha256: str, reader: ReadTruth,
+) -> Mapping[str, object]:
+    """Publish authorized truth and retain its live completion evidence."""
+    if not _registered(claim) or _claim_mode(claim):
+        raise ValueError("armed context truth requires authentication")
+    evaluation, evidence = _authorized_truth_evidence(
+        claim, master, phase, source_failure_sha256, config_sha256,
+        source_tree_sha256, reader,
+    )
+    claim._completed[phase.phase] = evidence
     return evaluation
 
 
@@ -464,7 +540,8 @@ def publish_context_outcome(
     claim: RunClaim, value: Mapping[str, object], verify: Verify,
 ) -> Path:
     """Atomically close one live run while its phase evidence is frozen."""
-    if not isinstance(claim, RunClaim) or not isinstance(value, Mapping) or \
+    if not _registered(claim) or \
+       not isinstance(value, Mapping) or \
        claim.path != _run_path(claim.root, claim.attempt) or \
        _directory_identity(claim.path) != claim.directory_identity:
         raise ValueError("context outcome claim is invalid")
@@ -475,14 +552,13 @@ def publish_context_outcome(
     return outcome
 
 
-def execute_phase(
+def _execute_started_phase(
+    artifacts: PhaseArtifacts,
     claim: RunClaim, master: Sequence[str], phase: ContextPhase,
     source_failure_sha256: str, config_sha256: str,
     source_tree_sha256: str, fit_one: FitOne,
-    predict_one: PredictOne, truth: ReadTruth,
-) -> Mapping[str, object]:
-    """Fit, predict, publish, and only then authorize one phase's truth."""
-    artifacts = _start(claim, phase)
+    predict_one: PredictOne, truth: ReadTruth, verify_inputs: Verify,
+) -> tuple[Mapping[str, object], PhaseEvidence]:
     root, attempt = claim.root, claim.attempt
     source = _sha256(source_failure_sha256, "source failure")
     config = _sha256(config_sha256, "context config")
@@ -494,6 +570,7 @@ def execute_phase(
             raise ValueError("context attempt changed after the run claim")
 
         def verify_attempt() -> None:
+            verify_inputs()
             if _directory_identity(claim.path) != claim.directory_identity:
                 raise ValueError("context run directory changed")
             _verify_identities(attempt_identities)
@@ -565,6 +642,132 @@ def execute_phase(
                 claim.directory_identity,
             )
             verify()
-    return read_authorized_truth(
+    return _authorized_truth_evidence(
         claim, master, phase, source, config, source_tree, truth,
     )
+
+
+def execute_phase(
+    claim: RunClaim, master: Sequence[str], phase: ContextPhase,
+    source_failure_sha256: str, config_sha256: str,
+    source_tree_sha256: str, fit_one: FitOne,
+    predict_one: PredictOne, truth: ReadTruth,
+) -> Mapping[str, object]:
+    """Fit, predict, publish, and only then authorize one phase's truth."""
+    if not _registered(claim) or _claim_mode(claim):
+        raise ValueError("armed context execution requires authentication")
+    evaluation, evidence = _execute_started_phase(
+        _start(claim, phase), claim, master, phase,
+        source_failure_sha256, config_sha256, source_tree_sha256,
+        fit_one, predict_one, truth, lambda: None,
+    )
+    claim._completed[phase.phase] = evidence
+    return evaluation
+
+
+def _validate_completed_prefix(
+    claim: RunClaim, attempt: ContextAttempt,
+) -> None:
+    """Require every skipped phase to have its complete live evidence."""
+    names = tuple(claim._completed)
+    if names != TARGET_PHASES[:len(names)] or \
+       len(names) > len(attempt.phases):
+        raise ValueError("armed context phase prefix changed")
+    provenance = (
+        attempt.source_binding("failure").sha256,
+        attempt.config.sha256,
+        attempt.source_tree.sha256,
+    )
+    for phase in attempt.phases[:len(names)]:
+        evidence = claim._completed[phase.phase]
+        artifacts = _artifacts(claim.root, claim.attempt, phase)
+        paths = tuple(artifacts)
+        if type(evidence) is not PhaseEvidence or \
+           evidence.phase != phase.phase or \
+           (
+               evidence.source_failure_sha256,
+               evidence.config_sha256,
+               evidence.source_tree_sha256,
+           ) != provenance or \
+           len(evidence.bindings) != len(paths) or \
+           len(evidence.identities) != len(paths):
+            raise ValueError("armed context phase evidence changed")
+        identities = _regular_inputs(paths)
+        if tuple(item for _, item in identities) != evidence.identities:
+            raise ValueError("armed context phase identity changed")
+        with freeze_inputs(paths) as frozen:
+            by_path = dict(zip(paths, frozen, strict=True))
+            bindings = tuple(
+                _binding(claim.root, by_path[path]) for path in paths
+            )
+            if bindings != evidence.bindings:
+                raise ValueError("armed context phase binding changed")
+            fits, predictions, receipt, access, evaluation = paths
+            parsed = ContextReceipt.parse(read_canonical_json(
+                by_path[receipt].snapshot,
+            ))
+            parsed.validate(
+                phase, claim.attempt_binding, bindings[0], bindings[1],
+                provenance[2], claim.directory_identity,
+            )
+            validate_context_ledgers(
+                attempt.master, phase, by_path[fits].snapshot,
+                by_path[predictions].snapshot,
+                provenance[0], provenance[1],
+            )
+            if not _exact_json(
+                read_canonical_json(by_path[access].snapshot),
+                context_access_value(
+                    claim.attempt_binding, bindings[2], phase,
+                ),
+            ) or not isinstance(
+                read_canonical_json(by_path[evaluation].snapshot),
+                Mapping,
+            ):
+                raise ValueError("armed context phase result changed")
+            _verify_identities(identities)
+            verify_frozen(frozen)
+
+
+def execute_armed_phase(
+    claim: RunClaim, prepare: Prepare,
+) -> Mapping[str, object]:
+    """Execute the next armed phase without caller-supplied provenance."""
+    if not _registered(claim) or not _claim_mode(claim) or \
+       not callable(prepare) or \
+       claim.root != claim.root.resolve(strict=True):
+        raise ValueError("armed context execution is invalid")
+    attempt_identity = ((claim.attempt, claim.attempt_identity),)
+    with freeze_inputs((claim.attempt,)) as frozen:
+        binding = _binding(claim.root, frozen[0])
+        if binding != claim.attempt_binding:
+            raise ValueError("armed context attempt changed")
+        logical = claim.attempt.relative_to(claim.root)
+        attempt = ContextAttempt.read(
+            frozen[0].snapshot, logical, claim.root,
+        )
+        _verify_identities(attempt_identity)
+        verify_frozen(frozen)
+    with authenticate_context_attempt(attempt) as verify:
+        if Path(sys.executable).resolve(strict=True) != Path(
+            attempt.torch_probe.python.path,
+        ).resolve(strict=True):
+            raise ValueError("context phase requires the bound Torch Python")
+        _validate_completed_prefix(claim, attempt)
+        index = len(claim._completed)
+        if index >= len(attempt.phases):
+            raise ValueError("armed context phases are complete")
+        phase = attempt.phases[index]
+        artifacts = _start(claim, phase)
+        callbacks = prepare(attempt, phase)
+        if not isinstance(callbacks, tuple) or len(callbacks) != 3 or \
+           any(not callable(callback) for callback in callbacks):
+            raise ValueError("armed context preparation is invalid")
+        evaluation, evidence = _execute_started_phase(
+            artifacts, claim, attempt.master, phase,
+            attempt.source_binding("failure").sha256,
+            attempt.config.sha256, attempt.source_tree.sha256,
+            *callbacks, verify,
+        )
+    claim._completed[phase.phase] = evidence
+    return evaluation
