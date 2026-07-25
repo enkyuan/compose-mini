@@ -199,6 +199,11 @@ The environment is exactly:
 ```
 
 No inherited `MASSIVE_API_KEY` is part of the child environment.
+The runner authenticates its adjacent `tools` package and exact CPython
+launch before repository imports. Primary stages use `-I -S -B`; calibration
+also uses `-I -S -B`, then exposes only the attested Torch package parent
+after the executable, package tree, and source closure validate, replacing the
+repository import root before Torch loads.
 
 - [ ] **Step 4: Implement immutable arming and preflight**
 
@@ -399,9 +404,10 @@ local_id = (phase, series, seed)
 
 Question and view never enter a fit identity; mode enters only neural pooled
 fits. The fixed-epoch sampler makes `sum(len(member.train))` stock-uniform
-draws with replacement per epoch and retains patience stopping. Label it as a
-secondary cohort-sized-draw data-plus-compute curve, not a literal pass over
-every row.
+draws per epoch and retains patience stopping: equal-length members use the
+shuffled without-replacement fast path; unequal lengths use weighted
+replacement. Label it as a secondary cohort-sized-draw data-plus-compute
+curve, not a literal pass over every row.
 
 - [ ] **Step 3: Emit canonical ledgers**
 
@@ -438,8 +444,10 @@ binary32 returns. Zero is synthesized by analysis and emits no ledger rows.
 
 Mirror the tested process-group termination and signal handling from
 `run_panel_attempt.py`. Execute bound stages with only the attempt's exact
-environment; finalize once on success and every catchable failure. Never resume
-or reuse an interrupted run directory.
+child environment; finalize once on success and every catchable failure.
+Signals received during finalization are deferred until that one finalizer
+returns, then reflected in the controller exit. Never resume or reuse an
+interrupted run directory.
 
 - [ ] **Step 5: Run checks and checkpoint**
 

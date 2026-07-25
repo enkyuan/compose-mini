@@ -13,11 +13,13 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,10 +29,13 @@ sys.path.insert(0, str(ROOT))
 from tools.universe_scaling_contract import (
     CALENDAR_SHA256, CONFIG_SHA256, CSV_ROOT, EXPECTED_BUDGETS,
     EXPECTED_FIT_COUNT, EXPECTED_MISSING, EXPECTED_PREDICTION_RECORDS,
-    FETCH_PATH, FETCH_SHA256, FINALIZER_PYTHON_FLAGS,
+    EXPECTED_PREDICTION_VALUES, FETCH_PATH, FETCH_SHA256,
+    FINALIZER_PYTHON_FLAGS,
     FINALIZER_SOURCE_PATHS, FIXED_EPOCH_BUDGET, MANIFEST_BINDINGS, PHASES,
-    SEEDS, SELECTION_FILES, SELECTION_SHA256, SOURCE_PATHS, FitJob,
-    PhaseCoverage, ScalingAttempt, ScalingCoverage, SeriesCoverage,
+    MODES, POOLED_MODELS, RUNNER_PRIMARY_PYTHON_FLAGS,
+    RUNNER_TORCH_PYTHON_FLAGS, SEEDS, SELECTION_FILES, SELECTION_SHA256,
+    SOURCE_PATHS, TRAINING_COHORTS, FitJob, PhaseCoverage, ScalingAttempt,
+    ScalingCoverage, SeriesCoverage,
     expected_fit_jobs, expected_protocol, expected_scaling_commands,
     question_uses, required_prediction_series, timestamp_grid_sha256,
 )
@@ -48,6 +53,7 @@ from tools.universe_scaling import ForecastPoint, paired_comparison
 from tools.universe_contract import PackedRows
 from tools.session_samples import SampleRows, SessionSamples
 import tools.files as file_tools
+import tools.run_universe_scaling as runner
 
 
 def sha256(index: int) -> str:
@@ -306,7 +312,14 @@ def verify_attempt() -> None:
         )
         assert protocol["finalizer_python_flags"] == \
             list(FINALIZER_PYTHON_FLAGS) == ["-I", "-S", "-B"]
+        assert protocol["runner_primary_python_flags"] == \
+            list(RUNNER_PRIMARY_PYTHON_FLAGS) == ["-I", "-S", "-B"]
+        assert protocol["runner_torch_python_flags"] == \
+            list(RUNNER_TORCH_PYTHON_FLAGS) == ["-I", "-S", "-B"]
         assert finalizer._BOOTSTRAP_PYTHON_FLAGS == FINALIZER_PYTHON_FLAGS
+        assert runner._BOOTSTRAP_PRIMARY_FLAGS == \
+            RUNNER_PRIMARY_PYTHON_FLAGS
+        assert runner._BOOTSTRAP_TORCH_FLAGS == RUNNER_TORCH_PYTHON_FLAGS
         protocol["models"].clear()
         assert expected_protocol()["models"]
         assert "tools/__init__.py" in SOURCE_PATHS
@@ -334,6 +347,18 @@ def verify_attempt() -> None:
             ("budget", lambda item: item[
                 "budgets"
             ][0].update(total_updates=27_401)),
+            ("missing identities", lambda item: (
+                item["coverage"][0]["series"][14].update(
+                    validation_rows=1,
+                    timestamp_sha256=item["coverage"][0][
+                        "series"
+                    ][15]["timestamp_sha256"],
+                ),
+                item["coverage"][0]["series"][15].update(
+                    validation_rows=0,
+                    timestamp_sha256=timestamp_grid_sha256(()),
+                ),
+            )),
             ("manifest order", lambda item: item["manifests"].reverse()),
             ("manifest hash", lambda item: item[
                 "manifests"
@@ -524,6 +549,65 @@ def verify_isolated_startup() -> None:
         optimized = run(repository, *FINALIZER_PYTHON_FLAGS, "-O")
         assert optimized.returncode != 0
         assert "launch" in optimized.stderr.lower()
+
+        runner_script = repository / "tools/run_universe_scaling.py"
+
+        def run_runner(
+            *flags: str, arguments: tuple[str, ...] = ("--help",),
+        ) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                (sys.executable, *flags, str(runner_script), *arguments),
+                cwd=repository, env=environment,
+                capture_output=True, text=True, check=False,
+            )
+
+        unisolated_runner = run_runner()
+        assert unisolated_runner.returncode != 0
+        assert "isolated" in unisolated_runner.stderr.lower()
+        isolated_runner = run_runner(*RUNNER_PRIMARY_PYTHON_FLAGS)
+        assert isolated_runner.returncode == 0, isolated_runner.stderr
+        assert "usage:" in isolated_runner.stdout
+        optimized_runner = run_runner(
+            *RUNNER_PRIMARY_PYTHON_FLAGS, "-O",
+        )
+        assert optimized_runner.returncode != 0
+        assert "launch" in optimized_runner.stderr.lower()
+        torch_runner = run_runner(
+            *RUNNER_TORCH_PYTHON_FLAGS,
+            arguments=("calibrate", "missing-attempt.json"),
+        )
+        assert torch_runner.returncode == 2
+        assert "launch" not in torch_runner.stderr.lower()
+
+        runner_runpy = (
+            "import runpy,sys;"
+            f"sys.argv=[{str(runner_script)!r},'--help'];"
+            f"runpy.run_path({str(runner_script)!r},run_name='__main__')"
+        )
+        rejected_runner = subprocess.run(
+            (
+                sys.executable, *RUNNER_PRIMARY_PYTHON_FLAGS,
+                "-c", runner_runpy,
+            ),
+            cwd=repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert rejected_runner.returncode != 0
+        assert "launch" in rejected_runner.stderr.lower()
+        preloaded_runner = subprocess.run(
+            (
+                sys.executable, *RUNNER_PRIMARY_PYTHON_FLAGS, "-c",
+                "import ctypes,runpy,sys;"
+                f"sys.argv=[{str(runner_script)!r},'--help'];"
+                f"runpy.run_path({str(runner_script)!r},"
+                "run_name='__main__')",
+            ),
+            cwd=repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        assert preloaded_runner.returncode != 0
+        assert "inspection" in preloaded_runner.stderr.lower()
+
         after = tuple(sorted(
             path.relative_to(repository)
             for path in repository.rglob("*")
@@ -703,6 +787,18 @@ def verify_isolated_startup() -> None:
             encoding="ascii",
         )
         rejected = run(package_repository, *FINALIZER_PYTHON_FLAGS)
+        assert rejected.returncode != 0
+        assert "namespace" in rejected.stderr.lower()
+        assert not marker.exists()
+        package_runner = package_repository / "tools/run_universe_scaling.py"
+        rejected = subprocess.run(
+            (
+                sys.executable, *RUNNER_PRIMARY_PYTHON_FLAGS,
+                str(package_runner), "--help",
+            ),
+            cwd=package_repository, env=environment,
+            capture_output=True, text=True, check=False,
+        )
         assert rejected.returncode != 0
         assert "namespace" in rejected.stderr.lower()
         assert not marker.exists()
@@ -1039,6 +1135,730 @@ def verify_fit_schedule() -> None:
         raise AssertionError("invalid physical fit schedule was accepted")
 
 
+def verify_runner_boundaries() -> None:
+    assert "torch" not in sys.modules
+    names = synthetic_master()
+    coverage = synthetic_coverage(names)
+    evaluable = {
+        phase.phase: phase.evaluable for phase in coverage.phases
+    }
+    counts = runner.preflight_counts(coverage)
+    assert counts.phases == (53, 52, 51)
+    assert counts.fits == EXPECTED_FIT_COUNT
+    assert counts.prediction_records == EXPECTED_PREDICTION_RECORDS
+    assert counts.prediction_values == EXPECTED_PREDICTION_RECORDS
+    assert runner.EXPECTED_PREFLIGHT_COUNTS.prediction_values == \
+        EXPECTED_PREDICTION_VALUES
+
+    phases = list(coverage.phases)
+    series = list(phases[0].series)
+    target = series[0]
+    extra_rows = 6
+    series[0] = SeriesCoverage(
+        target.series, target.train_rows,
+        target.validation_rows + extra_rows, target.timestamp_sha256,
+    )
+    phases[0] = PhaseCoverage(phases[0].phase, tuple(series))
+    changed = runner.preflight_counts(ScalingCoverage(tuple(phases)))
+    predictions_per_core_series = (
+        len(MODES) * len(SEEDS) * len(TRAINING_COHORTS) *
+        (len(POOLED_MODELS) + 1) +
+        len(TRAINING_COHORTS) + len(SEEDS)
+    )
+    assert predictions_per_core_series == 129
+    assert changed.prediction_records == counts.prediction_records
+    assert changed.prediction_values - counts.prediction_values == \
+        extra_rows * predictions_per_core_series
+    assert tuple(
+        job.phase for job in runner.phase_jobs(
+            expected_fit_jobs(names, evaluable), "fold-1",
+        )
+    ) == ("fold-1",) * 405
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-spools-",
+    ) as directory_name:
+        directory = Path(directory_name).resolve()
+        spools = {
+            phase: directory / f"{phase}.jsonl"
+            for phase in ("fold-0", "fold-1")
+        }
+        spools["fold-0"].write_text(
+            '{"index": 0}\n{"index": 2}\n', encoding="ascii",
+        )
+        spools["fold-1"].write_text(
+            '{"index": 1}\n', encoding="ascii",
+        )
+        output = directory / "ordered.jsonl"
+        runner.merge_spools(
+            ("fold-0", "fold-1", "fold-0"), spools, output,
+        )
+        assert output.read_text(encoding="ascii") == (
+            '{"index": 0}\n{"index": 1}\n{"index": 2}\n'
+        )
+        spools["fold-1"].write_text(
+            '{"index": 1}\n{"index": 3}\n', encoding="ascii",
+        )
+        try:
+            runner.merge_spools(
+                ("fold-0", "fold-1", "fold-0"), spools,
+                directory / "extra.jsonl",
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("extra phase spool record was accepted")
+
+        source = directory / "publish-source"
+        target = directory / "publish-target"
+        source.write_text("complete\n", encoding="ascii")
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            runner._publish_complete(
+                directory_fd, source.name, directory_fd, target.name,
+            )
+        finally:
+            os.close(directory_fd)
+        assert not source.exists()
+        assert target.read_text(encoding="ascii") == "complete\n"
+
+    orchestrator = SimpleNamespace(
+        attempt_path="experiments/exact-attempt.json",
+        commands={"validate": ("tools/run_universe_scaling.py", "validate",
+                               "experiments/exact-attempt.json")},
+        primary_python=SimpleNamespace(
+            path=sys.executable, validate_live=lambda _: None,
+        ),
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            sys, "argv",
+            ["tools/run_universe_scaling.py",
+             "experiments/exact-attempt.json"],
+        ))
+        stack.enter_context(patch.object(
+            runner, "_require_isolated_execution",
+        ))
+        stack.enter_context(patch.object(runner, "_require_exact_launch"))
+        stack.enter_context(patch.object(runner, "_validate_environment"))
+        stack.enter_context(patch.object(runner, "_validate_source"))
+        stack.enter_context(patch.object(runner, "_validate_stage_paths"))
+        runner._validate_orchestrator(orchestrator)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            sys, "argv", ["tools/run_universe_scaling.py", "other.json"],
+        ))
+        stack.enter_context(patch.object(
+            runner, "_require_isolated_execution",
+        ))
+        stack.enter_context(patch.object(runner, "_require_exact_launch"))
+        stack.enter_context(patch.object(runner, "_validate_source"))
+        stack.enter_context(patch.object(runner, "_validate_stage_paths"))
+        try:
+            runner._validate_orchestrator(orchestrator)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("wrong orchestrator argv was accepted")
+
+    stage_attempt = SimpleNamespace(
+        commands={
+            "calibrate": (
+                "tools/run_universe_scaling.py", "calibrate", "attempt.json",
+            ),
+        },
+        torch_probe=SimpleNamespace(
+            package_tree=SimpleNamespace(root="/attested/torch"),
+        ),
+    )
+    order = []
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            sys, "argv", list(stage_attempt.commands["calibrate"]),
+        ))
+        stack.enter_context(patch.object(
+            runner, "_require_isolated_execution",
+            side_effect=lambda **_: order.append("isolated"),
+        ))
+        stack.enter_context(patch.object(
+            runner, "_require_exact_launch",
+            side_effect=lambda: order.append("launch"),
+        ))
+        for name, label in (
+            ("_validate_environment", "environment"),
+            ("_validate_runtime", "runtime"),
+            ("_validate_source", "source"),
+            ("_expose_torch_package", "expose"),
+            ("_validate_stage_paths", "paths"),
+        ):
+            stack.enter_context(patch.object(
+                runner, name,
+                side_effect=lambda *_, label=label:
+                order.append(label),
+            ))
+        runner._validate_stage(stage_attempt, "calibrate")
+    assert order == [
+        "isolated", "launch", "environment",
+        "runtime", "source", "expose", "paths",
+    ]
+
+    environment = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPYCACHEPREFIX": "reports/mock/.pycache",
+    }
+    with patch.dict(runner.os.environ, environment, clear=True):
+        runner._validate_environment(SimpleNamespace(environment=environment))
+        try:
+            runner._validate_environment(SimpleNamespace(environment={}))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("ambient runner environment was accepted")
+    with patch.dict(
+        runner.os.environ,
+        environment | {
+            "LC_CTYPE": "UTF-8",
+            "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
+        },
+        clear=True,
+    ):
+        runner._validate_environment(SimpleNamespace(environment=environment))
+    with patch.dict(
+        runner.os.environ, environment | {"MASSIVE_API_KEY": "secret"},
+        clear=True,
+    ):
+        try:
+            runner._validate_environment(
+                SimpleNamespace(environment=environment),
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("ambient secret reached the runner")
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-attested-torch-",
+    ) as directory_name:
+        directory = Path(directory_name)
+        repository = directory / "repository"
+        standard_library = directory / "stdlib"
+        package = directory / "site-packages/torch"
+        repository.mkdir()
+        standard_library.mkdir()
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "ORIGIN = 'attested'\n", encoding="ascii",
+        )
+        parent = str(package.parent.resolve())
+        package_tree = SimpleNamespace(root=str(package.resolve()))
+        for shadow in ("module", "package"):
+            shadow_root = repository / shadow
+            shadow_root.mkdir()
+            marker = shadow_root / "shadow-ran"
+            if shadow == "module":
+                target = shadow_root / "torch.py"
+            else:
+                target = shadow_root / "torch/__init__.py"
+                target.parent.mkdir()
+            target.write_text(
+                f"open({str(marker)!r}, 'w').write('ran')\n",
+                encoding="ascii",
+            )
+            paths = [str(standard_library), str(shadow_root)]
+            exposures = []
+            runtime = SimpleNamespace(
+                primary_python=SimpleNamespace(
+                    path=sys.executable, validate_live=lambda _: None,
+                ),
+                torch_probe=SimpleNamespace(
+                    python=SimpleNamespace(
+                        path=sys.executable,
+                        validate_live=lambda _:
+                        exposures.append(parent in sys.path),
+                    ),
+                    package_tree=package_tree,
+                ),
+            )
+
+            def attest(path: Path) -> object:
+                assert path == package.resolve()
+                assert parent not in sys.path
+                return package_tree
+
+            with patch.object(
+                runner, "ROOT", shadow_root,
+            ), patch.object(
+                sys, "path", paths,
+            ), patch.object(
+                runner, "source_tree", side_effect=attest,
+            ):
+                runner._validate_runtime(runtime, "calibrate")
+                runner._expose_torch_package(package)
+                assert sys.path == [
+                    str(standard_library), parent,
+                ]
+                imported = __import__("torch")
+                assert imported.ORIGIN == "attested"
+                assert Path(imported.__file__).resolve().parent == \
+                    package.resolve()
+                sys.modules.pop("torch")
+            assert exposures == [False]
+            assert not marker.exists()
+
+        paths = [str(standard_library), str(repository)]
+        runtime.torch_probe.python.validate_live = lambda _: None
+        with patch.object(
+            runner, "ROOT", repository,
+        ), patch.object(
+            sys, "path", paths,
+        ), patch.object(
+            runner, "source_tree", return_value=object(),
+        ):
+            try:
+                runner._validate_runtime(runtime, "calibrate")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("changed Torch tree was accepted")
+            assert parent not in sys.path
+
+        (standard_library / "torch.py").write_text(
+            "raise AssertionError('competing torch resolved')\n",
+            encoding="ascii",
+        )
+        with patch.object(
+            runner, "ROOT", repository,
+        ), patch.object(
+            sys, "path", paths,
+        ), patch.object(
+            runner, "source_tree", return_value=package_tree,
+        ):
+            try:
+                runner._validate_runtime(runtime, "calibrate")
+                runner._expose_torch_package(package)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("competing Torch resolver was accepted")
+            assert parent not in sys.path
+
+        paths.insert(1, parent)
+        with patch.object(
+            runner, "ROOT", repository,
+        ), patch.object(
+            sys, "path", paths,
+        ), patch.object(
+            runner, "source_tree", return_value=package_tree,
+        ):
+            try:
+                runner._validate_runtime(runtime, "calibrate")
+                runner._expose_torch_package(package)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("pre-exposed Torch path was accepted")
+
+        sys.modules["torch.injected"] = object()
+        try:
+            with patch.object(
+                runner, "ROOT", repository,
+            ), patch.object(
+                sys, "path", [str(standard_library), str(repository)],
+            ), patch.object(
+                runner, "source_tree", return_value=package_tree,
+            ):
+                try:
+                    runner._validate_runtime(runtime, "calibrate")
+                    runner._expose_torch_package(package)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("preloaded Torch was accepted")
+        finally:
+            sys.modules.pop("torch.injected")
+
+    child = SimpleNamespace(wait=lambda timeout=None: 0)
+    with patch.dict(
+        runner.os.environ, {"MASSIVE_API_KEY": "secret"}, clear=True,
+    ), patch.object(
+        runner.subprocess, "Popen", return_value=child,
+    ) as spawned:
+        assert runner._run(("child",), environment) == 0
+    assert spawned.call_args.kwargs["env"] == environment
+
+    class Process:
+        pid = 41
+
+        def __init__(self, timeout: bool) -> None:
+            self.timeout = timeout
+            self.waits = 0
+
+        def wait(self, timeout: int | None = None) -> None:
+            self.waits += 1
+            if self.timeout and timeout == 2 and self.waits == 1:
+                raise subprocess.TimeoutExpired("runner", timeout)
+
+    def leader_only(_pid: int, signum: int) -> None:
+        if signum == 0:
+            raise ProcessLookupError
+
+    process = Process(False)
+    with patch.object(
+        runner.os, "killpg", side_effect=leader_only,
+    ) as killed:
+        runner._terminate(process)
+    assert [call.args for call in killed.call_args_list] == [
+        (41, signal.SIGTERM), (41, 0),
+    ]
+    assert process.waits == 1
+
+    process = Process(False)
+    with patch.object(runner.os, "killpg") as killed:
+        runner._terminate(process)
+    assert [call.args for call in killed.call_args_list] == [
+        (41, signal.SIGTERM), (41, 0), (41, signal.SIGKILL),
+    ]
+    assert process.waits == 1
+
+    process = Process(True)
+    with patch.object(runner.os, "killpg") as killed:
+        runner._terminate(process)
+    assert [call.args for call in killed.call_args_list] == [
+        (41, signal.SIGTERM), (41, 0), (41, signal.SIGKILL),
+    ]
+    assert process.waits == 2
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-process-group-",
+    ) as directory_name:
+        heartbeat = Path(directory_name) / "heartbeat"
+        descendant = (
+            "from pathlib import Path\n"
+            "import signal,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"path=Path({str(heartbeat)!r})\n"
+            "path.write_text(str(time.monotonic_ns()))\n"
+            "print('ready', flush=True)\n"
+            "while True:\n"
+            " path.write_text(str(time.monotonic_ns()))\n"
+            " time.sleep(0.01)\n"
+        )
+        leader = (
+            "import signal,subprocess,sys\n"
+            "def stop(*_): raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            f"child=subprocess.Popen([sys.executable,'-c',{descendant!r}],"
+            "stdout=subprocess.PIPE,text=True)\n"
+            "assert child.stdout.readline().strip() == 'ready'\n"
+            "print(child.pid, flush=True)\n"
+            "signal.pause()\n"
+        )
+        process = subprocess.Popen(
+            (sys.executable, "-c", leader),
+            stdout=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        assert process.stdout is not None
+        process.stdout.readline()
+        try:
+            runner._terminate(process)
+            time.sleep(0.05)
+            first = heartbeat.read_text()
+            time.sleep(0.05)
+            assert heartbeat.read_text() == first, \
+                "TERM-ignoring descendant survived"
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    attempt = SimpleNamespace(
+        commands={
+            stage: ("tools/run_universe_scaling.py", stage, "attempt.json")
+            for stage in ("validate", "preflight", "calibrate", "analyze")
+        } | {
+            "finalizer_prefix": (
+                "tools/finalize_universe_scaling.py",
+                "attempt.json", "outcome.json",
+            ),
+        },
+        environment=environment,
+        outputs={"outcome": "outcome.json"},
+        primary_python=SimpleNamespace(path="/bound/primary"),
+        protocol={
+            "finalizer_python_flags": FINALIZER_PYTHON_FLAGS,
+            "runner_primary_python_flags": RUNNER_PRIMARY_PYTHON_FLAGS,
+            "runner_torch_python_flags": RUNNER_TORCH_PYTHON_FLAGS,
+        },
+        run_dir="reports/mock",
+        torch_argv=("/bound/torch",),
+    )
+
+    def controller_case(
+        exits: Mapping[str, int] = {},
+        errors: tuple[str, ...] = (),
+        setup_error: bool = False,
+        mask_after_analysis: bool = False,
+        signal_stage: str | None = None,
+    ) -> tuple[int, list[tuple[object, ...]], object, list[object]]:
+        commands: list[tuple[object, ...]] = []
+        finalizers: list[tuple[object, ...]] = []
+        handlers: dict[int, object] = {}
+        signal_changes: list[object] = []
+        analysis_finished = failed_mask = False
+
+        def command_stage(command: object) -> str:
+            values = tuple(command)
+            if attempt.commands["finalizer_prefix"][0] in values:
+                return "finalizer"
+            return next(
+                name for name in (
+                    "validate", "preflight", "calibrate", "analyze",
+                ) if name in values
+            )
+
+        def run(command: object, child_environment: object) -> int:
+            nonlocal analysis_finished
+            values = tuple(command)
+            commands.append(values)
+            assert dict(child_environment) == environment
+            stage = command_stage(values)
+            if stage == "finalizer":
+                finalizers.append(values)
+            if signal_stage == stage:
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+            if stage in errors:
+                raise RuntimeError(f"{stage} failed")
+            if stage == "analyze":
+                analysis_finished = True
+            return exits.get(stage, 0)
+
+        def set_handler(signum: int, handler: object) -> None:
+            handlers[signum] = handler
+            signal_changes.append(handler)
+
+        def mask(how: int, _signals: object) -> set[int]:
+            nonlocal failed_mask
+            if mask_after_analysis and analysis_finished and \
+                    how == signal.SIG_BLOCK and not failed_mask:
+                failed_mask = True
+                raise OSError("post-analysis mask failed")
+            return set()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                runner, "read_attempt", return_value=attempt,
+            ))
+            stack.enter_context(patch.object(
+                runner, "_validate_orchestrator",
+            ))
+            mkdir = stack.enter_context(patch.object(
+                runner, "mkdir_nofollow",
+                side_effect=OSError("setup failed") if setup_error else None,
+            ))
+            stack.enter_context(patch.object(
+                runner, "_run", side_effect=run,
+            ))
+            stack.enter_context(patch.object(
+                runner, "_utc_now",
+                side_effect=("2026-07-24T00:00:00Z",
+                             "2026-07-24T00:01:00Z"),
+            ))
+            stack.enter_context(patch.object(
+                runner.signal, "getsignal",
+                side_effect=lambda signum: f"original-{signum}",
+            ))
+            stack.enter_context(patch.object(
+                runner.signal, "signal", side_effect=set_handler,
+            ))
+            stack.enter_context(patch.object(
+                runner.signal, "pthread_sigmask", side_effect=mask,
+            ))
+            stack.enter_context(patch.object(
+                runner.signal, "sigpending", return_value=set(),
+            ))
+            result = runner.execute(Path("attempt.json"))
+        assert len(finalizers) == 1
+        assert all(handler != signal.SIG_IGN for handler in signal_changes)
+        return result, finalizers, mkdir, commands
+
+    result, finalizers, mkdir, commands = controller_case(
+        {"analyze": 3},
+    )
+    assert result == 3
+    mkdir.assert_called_once_with(ROOT / "reports/mock")
+    assert tuple(commands[:-1]) == (
+        (
+            "/bound/primary", *RUNNER_PRIMARY_PYTHON_FLAGS,
+            *attempt.commands["validate"],
+        ),
+        (
+            "/bound/primary", *RUNNER_PRIMARY_PYTHON_FLAGS,
+            *attempt.commands["preflight"],
+        ),
+        (
+            "/bound/torch", *RUNNER_TORCH_PYTHON_FLAGS,
+            *attempt.commands["calibrate"],
+        ),
+        (
+            "/bound/primary", *RUNNER_PRIMARY_PYTHON_FLAGS,
+            *attempt.commands["analyze"],
+        ),
+    )
+    assert finalizers[0][-6:] == (
+        "--stage", "analysis", "--exit", "3",
+        "--status", "gate-failure",
+    )
+
+    cases = (
+        ({}, (), True, 1, "setup", 1, "setup-failure"),
+        ({"preflight": 1}, (), False, 1, "preflight", 1,
+         "preflight-failure"),
+        ({"calibrate": 4}, (), False, 4, "experiment", 4,
+         "experiment-failure"),
+        ({"analyze": 2}, (), False, 2, "analysis", 2,
+         "analysis-integrity-failure"),
+        ({}, ("analyze",), False, 2, "analysis", 2,
+         "analysis-integrity-failure"),
+        ({"finalizer": 5}, (), False, 5, "analysis", 0, "pass"),
+        ({}, ("finalizer",), False, 2, "analysis", 0, "pass"),
+    )
+    for (
+        exits, errors, setup_error, expected, stage, terminal, status,
+    ) in cases:
+        result, finalizers, _, _ = controller_case(
+            exits, errors, setup_error,
+        )
+        assert result == expected
+        assert finalizers[0][-6:] == (
+            "--stage", stage, "--exit", str(terminal),
+            "--status", status,
+        )
+
+    for analysis_exit in (0, 3):
+        result, finalizers, _, _ = controller_case(
+            {"analyze": analysis_exit}, mask_after_analysis=True,
+        )
+        assert result == 2
+        assert finalizers[0][-6:] == (
+            "--stage", "analysis", "--exit", "2",
+            "--status", "analysis-integrity-failure",
+        )
+
+    result, finalizers, _, _ = controller_case(
+        signal_stage="finalizer",
+    )
+    assert result == 128 + signal.SIGTERM
+    assert finalizers[0][-6:] == (
+        "--stage", "analysis", "--exit", "0", "--status", "pass",
+    )
+    result, finalizers, _, _ = controller_case(
+        signal_stage="validate",
+    )
+    assert result == 128 + signal.SIGTERM
+    assert finalizers[0][-6:] == (
+        "--stage", "preflight", "--exit", str(128 + signal.SIGTERM),
+        "--status", "preflight-failure",
+    )
+
+
+def verify_finalizer_signal_subprocess() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-finalizer-signal-",
+    ) as directory_name:
+        directory = Path(directory_name).resolve()
+        started = directory / "started"
+        release = directory / "release"
+        completed = directory / "completed"
+        log = directory / "stages.log"
+        stage_script = directory / "stage.py"
+        stage_script.write_text(
+            "from pathlib import Path\n"
+            "import sys,time\n"
+            "stage=sys.argv[1]\n"
+            f"log=Path({str(log)!r})\n"
+            "with log.open('a') as file: file.write(stage+'\\n')\n"
+            "if stage == 'finalizer':\n"
+            f" Path({str(started)!r}).open('x').write('started')\n"
+            f" release=Path({str(release)!r})\n"
+            " deadline=time.monotonic()+5\n"
+            " while not release.exists():\n"
+            "  if time.monotonic()>=deadline: raise SystemExit(2)\n"
+            "  time.sleep(0.01)\n"
+            f" Path({str(completed)!r}).open('x').write('completed')\n",
+            encoding="ascii",
+        )
+        commands = {
+            stage: (str(stage_script), stage)
+            for stage in ("validate", "preflight", "calibrate", "analyze")
+        } | {"finalizer_prefix": (str(stage_script), "finalizer")}
+        (directory / "reports").mkdir()
+        script = (
+            "from contextlib import ExitStack\n"
+            "from pathlib import Path\n"
+            "from types import SimpleNamespace\n"
+            "from unittest.mock import patch\n"
+            "import sys\n"
+            f"sys.path.insert(0,{str(ROOT)!r})\n"
+            "import tools.run_universe_scaling as runner\n"
+            f"commands={commands!r}\n"
+            "attempt=SimpleNamespace("
+            "commands=commands,environment={},run_dir='reports/mock',"
+            "primary_python=SimpleNamespace(path=sys.executable),"
+            f"protocol={{'finalizer_python_flags':"
+            f"{FINALIZER_PYTHON_FLAGS!r},"
+            f"'runner_primary_python_flags':"
+            f"{RUNNER_PRIMARY_PYTHON_FLAGS!r},"
+            f"'runner_torch_python_flags':"
+            f"{RUNNER_TORCH_PYTHON_FLAGS!r}}},"
+            "torch_argv=(sys.executable,))\n"
+            "with ExitStack() as stack:\n"
+            f" stack.enter_context(patch.object(runner,'ROOT',"
+            f"Path({str(directory)!r})))\n"
+            " stack.enter_context(patch.object("
+            "runner,'read_attempt',return_value=attempt))\n"
+            " stack.enter_context(patch.object("
+            "runner,'_validate_orchestrator'))\n"
+            " code=runner.execute(Path('attempt.json'))\n"
+            "raise SystemExit(code)\n"
+        )
+        process = subprocess.Popen(
+            (sys.executable, "-c", script),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not started.exists():
+                if process.poll() is not None:
+                    output, error = process.communicate()
+                    raise AssertionError((process.returncode, output, error))
+                if time.monotonic() >= deadline:
+                    raise AssertionError("finalizer did not start")
+                time.sleep(0.01)
+            os.kill(process.pid, signal.SIGTERM)
+            time.sleep(0.05)
+            release.write_text("release", encoding="ascii")
+            output, error = process.communicate(timeout=5)
+            assert process.returncode == 128 + signal.SIGTERM, (
+                process.returncode, output, error,
+            )
+            assert started.read_text() == "started"
+            assert completed.read_text() == "completed"
+            assert log.read_text().splitlines() == [
+                "validate", "preflight", "calibrate",
+                "analyze", "finalizer",
+            ]
+        finally:
+            release.touch(exist_ok=True)
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
 def verify_market_truth_derivation() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-scaling-truth-",
@@ -1229,51 +2049,17 @@ def scaling_finalizer_fixture() -> tuple[
     for job in expected_fit_jobs(names, evaluable):
         provenance = fit_provenance_id(job)
         fixed = job.kind == "pooled" and job.mode == "fixed-update"
-        ridge = job.kind == "ridge"
-        fixed_epoch = not ridge and not fixed
-        epochs_trained = 11 if fixed_epoch else 0
-        rows_per_epoch = (
-            sum(rows[(job.phase, name)][0] for name in job.members) +
-            FIXED_EPOCH_BUDGET.batch_size - 1
-        ) // FIXED_EPOCH_BUDGET.batch_size
-        fits.append({
-            "budget": (
-                asdict(dict(EXPECTED_BUDGETS)[job.phase]) if fixed else
-                asdict(FIXED_EPOCH_BUDGET) if fixed_epoch else None
-            ),
-            "cohort": job.cohort,
-            "coverage": [
-                {
-                    "series": name,
-                    "train_rows": rows[(job.phase, name)][0],
-                    "validation_rows": rows[(job.phase, name)][1],
-                }
-                for name in job.members
-            ],
-            "kind": job.kind,
-            "members": list(job.members),
-            "mode": job.mode,
-            "model": job.model,
-            "model_fingerprint": hashlib.sha256(
-                f"model:{provenance}".encode()
-            ).hexdigest(),
-            "epochs_trained": epochs_trained,
-            "optimizer_updates": (
-                0 if ridge else
-                dict(EXPECTED_BUDGETS)[job.phase].total_updates
-                if fixed else epochs_trained * rows_per_epoch
-            ),
-            "phase": job.phase,
-            "provenance_id": provenance,
-            "question_uses": [
-                {"question": question, "cohort": cohort}
-                for question, cohort in question_uses(job, names)
-            ],
-            "schema": 1,
-            "seed": job.seed,
-            "selected_checkpoint": 1 if fixed else None,
-            "selected_epoch": None if ridge or fixed else 1,
-        })
+        epoch = job.kind == "local" or job.mode == "fixed-epoch"
+        fit = (
+            SimpleNamespace(best_checkpoint=1) if fixed else
+            SimpleNamespace(best_epoch=1, epochs_trained=11)
+            if epoch else None
+        )
+        fits.append(runner._fit_record(
+            job,
+            hashlib.sha256(f"model:{provenance}".encode()).hexdigest(),
+            fit, rows, names,
+        ))
     closure = validate_fit_ledger(fits, names, coverage)
     model_prediction = {
         "global_ridge": 0.01,
@@ -2601,6 +3387,8 @@ def main() -> None:
     verify_isolated_startup()
     verify_input_derivation()
     verify_fit_schedule()
+    verify_runner_boundaries()
+    verify_finalizer_signal_subprocess()
     verify_market_truth_derivation()
     verify_scaling_finalizer()
     verify_gate_boundaries()

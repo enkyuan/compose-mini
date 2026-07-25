@@ -3,10 +3,11 @@
 
 from array import array
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import json
 import hashlib
 import math
@@ -52,6 +53,13 @@ from tools.panel_contract import (
 )
 from tools.session_samples import SampleRows
 from tools.universe_contract import PackedRows, common_calendar, pack_rows
+from tools.universe_scaling_contract import (
+    EXPECTED_BUDGETS, PHASES, RUNNER_TORCH_PYTHON_FLAGS, FitJob,
+    PhaseCoverage, ScalingCoverage, SeriesCoverage,
+)
+from tools.float32 import decode_f32le_base64
+import tools.experiment as experiment_module
+import tools.run_universe_scaling as scaling_runner
 
 
 def close_value(index: int) -> float:
@@ -1203,6 +1211,327 @@ def verify_stock_macro_training() -> None:
         updates.assert_not_called()
 
 
+def verify_scaling_calibrate_smoke() -> None:
+    names = tuple(f"S{index:02d}" for index in range(55))
+    phase = "fold-0"
+    grid = "2" * 64
+    coverage = ScalingCoverage((PhaseCoverage(
+        phase,
+        tuple(
+            SeriesCoverage(name, 2, 1, grid) for name in names
+        ),
+    ),))
+    job = FitJob(
+        "ridge", None, 11, phase, "global_ridge", None, names[:11],
+    )
+    fingerprint = "1" * 64
+    prediction = {
+        "grid_sha256": grid,
+        "model_fingerprint": fingerprint,
+        "phase": phase,
+        "predictions": "AAAAAA==",
+        "provenance_id": scaling_runner.fit_provenance_id(job),
+        "schema": 2,
+        "series": names[0],
+    }
+    expected = scaling_runner.PreflightCounts((55,), 1, 1, 1)
+
+    @contextmanager
+    def validated(_attempt: object) -> Iterator[tuple[object, ...]]:
+        yield names, {}, None
+
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-calibrate-smoke-",
+    ) as directory_name:
+        root = Path(directory_name).resolve()
+        run_dir = root / "reports/smoke"
+        run_dir.mkdir(parents=True)
+        attempt = SimpleNamespace(
+            run_dir="reports/smoke",
+            run_id="universe-scaling-smoke",
+            outputs={
+                "fits": "reports/smoke/fits.jsonl",
+                "predictions": "reports/smoke/predictions.jsonl",
+            },
+        )
+        data = {name: object() for name in names[:11]}
+        candidate, sweep, model = object(), object(), object()
+        with ExitStack() as stack:
+            for name, value in (
+                ("ROOT", root),
+                ("PHASES", (phase,)),
+                ("EXPECTED_PREFLIGHT_COUNTS", expected),
+            ):
+                stack.enter_context(patch.object(
+                    scaling_runner, name, value,
+                ))
+            for name, value in (
+                ("_validated_inputs", validated),
+                ("_derive_coverage", lambda *_: coverage),
+                ("expected_fit_jobs", lambda *_: (job,)),
+                ("_phase_data", lambda *_: (candidate, sweep, data)),
+                ("_fit", lambda *_: (model, None)),
+                ("model_fingerprint", lambda *_: fingerprint),
+                ("_predictions", lambda *_: (prediction,)),
+                ("_runtime_sha256", lambda _: "3" * 64),
+                ("required_prediction_series", lambda *_: (names[0],)),
+            ):
+                stack.enter_context(patch.object(
+                    scaling_runner, name, side_effect=value,
+                ))
+            merged = stack.enter_context(patch.object(
+                scaling_runner, "merge_spools",
+                wraps=scaling_runner.merge_spools,
+            ))
+            published = stack.enter_context(patch.object(
+                scaling_runner, "_publish_complete",
+                wraps=scaling_runner._publish_complete,
+            ))
+            scaling_runner.calibrate(attempt)
+
+        assert merged.call_count == published.call_count == 2
+        assert [call.args[3] for call in published.call_args_list] == [
+            "fits.jsonl", "predictions.jsonl",
+        ]
+        private_spool = merged.call_args_list[0].args[2].parent
+        assert private_spool.parent == run_dir.parent
+        assert private_spool.name.startswith(
+            f".{attempt.run_id}-spool-",
+        )
+        assert not private_spool.exists()
+        fit_path = run_dir / "fits.jsonl"
+        prediction_path = run_dir / "predictions.jsonl"
+        fits = tuple(map(
+            json.loads, fit_path.read_text(encoding="utf-8").splitlines(),
+        ))
+        predictions = tuple(map(
+            json.loads,
+            prediction_path.read_text(encoding="utf-8").splitlines(),
+        ))
+        rows = {(phase, name): (2, 1) for name in names}
+        assert fits == (
+            scaling_runner._fit_record(
+                job, fingerprint, None, rows, names,
+            ),
+        )
+        assert predictions == (prediction,)
+        assert {path.name for path in run_dir.iterdir()} == {
+            "fits.jsonl", "predictions.jsonl",
+        }
+
+
+def verify_scaling_runner_training() -> None:
+    package_parent = str(Path(torch.__file__).resolve().parents[1])
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-torch-resolution-",
+    ) as directory_name:
+        directory = Path(directory_name)
+        marker = directory / "shadow-ran"
+        (directory / "torch.py").write_text(
+            f"open({str(marker)!r}, 'w').write('ran')\n",
+            encoding="ascii",
+        )
+        expected = str(Path(torch.__file__).resolve())
+        isolated_import = subprocess.run(
+            (
+                sys.executable, *RUNNER_TORCH_PYTHON_FLAGS, "-c",
+                "import os,sys;"
+                "assert sys.flags.no_site and "
+                f"{package_parent!r} not in sys.path;"
+                f"sys.path.append({str(directory)!r});"
+                f"sys.path[-1]={package_parent!r};"
+                "import torch;"
+                f"assert os.path.realpath(torch.__file__)=={expected!r}",
+            ),
+            capture_output=True, text=True, check=False,
+        )
+        assert isolated_import.returncode == 0, isolated_import.stderr
+        assert not marker.exists()
+
+    names = tuple(f"S{index:02d}" for index in range(55))
+    members = {
+        name: SimpleNamespace(
+            train=(object(),) * (index + 1),
+            validation=() if index in (14, 28) else (object(),),
+        )
+        for index, name in enumerate(names)
+    }
+    calls = []
+    budget = dict(EXPECTED_BUDGETS)["fold-0"]
+
+    def updates(*args: object, **kwargs: object) -> tuple[object, object]:
+        calls.append((args, kwargs))
+        return object(), SimpleNamespace(
+            best_checkpoint=2, updates_trained=budget.total_updates,
+        )
+
+    api = SimpleNamespace(_fit_shared_updates=updates)
+    job = FitJob(
+        "pooled", "fixed-update", 44, "fold-0", "global_mlp", 7,
+        names[:44],
+    )
+    model, fit = scaling_runner._fit(
+        job, members, SimpleNamespace(), SimpleNamespace(),
+        torch.device("cpu"), api,
+    )
+    assert model is not None and fit.best_checkpoint == 2
+    args, kwargs = calls.pop()
+    assert args[0] == "mlp"
+    assert args[2] == tuple(members[name] for name in names[:44])
+    assert args[4:6] == (7, budget.updates_per_checkpoint)
+    assert kwargs["validation_indices"] == tuple(
+        index for index in range(44) if index not in (14, 28)
+    )
+
+    sentinel = object()
+    epoch_fit = SimpleNamespace(best_epoch=1, epochs_trained=11)
+    selected = SimpleNamespace(ridge=0.1)
+    sweep = SimpleNamespace(batch_size=128)
+    device = torch.device("cpu")
+    dispatched = {}
+
+    def epochs(*args: object, **kwargs: object) -> tuple[object, ...]:
+        dispatched["epochs"] = (args, kwargs)
+        return sentinel, epoch_fit, ()
+
+    def neural(*args: object, **kwargs: object) -> tuple[object, ...]:
+        dispatched["local"] = (args, kwargs)
+        return sentinel, epoch_fit, ()
+
+    def ridge_model(*args: object) -> object:
+        dispatched["ridge"] = args
+
+        def move(target: object) -> object:
+            dispatched["ridge_device"] = target
+            return sentinel
+
+        return SimpleNamespace(to=move)
+
+    api = SimpleNamespace(
+        _fit_shared_epochs=epochs,
+        _fit_neural=neural,
+        stock_macro_linear_model=ridge_model,
+    )
+    conditioned = FitJob(
+        "pooled", "fixed-epoch", 11, "fold-0",
+        "conditioned_panel_transformer", 7, names[:11],
+    )
+    assert scaling_runner._fit(
+        conditioned, members, selected, sweep, device, api,
+    ) == (sentinel, epoch_fit)
+    args, kwargs = dispatched["epochs"]
+    assert args == (
+        "conditioned_panel_transformer", selected,
+        tuple(members[name] for name in names[:11]),
+        sweep, 7, device,
+    )
+    assert kwargs == {"validation_indices": tuple(range(11))}
+    local = FitJob(
+        "local", None, None, "fold-0", "local_transformer", 7,
+        (names[0],),
+    )
+    assert scaling_runner._fit(
+        local, members, selected, sweep, device, api,
+    ) == (sentinel, epoch_fit)
+    assert dispatched["local"] == ((
+        "transformer", selected, members[names[0]], sweep, 7, device,
+    ), {})
+    ridge = FitJob(
+        "ridge", None, 11, "fold-0", "global_ridge", None, names[:11],
+    )
+    assert scaling_runner._fit(
+        ridge, members, selected, sweep, device, api,
+    ) == (sentinel, None)
+    assert dispatched["ridge"] == (
+        tuple(members[name] for name in names[:11]), selected.ridge,
+    )
+    assert dispatched["ridge_device"] == device
+
+    candidate_value = candidate("runner", 3)
+    dataset = torch.utils.data.TensorDataset(
+        torch.randn(2, 3, 5), torch.tensor((0.1, -0.1)),
+        torch.tensor((100.0, 100.0)), torch.tensor((101.0, 99.0)),
+    )
+    empty = torch.utils.data.TensorDataset(
+        torch.empty(0, 3, 5), torch.empty(0),
+        torch.empty(0), torch.empty(0),
+    )
+    data = TrainingData(
+        dataset, dataset, empty,
+        torch.zeros(5), torch.ones(5),
+        torch.tensor(0.0), torch.tensor(1.0),
+    )
+    local = FitJob(
+        "local", None, None, "fold-0", "local_transformer", 7,
+        (names[0],),
+    )
+    runtime = "1" * 64
+    forecast = ForecastTransformer(candidate_value.config())
+    first = scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+    assert first == scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+    with torch.no_grad():
+        forecast.head_b.add_(1.0)
+    assert first != scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+
+    forecast = ForecastTransformer(candidate_value.config())
+    first = scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+    assert "position" not in forecast.state_dict()
+    with torch.no_grad():
+        forecast.position.view(-1)[0].add_(1.0)
+    assert first != scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+
+    forecast = ForecastTransformer(candidate_value.config())
+    fingerprint = scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+    records = list(scaling_runner._predictions(
+        local, forecast, {names[0]: data}, candidate_value,
+        SimpleNamespace(batch_size=2), torch.device("cpu"),
+        experiment_module, names, {phase: names for phase in PHASES},
+        {("fold-0", names[0]): "2" * 64}, fingerprint, runtime,
+    ))
+    assert len(records) == 1
+    assert len(decode_f32le_base64(
+        records[0]["predictions"], expected_count=2,
+    )) == 2
+
+    original_evaluate = evaluate
+
+    def mutate(*args: object, **kwargs: object) -> object:
+        result = original_evaluate(*args, **kwargs)
+        with torch.no_grad():
+            forecast.head_b.add_(1.0)
+        return result
+
+    fingerprint = scaling_runner.model_fingerprint(
+        forecast, local, candidate_value, ((names[0], data),), runtime,
+    )
+    with patch("tools.train.evaluate", side_effect=mutate):
+        try:
+            list(scaling_runner._predictions(
+                local, forecast, {names[0]: data}, candidate_value,
+                SimpleNamespace(batch_size=2), torch.device("cpu"),
+                experiment_module, names,
+                {phase: names for phase in PHASES},
+                {("fold-0", names[0]): "2" * 64},
+                fingerprint, runtime,
+            ))
+        except ValueError as error:
+            assert "model changed" in str(error)
+        else:
+            raise AssertionError("prediction-time model mutation was accepted")
+
+
 def verify_panel_orchestration() -> None:
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-source-tree-", dir=ROOT,
@@ -1797,6 +2126,8 @@ def main() -> None:
     assert purged_split((12, 4), 2, preserve_last=False) == (10, 2)
     verify_series_conditioning()
     verify_stock_macro_training()
+    verify_scaling_calibrate_smoke()
+    verify_scaling_runner_training()
     verify_panel_orchestration()
     verify_universe_contract(ROOT)
     verify_selection_is_validation_only()

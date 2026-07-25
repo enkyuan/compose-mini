@@ -35,9 +35,12 @@ EXPECTED_MISSING = (
 )
 EXPECTED_FIT_COUNT = 1_215
 EXPECTED_PREDICTION_RECORDS = 14_216
+EXPECTED_PREDICTION_VALUES = 7_586_158
 COMMANDS = ("validate", "preflight", "calibrate", "analyze")
 OUTPUTS = ("fits", "predictions", "summary", "outcome")
 FINALIZER_PYTHON_FLAGS = ("-I", "-S", "-B")
+RUNNER_PRIMARY_PYTHON_FLAGS = ("-I", "-S", "-B")
+RUNNER_TORCH_PYTHON_FLAGS = ("-I", "-S", "-B")
 POOLED_MODELS = ("global_mlp", "panel_transformer")
 SELECTION_ROOT = Path("reports/universe-selection-20260724-06")
 FETCH_PATH = Path("reports/liquid-common-55-20260724-03-fetch.json")
@@ -177,6 +180,8 @@ def expected_protocol() -> dict[str, object]:
         "phases": list(PHASES),
         "prediction_schema": 2,
         "questions": ["cohort-scaling", "unseen-transfer"],
+        "runner_primary_python_flags": list(RUNNER_PRIMARY_PYTHON_FLAGS),
+        "runner_torch_python_flags": list(RUNNER_TORCH_PYTHON_FLAGS),
         "seeds": list(SEEDS),
         "target_horizon_bars": 13,
         "target_kind": "executable-return-v1",
@@ -235,6 +240,20 @@ class FitJob:
     model: str
     seed: int | None
     members: tuple[str, ...]
+
+
+def fit_provenance_id(job: FitJob) -> str:
+    """Return the canonical physical-fit provenance identifier."""
+    encoded = json.dumps({
+        "cohort": job.cohort,
+        "kind": job.kind,
+        "members": list(job.members),
+        "mode": job.mode,
+        "model": job.model,
+        "phase": job.phase,
+        "seed": job.seed,
+    }, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_fit_job(job: FitJob, master: tuple[str, ...]) -> None:
@@ -566,10 +585,9 @@ class ScalingCoverage:
             for phase in phases for item in phase.series
         ):
             raise ValueError("coverage timestamp grid is inconsistent")
-        missing = tuple(set(phase.missing) for phase in phases)
-        if tuple(map(len, missing)) != tuple(
-            len(names) for _, names in EXPECTED_MISSING
-        ) or not missing[0] < missing[1] < missing[2]:
+        if tuple(
+            (phase.phase, phase.missing) for phase in phases
+        ) != EXPECTED_MISSING:
             raise ValueError("coverage miss identities are invalid")
         budgets = dict(EXPECTED_BUDGETS)
         if any(

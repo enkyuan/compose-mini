@@ -131,7 +131,6 @@ from math import isfinite, log
 from pathlib import Path
 from statistics import fmean
 import argparse
-import hashlib
 import json
 import os
 import stat
@@ -164,7 +163,8 @@ from tools.universe_scaling_contract import (
     EXPECTED_PREDICTION_RECORDS, MODES, MODELS, PHASES, SEEDS,
     TRAINING_COHORTS, TRANSFER_COHORTS, FIXED_EPOCH_BUDGET, FitJob,
     PhaseCoverage, ScalingAttempt, ScalingCoverage, SeriesCoverage,
-    expected_fit_jobs, question_uses, required_prediction_series,
+    expected_fit_jobs, fit_provenance_id, question_uses,
+    required_prediction_series,
     timestamp_grid_sha256,
 )
 
@@ -312,26 +312,6 @@ def _timestamp(value: object, label: str) -> str:
     if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != text:
         raise ValueError(f"{label} must be a canonical UTC timestamp")
     return text
-
-
-def _digest(value: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        value, allow_nan=False, separators=(",", ":"), sort_keys=True,
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def fit_provenance_id(job: FitJob) -> str:
-    """Return the canonical physical-fit provenance identifier."""
-    return _digest({
-        "cohort": job.cohort,
-        "kind": job.kind,
-        "members": list(job.members),
-        "mode": job.mode,
-        "model": job.model,
-        "phase": job.phase,
-        "seed": job.seed,
-    })
 
 
 def _master(value: Sequence[str]) -> tuple[str, ...]:

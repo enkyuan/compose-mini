@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import tempfile
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -51,6 +51,15 @@ def phase_train_rows(phase: str, index: int) -> int:
     budget = dict(EXPECTED_BUDGETS)[phase].control_samples
     quotient, remainder = divmod(budget, 11)
     return quotient + (index < remainder) if index < 11 else 1
+
+
+def synthetic_master() -> tuple[str, ...]:
+    names = [f"S{index:02d}" for index in range(55)]
+    for index, name in zip(
+        (14, 28, 32, 39), ("ALTR", "ZI", "FYBR", "INFA"), strict=True,
+    ):
+        names[index] = name
+    return tuple(names)
 
 
 def synthetic_coverage(names: tuple[str, ...]) -> ScalingCoverage:
@@ -416,6 +425,44 @@ def verify_serializes_coverage(root: Path) -> None:
     assert value["coverage"] == coverage_value(fixture.coverage)
 
 
+def verify_torch_venv_launcher(root: Path) -> None:
+    fixture = ArmFixture(root)
+    launcher = fixture.torch.with_name("torch-venv")
+    launcher.symlink_to(fixture.torch)
+    with fixture.patched() as probes:
+        armer.arm(
+            fixture.output, "1" * 40, fixture.run_id,
+            fixture.primary, launcher,
+        )
+    assert probes.observe_torch.call_args_list == [
+        call((str(launcher),), fixture.root),
+        call((str(launcher),), fixture.root),
+    ]
+    value = json.loads(fixture.output_path.read_text(encoding="utf-8"))
+    assert value["torch_argv"] == [str(fixture.torch)]
+
+
+def verify_shared_torch_runtime(root: Path) -> None:
+    fixture = ArmFixture(root)
+    launcher = fixture.primary.with_name("torch-venv")
+    launcher.symlink_to(fixture.primary)
+    fixture.torch_probe = replace(
+        fixture.torch_probe,
+        python=executable_binding(fixture.primary, "synthetic torch"),
+    )
+    with fixture.patched() as probes:
+        armer.arm(
+            fixture.output, "1" * 40, fixture.run_id,
+            fixture.primary, launcher,
+        )
+    probes.observe_torch.assert_has_calls([
+        call((str(launcher),), fixture.root),
+        call((str(launcher),), fixture.root),
+    ])
+    value = json.loads(fixture.output_path.read_text(encoding="utf-8"))
+    assert value["torch_argv"] == [str(fixture.primary)]
+
+
 def verify_nonpromotable_coverage(root: Path) -> None:
     fixture = ArmFixture(root)
     with fixture.patched(validate_data=True) as probes, patch.object(
@@ -459,10 +506,8 @@ def verify_nonpromotable_coverage(root: Path) -> None:
 
 
 def verify_exact_coverage_and_fit_closure() -> None:
-    names = [f"S{index:02d}" for index in range(55)]
-    for index, name in zip((14, 28, 32, 39), ("ALTR", "ZI", "FYBR", "INFA")):
-        names[index] = name
-    coverage = synthetic_coverage(tuple(names))
+    names = synthetic_master()
+    coverage = synthetic_coverage(names)
     assert tuple(
         (phase.phase, phase.missing) for phase in coverage.phases
     ) == EXPECTED_MISSING
@@ -677,7 +722,7 @@ def verify_timestamp_grid_provenance() -> None:
 
 
 def verify_coverage_parser() -> None:
-    names = tuple(f"S{index:02d}" for index in range(55))
+    names = synthetic_master()
     value = coverage_value(synthetic_coverage(names))
     parsed = ScalingCoverage.parse(value)
     assert parsed.master == names
@@ -777,6 +822,14 @@ def main() -> None:
         prefix="compose-mini-scaling-arm-serialize-",
     ) as directory:
         verify_serializes_coverage(Path(directory))
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-arm-torch-venv-",
+    ) as directory:
+        verify_torch_venv_launcher(Path(directory))
+    with tempfile.TemporaryDirectory(
+        prefix="compose-mini-scaling-arm-shared-runtime-",
+    ) as directory:
+        verify_shared_torch_runtime(Path(directory))
     with tempfile.TemporaryDirectory(
         prefix="compose-mini-scaling-arm-coverage-",
     ) as directory:

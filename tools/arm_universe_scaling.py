@@ -249,21 +249,23 @@ def arm(
                 *SOURCE_PATHS, *FINALIZER_SOURCE_PATHS,
             ))
         )
-        runtime_paths = tuple(map(Path, (
+        torch_launcher = Path(os.path.abspath(torch_python))
+        runtime_paths = (
             primary_python.resolve(strict=True),
-            torch_python.resolve(strict=True),
-        )))
-        support = (*source_paths, *runtime_paths)
+            torch_launcher.resolve(strict=True),
+        )
+        support = tuple(dict.fromkeys((*source_paths, *runtime_paths)))
         support_identities = regular_file_identities(support)
         with freeze_inputs(support) as frozen_support:
             support_by_path = {item.source: item for item in frozen_support}
             primary = executable_binding(runtime_paths[0], _version(
                 runtime_paths[0],
             ))
-            torch = observe_torch((str(runtime_paths[1]),), ROOT)
+            torch = observe_torch((str(torch_launcher),), ROOT)
             if primary.sha256 != _frozen(
                 support_by_path, runtime_paths[0],
-            ).sha256 or torch.python.sha256 != _frozen(
+            ).sha256 or Path(torch.python.path) != runtime_paths[1] or \
+                    torch.python.sha256 != _frozen(
                 support_by_path, runtime_paths[1],
             ).sha256:
                 raise ValueError("runtime changed while arming")
@@ -357,7 +359,9 @@ def arm(
                        executable_binding(
                            runtime_paths[0], _version(runtime_paths[0]),
                        ) != primary or \
-                       observe_torch((str(runtime_paths[1]),), ROOT) != torch:
+                       torch_launcher.resolve(strict=True) != \
+                           runtime_paths[1] or \
+                       observe_torch((str(torch_launcher),), ROOT) != torch:
                         raise ValueError("attempt input changed while arming")
                     _fresh(absent)
                     if any(
