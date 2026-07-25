@@ -27,8 +27,9 @@ from tools.reference import predict_windows
 from tools.session_samples import SampleRows
 from tools.train import (
     DataSplits, ForecastTransformer, TrainingData, data_loaders, export_weights,
-    evaluate, feature_values, fit_epochs, fit_model, fit_updates, mean_loss,
-    parse_args, prepare_data, prepare_rows, train as train_model, train_epoch,
+    evaluate, feature_values, fit_epochs, fit_model, fit_training_updates,
+    fit_updates, mean_loss, parse_args, prepare_data, prepare_rows,
+    train as train_model, train_epoch,
 )
 
 
@@ -237,6 +238,80 @@ def verify_fixed_updates() -> None:
             pass
         else:
             raise AssertionError("non-finite fixed-update validation was accepted")
+
+
+def verify_training_updates() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    samples = tuple(
+        (torch.zeros(1), torch.tensor(float(index)), 0.0, 0.0)
+        for index in range(3)
+    )
+    loader = DataLoader(samples, batch_size=1, sampler=(2, 0, 2, 1))
+    observed = []
+
+    def train_batch(model, batch, *_args) -> tuple[float, int]:
+        observed.append(int(batch[1].item()))
+        with torch.no_grad():
+            model.weight.fill_(len(observed))
+        return float(len(observed)), 1
+
+    with patch("tools.train._train_batch", side_effect=train_batch):
+        loss = fit_training_updates(
+            model, loader, 4, 3e-4, 1e-4, torch.device("cpu"),
+        )
+    assert observed == [2, 0, 2, 1]
+    assert loss == 2.5
+    assert torch.equal(model.weight, torch.full_like(model.weight, 4.0))
+    for updates in (True, 0, 3):
+        try:
+            fit_training_updates(
+                model, loader, updates, 3e-4, 1e-4, torch.device("cpu"),
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"invalid update budget passed: {updates}")
+
+    class Schedule:
+        def __init__(self, indices: tuple[int, ...]) -> None:
+            self.indices = indices
+
+        def __iter__(self):
+            return iter(self.indices)
+
+        def __len__(self) -> int:
+            return 4
+
+    for indices in ((2, 0, 1), (2, 0, 1, 2, 0)):
+        calls = 0
+
+        def count_batch(*_args) -> tuple[float, int]:
+            nonlocal calls
+            calls += 1
+            return 0.0, 1
+
+        with patch("tools.train._train_batch", side_effect=count_batch):
+            try:
+                fit_training_updates(
+                    model,
+                    DataLoader(
+                        samples, batch_size=1, sampler=Schedule(indices),
+                    ),
+                    4, 3e-4, 1e-4, torch.device("cpu"),
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("dishonest schedule was accepted")
+        assert calls == min(len(indices), 4)
+    with patch("tools.train._train_batch", return_value=(math.inf, 1)):
+        try:
+            fit_training_updates(
+                model, loader, 4, 3e-4, 1e-4, torch.device("cpu"),
+            )
+        except FloatingPointError:
+            pass
+        else:
+            raise AssertionError("non-finite training-only loss was accepted")
 
 
 def verify_sampled_epoch_mean() -> None:
@@ -466,6 +541,7 @@ def main() -> None:
         verify_indexed_windows(Path(directory) / "training.csv")
         verify_fixed_epochs(Path(directory) / "training.csv")
         verify_fixed_updates()
+        verify_training_updates()
         verify_sampled_epoch_mean()
         verify_conditioned_batches()
     print("training and export tests passed "

@@ -281,6 +281,34 @@ def train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Opt
     return total / count
 
 
+def _train_updates(
+    model: nn.Module, batches: Iterator[Sequence[object]],
+    optimizer: torch.optim.Optimizer, updates: int, device: torch.device,
+) -> float:
+    model.train()
+    total, count = 0.0, 0
+    for _ in range(updates):
+        try:
+            batch = next(batches)
+        except StopIteration as error:
+            raise ValueError(
+                "training loader ended before its update budget"
+            ) from error
+        loss, samples = _train_batch(model, batch, optimizer, device)
+        total, count = total + loss, count + samples
+    if not count or not math.isfinite(total):
+        raise FloatingPointError("training produced a non-finite loss")
+    return total / count
+
+
+def _require_exhausted(batches: Iterator[Sequence[object]]) -> None:
+    try:
+        next(batches)
+    except StopIteration:
+        return
+    raise ValueError("training loader exceeds its update budget")
+
+
 def evaluate(model: nn.Module, loader: DataLoader, target_mean: torch.Tensor,
              target_scale: torch.Tensor, device: torch.device,
              predictions: list[float] | None = None) -> dict[str, float]:
@@ -585,6 +613,22 @@ def fit_epochs(model: nn.Module, data: DataSplits, batch_size: int,
     return loaders
 
 
+def fit_training_updates(
+    model: nn.Module, loader: DataLoader, updates: int,
+    learning_rate: float, weight_decay: float, device: torch.device,
+) -> float:
+    """Fit the caller's exact batch schedule without validation selection."""
+    if type(updates) is not int or updates < 1 or len(loader) != updates:
+        raise ValueError("training loader does not match its update budget")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay,
+    )
+    batches = iter(loader)
+    loss = _train_updates(model, batches, optimizer, updates, device)
+    _require_exhausted(batches)
+    return loss
+
+
 def fit_model(model: nn.Module, data: DataSplits, batch_size: int,
               epochs: int, patience: int, learning_rate: float,
               weight_decay: float, seed: int, device: torch.device,
@@ -640,30 +684,23 @@ def fit_updates(
     batches = iter(loader)
     best_loss, best_state, best_checkpoint = math.inf, None, 0
     for checkpoint in range(1, checkpoints + 1):
-        model.train()
-        total, count = 0.0, 0
-        for _ in range(updates_per_checkpoint):
-            try:
-                batch = next(batches)
-            except StopIteration as error:
-                raise ValueError(
-                    "fixed-update loader ended before its budget"
-                ) from error
-            loss, samples = _train_batch(model, batch, optimizer, device)
-            total, count = total + loss, count + samples
+        training_loss = _train_updates(
+            model, batches, optimizer, updates_per_checkpoint, device,
+        )
         observed = float(validation_loss())
-        if not count or not math.isfinite(total) or not math.isfinite(observed):
+        if not math.isfinite(observed):
             raise FloatingPointError(
                 f"checkpoint {checkpoint} produced a non-finite loss"
             )
         if log_checkpoints:
             print(
-                f"checkpoint={checkpoint} train={total / count:.6g} "
+                f"checkpoint={checkpoint} train={training_loss:.6g} "
                 f"val={observed:.6g}", file=sys.stderr,
             )
         if observed < best_loss:
             best_loss, best_checkpoint = observed, checkpoint
             best_state = _snapshot(model)
+    _require_exhausted(batches)
     if best_state is None:
         raise FloatingPointError(
             "training did not produce a finite validation checkpoint"
