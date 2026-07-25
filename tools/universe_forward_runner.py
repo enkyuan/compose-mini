@@ -53,13 +53,17 @@ class ForwardFeatureWindows(Dataset):
         ).clone()
         if not torch.isfinite(raw).all() or not torch.all(raw[:, 3] > 0):
             raise ValueError("forward bars are invalid")
+        self.feature_mean = feature_mean.clone()
+        self.feature_scale = feature_scale.clone()
         features = feature_values(raw, feature_set).sub_(
-            feature_mean,
-        ).div_(feature_scale)
+            self.feature_mean,
+        ).div_(self.feature_scale)
         if not torch.isfinite(features).all():
             raise ValueError("normalized forward features are invalid")
         self.features = features
-        self.starts, self.seq_len = starts, seq_len
+        self.starts, self.seq_len, self.feature_set = (
+            starts, seq_len, feature_set,
+        )
 
     def __len__(self) -> int:
         return len(self.starts)
