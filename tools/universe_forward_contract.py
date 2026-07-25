@@ -367,6 +367,23 @@ def resolve_prior_checkpoint(
     return matches[0]
 
 
+def forward_model_fingerprint(
+    forward_provenance_id: str, state_fingerprint: str,
+) -> str:
+    """Bind one fitted state to its authenticated forward-refit identity."""
+    value = {
+        "forward_provenance_id": _sha256(
+            forward_provenance_id, "forward provenance",
+        ),
+        "state_fingerprint": _sha256(
+            state_fingerprint, "state fingerprint",
+        ),
+    }
+    return hashlib.sha256(json.dumps(
+        value, allow_nan=False, separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+
+
 def _forward_provenance_id(
     outcome: str, members: tuple[str, ...],
     selection: CheckpointSelection, optimizer_updates: int,

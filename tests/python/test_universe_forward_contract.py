@@ -19,7 +19,7 @@ from tools.finalize_universe_scaling import FitClosure
 from tools.panel_contract import FileBinding
 from tools.universe_forward_contract import (
     CheckpointSelection, ForwardFitSpec, ForwardPredictionSpec,
-    forward_fit_specs, forward_prediction_specs,
+    forward_fit_specs, forward_model_fingerprint, forward_prediction_specs,
     read_passing_scaling_outcome, resolve_prior_checkpoint,
 )
 from tools.universe_scaling_contract import (
@@ -487,6 +487,18 @@ def test_forward_fit_specs() -> None:
     raises(forward_fit_specs, object(), "fold-1", root=root)
 
 
+def test_forward_model_fingerprint() -> None:
+    provenance, state = digest(1), digest(2)
+    expected = "848a2e3da573430c0b0e5444dee403e2cd0499f499a97b9e0cf6776d0da62495"
+    assert forward_model_fingerprint(provenance, state) == expected
+    assert forward_model_fingerprint(state, provenance) != expected
+    assert forward_model_fingerprint(digest(3), state) != expected
+    assert forward_model_fingerprint(provenance, digest(3)) != expected
+    for invalid in (None, True, 1, "A" * 64, "0" * 63, "g" * 64):
+        raises(forward_model_fingerprint, invalid, state)
+        raises(forward_model_fingerprint, provenance, invalid)
+
+
 def test_forward_prediction_specs() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
@@ -701,6 +713,7 @@ def main() -> None:
     test_pass_rejections()
     test_checkpoint_selection()
     test_forward_fit_specs()
+    test_forward_model_fingerprint()
     test_forward_prediction_specs()
 
 
