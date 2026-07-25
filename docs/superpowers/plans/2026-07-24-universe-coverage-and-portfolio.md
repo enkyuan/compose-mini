@@ -245,27 +245,100 @@ phase it predicts. Those ledgers are valid model-development diagnostics, but
 they are not forward-clean trading inputs. Do not pass them to a portfolio
 engine as out-of-sample evidence.
 
-Do not add a mode to the immutable scaling runner. Arm a separate forward
-attempt only after its bound scaling outcome has status `pass`:
+Do not add a mode to the immutable scaling runner. Use two phase-scoped forward
+attempts:
 
-1. Consume the canonical fold-0 `selected_checkpoint` record for each exact
-   `(question, mode, cohort, model, seed)` identity; do not retrain fold-0 to
-   rediscover it.
-2. Reinitialize deterministically, train on fold-1's training range for exactly
-   that frozen checkpoint count and phase-specific updates per checkpoint,
-   never evaluate fold-1 during fitting, then predict fold-1 once.
-3. After fold-1 outcomes are complete, freeze the canonical fold-1
-   `selected_checkpoint` record for calibration.
-4. Reinitialize deterministically, train on calibration's training range for
-   exactly that checkpoint count, never evaluate calibration during fitting,
-   then predict calibration once.
+1. After the exact scaling outcome has status `pass`, arm fold-1. Consume only
+   its authenticated fold-0 fixed-update selection for each exact
+   `(question, mode, cohort, model, seed)` identity.
+2. Reinitialize deterministically, train only on fold-1's training range for
+   the frozen checkpoint count and update budget, never evaluate fold-1 during
+   fitting, then predict fold-1 once.
+3. Finalize one terminal label-free fold-1 forward receipt.
+4. Only then arm calibration. Bind both the same passing scaling outcome and
+   the exact fold-1 receipt; use the prior fold-1 selection record designated
+   for calibration and already authenticated by
+   `read_passing_scaling_outcome()`. Reject a same-phase calibration selection.
+   Freeze and authenticate these attempt bytes before any fold-1 market-truth
+   accessor is authorized; do not inspect truth or select again while arming.
+5. Reinitialize deterministically, train only on calibration's training range
+   for that update budget, predict once, and publish its label-free receipt.
 
-A PASS-bound calibration schedule may be derived early for attempt hashing,
-but derivation is not execution authorization. The runner must authenticate a
-terminal fold-1 phase outcome that binds all five fits and every expected
-prediction, with no extras, before materializing or consuming calibration
-work. A schedule, checkpoint selection, or detached ledger closure is
-insufficient.
+A calibration schedule may be inspected early, but no calibration attempt,
+destination, data prefix, loader, model, or fit may be materialized before the
+fold-1 receipt is authenticated. Scaling PASS, a schedule, checkpoint record,
+or detached ledger closure is insufficient. Each receipt has exactly
+`schema`, `attempt`, `phase`, `started`, `ended`, `status`, `outputs`, and
+`integrity`. Only `status: pass`, with both complete ledgers present and its
+self-path absent, authorizes the next phase. Failure receipts use exactly
+`run-failure` or `integrity-failure`, keep canonical ledgers and the self-path
+absent, and never authorize. Integrity binds the finalizer tree and primary
+Python. A receipt contains no label, `actual_return`, loss, error, accuracy,
+equity, or other truth-derived field.
+
+Treat target-phase prediction as fixed-model rolling-origin inference. For
+each opportunity \(t\), the fitted state and scalers may depend only on its
+phase's training rows, and its model input may contain only completed bars at
+or before `as_of_t`. An earlier realized bar may enter a later opportunity's
+window once that bar is completed; therefore phase-wide invariance to changing
+all target closes is neither causal nor required. Instead, mutating any row
+strictly after one opportunity's `as_of` must leave that opportunity's
+prediction unchanged.
+
+Separate byte integrity, completed-bar features, and market truth. The runner
+may hash the complete frozen CSV without interpreting its values. Semantic
+OHLCV decoding must use a timestamp-bounded reader: training stops at the last
+retained training target, and prediction stops at the greatest target-phase
+`as_of`, both computed per `(phase, series)`. Here the training target is
+`SampleRows.target`, not `as_of`. The reader must check the timestamp cutoff
+before parsing that row's numeric fields. Its canonical UTC `stop` is
+inclusive, must occur in the bound file, and must equal the final returned
+timestamp. Reject a missing cutoff or an insufficient series. A phase-wide
+series prefix may be resident, but each dataset item slices it only through
+that sample's `as_of`; therefore an earlier realized target bar enters only
+later windows. Changing the timestamp grid must fail its binding; value
+invariance applies only on an unchanged grid.
+
+Add the shared bounded reader only after the scaling finalizer is terminal.
+Extend `_records(path, stop=None)` in `tools/data_v1.py` and expose
+`read_bars_through(path, stop)`, reusing the existing grammar and numeric
+parser. For one target phase, derive its normal `PackedRows`, retain
+`packed.rows[:packed.counts[0]]`, and pass
+`PackedRows(training_rows, (len(training_rows), 0))` to `_prepare_packed()`.
+The accompanying raw array must come from `read_bars_through()` through the
+largest retained training target, so neither training scalers nor the model
+fingerprint can depend on later OHLCV. Before truncation, separately require
+the last training `target_ordinal` to be no later than the first prediction
+`as_of_ordinal`; this preserves the embargo check that a zero validation count
+would otherwise skip.
+
+Do not use `evaluate()` or a target-bearing `Windows` instance for forward
+prediction: both materialize values that are outcomes for the opportunity being
+predicted. Use one small lazy feature-only dataset over the target-phase sample
+coordinates. It yields normalized windows through each sample's `as_of` and
+reuses `feature_values()` and `feature_lookback()` for both `ohlcv` and
+`stationary-v1`. Run batched inference under `model.eval()` and
+`torch.no_grad()`, then unscale outputs with the training-fitted target mean and
+scale. Do not add another scaler or a parallel `ForwardTrainingData` hierarchy.
+
+The completed-bar reader and semantic market-truth accessor are separate
+channels. Keep truth access entirely out of forward runner and finalizer
+signatures. They never call `derive_market_truth()` or truth-dependent
+`validate_prediction_ledger()` and validate only the existing
+`universe_forward_ledger` fit and prediction closures. Introduce the accessor
+only after the complete prediction ledger and its terminal label-free receipt
+are published, through the separately authorized portfolio truth join.
+Fold-1 truth remains closed until the calibration attempt binding is frozen
+and authenticated.
+
+For each phase, the finalizer freezes and authenticates the attempt bytes and
+both regular ledger files, validates fits before predictions with the same
+attempt binding and target phase, rejects missing, duplicate, reordered, or
+extra rows, rechecks file identities, and exclusively writes the receipt.
+Before opening any calibration destination, its runner and finalizer also
+authenticate the prior fold-1 receipt and both of that receipt's ledger
+bindings. A failure after a partial temporary write publishes no canonical
+ledger or authorizing receipt.
 
 After the scaling finalizer is terminal, add one no-validation primitive beside
 `fit_epochs()` in `tools/train.py`:
@@ -297,22 +370,82 @@ def fit_exact_updates(
 The target phase trains for
 `selected_checkpoint * target_budget.updates_per_checkpoint`; fold-1 therefore
 uses `321` updates per checkpoint and calibration uses `368`. Reuse
-`_neural_model()`, `_stock_uniform_loader()`, `_phase_data()`,
-`model_fingerprint()`, and the existing fit, prediction, and market-truth
-validators. Do not modify `experiment.py` or `run_universe_scaling.py`. Keep the
-forward attempt, one-shot runner, terminal finalizer, and focused tests in
+`_neural_model()`, `_stock_uniform_loader()`, training-only `_prepare_packed()`,
+`model_fingerprint()`, and the label-free forward-ledger validators. Do not
+call `_phase_data()` or `evaluate()` because they materialize target-phase
+outcomes, and do not modify `experiment.py` or `run_universe_scaling.py`. Keep
+the forward attempt, one-shot runner, terminal finalizer, and focused tests in
 separate `universe_forward` files so the completed scaling evidence remains
 immutable.
 
-Every forward ledger record must bind the passing scaling outcome, its
-prior-phase selection record, fit fingerprint, source/runtime/input hashes,
-exact update count, phase, cohort, model, seed, series, and timestamp grid.
+For the existing fingerprint API, construct the exact target-phase `FitJob`
+for the fixed-update panel candidate. Compute its state-and-scaler digest with
+`model_fingerprint()`, then SHA-256 the canonical JSON object containing only
+`forward_provenance_id` and `state_fingerprint`. Store that outer digest in
+both forward ledgers. This binds the fitted state to its authenticated scaling
+outcome, prior selection, checkpoint, and update count without changing the
+immutable scaling runner.
+
+Keep the frozen ledger row schemas unchanged. Source, runtime, input, protocol,
+and scaling bindings live once in the authenticated phase attempt; every row
+inherits them through `attempt_sha256`. Its forward `provenance_id` binds the
+passing scaling outcome, prior-phase selection, candidate axes, seed, and exact
+update count. Each prediction spec additionally binds its series, manifest
+rank, count, and exact ordered `(as_of, entry_time, target_time)` grid; the
+attempt binds history, horizon, and feature set. Do not add duplicate
+provenance fields to physical rows.
+
 Mutating fold-1 validation or outcome labels must not change the fold-1 model
 state; mutating calibration validation or outcome labels must not change the
 calibration state. Mutating a phase's training labels must change its state.
-Test exact update count, early loader exhaustion, non-finite loss rejection,
-deterministic reinitialization, target-phase budget selection, and validation
-and outcome label invariance before arming a forward attempt.
+Before arming, test:
+
+- exact update count, early loader exhaustion, non-finite loss rejection,
+  and fixed-update-only budget selection; reject fixed-epoch records;
+- fold-0 selects fold-1 and fold-1 selects calibration; reject a same/future
+  phase, wrong candidate axis or seed, non-PASS/unbound source, and any missing,
+  duplicate, reordered, or extra selection;
+- calibration cannot create or open data, destinations, loaders, models, or
+  fits before the exact fold-1 receipt; reject a wrong receipt, hash, attempt,
+  non-pass status, or ledger closure, then authorize the exact
+  five-fit/full-prediction receipt once;
+- fold-1 truth access fails before the calibration attempt binding is frozen,
+  even with a valid passing fold-1 receipt;
+- same seed and inputs reproduce sampled training indices, state, fingerprint,
+  and predictions; a different seed changes their identities, and no sampled
+  index falls outside retained training rows;
+- per-series training-target and prediction-`as_of` cutoffs include and parse
+  their exact row, return `cutoff_index + 1` rows, and do not parse a
+  malformed/non-finite first row after the cutoff; the same sentinel at the
+  cutoff fails, as does a missing or short grid;
+- training scalers and model fingerprints remain invariant to nontraining
+  OHLCV on a separately rebound, fixed timestamp grid;
+- mutating a retained training target changes its scaler or deterministic
+  fitted fingerprint, while the first embargo/target-phase row cannot; exact
+  train-target/prediction-origin equality passes and a one-bin overlap fails;
+- first and last feature windows and unscaled predictions match literal,
+  implementation-independent expected values for both feature sets;
+- mutating an in-window completed value changes its feature window;
+- mutating an earlier target leaves its prediction and every origin with
+  `as_of < target_time` unchanged; the bar enters a window exactly when
+  `as_of >= target_time`;
+- a batch whose resident prefix reaches the latest origin still leaves an
+  earlier prediction unchanged by later values, even when origins are
+  reordered; the later window must change;
+- an armed attempt rejects every byte mutation, including after a cutoff; a
+  separately rebound fixed-grid fixture preserves state or prediction only
+  for values beyond its applicable cutoff;
+- the exact series and ordered opportunity-coordinate grids, history, horizon,
+  feature set, row counts, and ledger order reject shifted, duplicated,
+  missing, or reordered values; and
+- truth imports and label/metric fields are rejected across arming,
+  authorization, running, successful/failure finalization, and receipts;
+  fault injection after partial writes publishes no canonical output.
+
+Throughout these tests, patch `_phase_data()`, `evaluate()`, and
+`derive_market_truth()` to raise at every forward entrypoint. Instrument
+target-bearing `Windows.__getitem__()` to permit only the exact retained
+training coordinates and fail any nontraining or prediction access.
 
 The first portfolio candidate is fixed before its results:
 
@@ -584,6 +717,12 @@ and [Reality Check](https://doi.org/10.1111/1468-0262.00152) literature.
 Do not claim a
 [Deflated Sharpe Ratio](https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf)
 or formal probability of overfitting from this sparse realized-event path.
+
+The rolling-origin rule follows the
+[prequential principle](https://doi.org/10.2307/2981683) and the
+[out-of-sample forecasting review](https://doi.org/10.1016/S0169-2070(00)00065-0):
+each prediction is judged against information available at its own origin,
+while later origins may use newly completed observations.
 
 The fixed-impact, full-fill model is appropriate only for the registered
 `$100` diagnostic. Before increasing notional, freeze spread/quote inputs,
