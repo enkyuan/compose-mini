@@ -461,6 +461,31 @@ def test_armer_preserves_authenticated_repository_path() -> None:
     assert result.stdout == ""
 
 
+def test_runner_package_alias_shares_finalizer_state() -> None:
+    script = (
+        "import importlib.util,sys; "
+        f"root={str(ROOT)!r}; "
+        f"path={str(ROOT / 'tools/run_context_diagnostic.py')!r}; "
+        "sys.path.append(root); "
+        "spec=importlib.util.spec_from_file_location("
+        "'context_runner_script',path); "
+        "runner=importlib.util.module_from_spec(spec); "
+        "sys.modules[spec.name]=runner; "
+        "spec.loader.exec_module(runner); "
+        "runner._register_package_alias(); "
+        "import tools.finalize_context_diagnostic as finalizer; "
+        "assert finalizer.RunClaim is runner.RunClaim; "
+        "assert finalizer.publish_context_outcome.__globals__['_CLAIMS'] "
+        "is runner._CLAIMS"
+    )
+    result = subprocess.run(
+        (sys.executable, "-I", "-S", "-B", "-c", script),
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
 def test_controller_failure_publishes_one_terminal_outcome() -> None:
     import tools.run_universe_scaling as scaling_runner
 
@@ -1478,6 +1503,7 @@ def main() -> None:
     test_loose_executor_cannot_complete_an_armed_attempt()
     test_controller_authenticates_before_claim_and_finalizes_after_exit()
     test_armer_preserves_authenticated_repository_path()
+    test_runner_package_alias_shares_finalizer_state()
     test_controller_failure_publishes_one_terminal_outcome()
     test_isolated_controller_bootstrap_rejects_an_unbound_attempt()
     test_claim_is_parent_synced()

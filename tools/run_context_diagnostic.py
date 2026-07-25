@@ -7,6 +7,7 @@ import sys
 
 _BOOTSTRAP_FLAGS = ("-I", "-S", "-B")
 _BOOTSTRAP_CACHE_PREFIX: str | None = None
+_PACKAGE_NAME = "tools.run_context_diagnostic"
 
 
 def _require_isolated_execution(*, bootstrapped: bool = False) -> None:
@@ -47,6 +48,18 @@ def _require_exact_launch(*, pristine: bool = False) -> None:
        canonical(tuple(sys.orig_argv)) != expected or \
        os.path.realpath(sys.argv[0]) != os.path.realpath(__file__):
         raise ValueError("context runner requires the exact bound launch")
+
+
+def _register_package_alias() -> None:
+    module = sys.modules[__name__]
+    if _PACKAGE_NAME in sys.modules:
+        raise ValueError("context runner package alias is unsafe")
+    sys.modules[_PACKAGE_NAME] = module
+
+
+def _require_package_alias() -> None:
+    if sys.modules.get(_PACKAGE_NAME) is not sys.modules[__name__]:
+        raise ValueError("context runner package alias changed")
 
 
 def _bootstrap_main() -> None:
@@ -102,6 +115,7 @@ def _bootstrap_main() -> None:
            map(os.path.realpath, package.__path__)
        ) != locations:
         raise ValueError("tools namespace import is unsafe")
+    _register_package_alias()
     _BOOTSTRAP_CACHE_PREFIX = prefix
 
 
@@ -1082,6 +1096,7 @@ def _attempt_path(path: Path) -> tuple[Path, Path]:
 
 def read_context_attempt(path: Path) -> ContextAttempt:
     """Read one canonical attempt without claiming its run directory."""
+    _require_package_alias()
     absolute, logical = _attempt_path(path)
     return ContextAttempt.read(absolute, logical, ROOT)
 
@@ -1149,6 +1164,7 @@ def execute_context_attempt(path: Path) -> Mapping[str, object]:
             _expose_torch_package(Path(
                 attempt.torch_probe.package_tree.root,
             ))
+            _require_package_alias()
             from tools.finalize_context_diagnostic import finalize_context_history
 
             claim = claim_run(ROOT, ROOT / attempt.attempt_path)
