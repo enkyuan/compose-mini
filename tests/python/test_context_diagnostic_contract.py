@@ -14,12 +14,15 @@ from tools.context_diagnostic_contract import (
     BATCH_SIZE, CONTROL_COHORT, CONTROL_MODELS, EVALUATION_RANKS,
     HISTORY_LENGTHS, MAX_HISTORY, MODELS, PHASE_RANGES, PRIMARY_MODEL,
     RUNTIME_MODELS, RUNTIME_TO_PUBLIC, SCALER_POLICY, SEEDS, TARGET_PHASES,
-    ContextPhase,
+    ContextPhase, ContextReceipt,
+    context_family_sha256, context_fit_record, context_phase_sha256,
+    context_prediction_record,
     context_provenance_id, expected_context_fits,
     expected_context_predictions, expected_context_sweep,
-    parse_context_phases, validate_context_sweep,
+    parse_context_phases, validate_context_fit_records,
+    validate_context_prediction_records, validate_context_sweep,
 )
-from tools.panel_contract import read_canonical_json
+from tools.panel_contract import FileBinding, read_canonical_json
 from tools.universe_scaling_contract import FitJob, fit_provenance_id
 
 CONFIG = ROOT / "experiments/executable-h13-context.example.json"
@@ -352,11 +355,163 @@ def test_provenance_binds_every_treatment() -> None:
         raise AssertionError("context phase is mutable")
 
 
+def test_evidence_and_receipt_closure() -> None:
+    phase = ContextPhase.parse(phase_value(TARGET_PHASES[0]), MASTER)
+    fits = expected_context_fits(MASTER, phase)
+    fit_records = [
+        context_fit_record(
+            fit,
+            context_provenance_id(
+                fit, phase, SOURCE_FAILURE, CONFIG_SHA256,
+            ),
+            digest(f"state-{index}"),
+            index / 100.0,
+        )
+        for index, fit in enumerate(fits)
+    ]
+    evidence = validate_context_fit_records(
+        fit_records, MASTER, phase, SOURCE_FAILURE, CONFIG_SHA256,
+    )
+    assert len(evidence) == 33
+    assert tuple(item.fit for item in evidence) == fits
+
+    by_fit = {item.fit: item for item in evidence}
+    prediction_records = [
+        context_prediction_record(
+            prediction, by_fit[prediction.fit],
+            [index / 100.0] * prediction.prediction_count,
+        )
+        for index, prediction in enumerate(
+            expected_context_predictions(MASTER, phase),
+        )
+    ]
+    predictions = validate_context_prediction_records(
+        prediction_records, MASTER, phase, fit_records,
+        SOURCE_FAILURE, CONFIG_SHA256,
+    )
+    assert len(predictions) == 363
+    assert tuple(item.prediction for item in predictions) == \
+        expected_context_predictions(MASTER, phase)
+
+    attempt = FileBinding(
+        "experiments/context-attempt.json", digest("attempt"),
+    )
+    fit_ledger = FileBinding("reports/context/fits.jsonl", digest("fits"))
+    prediction_ledger = FileBinding(
+        "reports/context/predictions.jsonl", digest("predictions"),
+    )
+    run_identity = (7, 11)
+    receipt = ContextReceipt.parse({
+        "attempt": attempt.__dict__,
+        "evaluation_grid_sha256": phase.evaluation_grid_sha256,
+        "family_sha256": context_family_sha256(),
+        "fit_count": len(evidence),
+        "fits": fit_ledger.__dict__,
+        "phase": phase.phase,
+        "phase_sha256": context_phase_sha256(phase),
+        "prediction_count": len(predictions),
+        "predictions": prediction_ledger.__dict__,
+        "run_identity": list(run_identity),
+        "schema": 1,
+        "source_tree_sha256": digest("source-tree"),
+    })
+    receipt.validate(
+        phase, attempt, fit_ledger, prediction_ledger, digest("source-tree"),
+        run_identity,
+    )
+
+    for records, validator, args in (
+        (
+            fit_records[:-1], validate_context_fit_records,
+            (MASTER, phase, SOURCE_FAILURE, CONFIG_SHA256),
+        ),
+        (
+            [fit_records[1], fit_records[0], *fit_records[2:]],
+            validate_context_fit_records,
+            (MASTER, phase, SOURCE_FAILURE, CONFIG_SHA256),
+        ),
+        (
+            prediction_records[:-1], validate_context_prediction_records,
+            (
+                MASTER, phase, fit_records,
+                SOURCE_FAILURE, CONFIG_SHA256,
+            ),
+        ),
+        (
+            [
+                prediction_records[1], prediction_records[0],
+                *prediction_records[2:],
+            ],
+            validate_context_prediction_records,
+            (
+                MASTER, phase, fit_records,
+                SOURCE_FAILURE, CONFIG_SHA256,
+            ),
+        ),
+    ):
+        raises(validator, records, *args)
+
+    invalid = copy.deepcopy(fit_records)
+    invalid[0]["state_fingerprint"] = "invalid"
+    raises(
+        validate_context_fit_records, invalid, MASTER, phase,
+        SOURCE_FAILURE, CONFIG_SHA256,
+    )
+    invalid = copy.deepcopy(prediction_records)
+    invalid[0]["fit_provenance_id"] = digest("wrong-fit")
+    raises(
+        validate_context_prediction_records, invalid, MASTER, phase,
+        fit_records, SOURCE_FAILURE, CONFIG_SHA256,
+    )
+    invalid = copy.deepcopy(prediction_records)
+    invalid[0]["predictions"]["count"] -= 1
+    raises(
+        validate_context_prediction_records, invalid, MASTER, phase,
+        fit_records, SOURCE_FAILURE, CONFIG_SHA256,
+    )
+    invalid = {
+        **receipt.value(),
+        "evaluation_grid_sha256": digest("wrong-grid"),
+    }
+    raises(
+        ContextReceipt.parse(invalid).validate,
+        phase, attempt, fit_ledger, prediction_ledger,
+        digest("source-tree"), run_identity,
+    )
+    changed = replace(
+        phase, training_grid_sha256=digest("other-training-grid"),
+    )
+    raises(
+        receipt.validate, changed, attempt, fit_ledger,
+        prediction_ledger, digest("source-tree"), run_identity,
+    )
+    raises(
+        receipt.validate, phase, attempt, fit_ledger,
+        prediction_ledger, digest("source-tree"), (7, 12),
+    )
+    invalid = {**receipt.value(), "run_identity": [7.0, 11]}
+    raises(ContextReceipt.parse, invalid)
+
+    for field in ("history", "seed", "prediction_count"):
+        invalid = copy.deepcopy(prediction_records)
+        index = 11 if field == "seed" else 0
+        invalid[index][field] = float(invalid[index][field])
+        raises(
+            validate_context_prediction_records, invalid, MASTER, phase,
+            fit_records, SOURCE_FAILURE, CONFIG_SHA256,
+        )
+    raises(
+        context_fit_record, fits[0], evidence[0].provenance_id,
+        evidence[0].state_fingerprint, 10 ** 10_000,
+    )
+
+
 def main() -> None:
     test_exact_sweep()
     test_phase_family_and_closure()
     test_phase_rejections()
     test_provenance_binds_every_treatment()
+    test_evidence_and_receipt_closure()
 
 
 if __name__ == "__main__":

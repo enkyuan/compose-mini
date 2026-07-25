@@ -6,10 +6,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from types import MappingProxyType
 
+from tools.float32 import decode_f32le_base64, encode_f32le_base64
 from tools.panel_contract import (
-    _exact_json, _integer, _object, _sha256, _string,
+    FileBinding, _exact_json, _integer, _object, _sha256, _string,
 )
 from tools.universe_contract import fixed_update_budget, universe_roles
 from tools.universe_scaling_contract import (
@@ -308,6 +310,22 @@ class ContextPrediction:
     grid_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ContextFitEvidence:
+    fit: ContextFit
+    provenance_id: str
+    state_fingerprint: str
+    training_loss: float
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPredictionEvidence:
+    prediction: ContextPrediction
+    fit_provenance_id: str
+    state_fingerprint: str
+    values: tuple[float, ...]
+
+
 def expected_context_fits(
     master: Sequence[str], phase: ContextPhase,
 ) -> tuple[ContextFit, ...]:
@@ -378,3 +396,269 @@ def context_provenance_id(
     return hashlib.sha256(json.dumps(
         payload, allow_nan=False, separators=(",", ":"), sort_keys=True,
     ).encode()).hexdigest()
+
+
+def context_family_sha256() -> str:
+    """Hash the predeclared model family independently of any run."""
+    return hashlib.sha256(json.dumps(
+        expected_context_sweep(), allow_nan=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode()).hexdigest()
+
+
+def context_phase_sha256(phase: ContextPhase) -> str:
+    """Hash every frozen axis and grid in one validated target phase."""
+    if not isinstance(phase, ContextPhase):
+        raise ValueError("context phase digest input is invalid")
+    return hashlib.sha256(json.dumps(
+        _phase_value(phase), allow_nan=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode()).hexdigest()
+
+
+def _loss(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("training loss must be numeric")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("training loss must be finite and nonnegative") \
+            from error
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError("training loss must be finite and nonnegative")
+    return result
+
+
+def _fit_value(fit: ContextFit) -> dict[str, object]:
+    value = asdict(fit)
+    value["members"] = list(fit.members)
+    return value
+
+
+def context_fit_record(
+    fit: ContextFit, provenance_id: str, state_fingerprint: str,
+    training_loss: float,
+) -> dict[str, object]:
+    """Serialize one fitted state without adding selection behavior."""
+    if not isinstance(fit, ContextFit):
+        raise ValueError("context fit record is invalid")
+    return {
+        "fit": _fit_value(fit),
+        "provenance_id": _sha256(provenance_id, "context provenance"),
+        "schema": 1,
+        "state_fingerprint": _sha256(
+            state_fingerprint, "context state fingerprint",
+        ),
+        "training_loss": _loss(training_loss),
+    }
+
+
+def validate_context_fit_records(
+    value: object, master: Sequence[str], phase: ContextPhase,
+    source_failure_sha256: str, config_sha256: str,
+) -> tuple[ContextFitEvidence, ...]:
+    """Require the complete ordered physical-fit ledger for one phase."""
+    expected = expected_context_fits(master, phase)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or \
+       len(value) != len(expected):
+        raise ValueError("context fit ledger has the wrong closure")
+    records = []
+    for index, (raw, fit) in enumerate(zip(value, expected, strict=True)):
+        item = _object(
+            raw,
+            {
+                "schema", "fit", "provenance_id", "state_fingerprint",
+                "training_loss",
+            },
+            f"context fit[{index}]",
+        )
+        provenance = context_provenance_id(
+            fit, phase, source_failure_sha256, config_sha256,
+        )
+        if _integer(item["schema"], "context fit schema") != 1 or \
+           not _exact_json(item["fit"], _fit_value(fit)) or \
+           _sha256(item["provenance_id"], "context fit provenance") != \
+                provenance:
+            raise ValueError("context fit ledger order or provenance changed")
+        records.append(ContextFitEvidence(
+            fit, provenance,
+            _sha256(
+                item["state_fingerprint"], "context state fingerprint",
+            ),
+            _loss(item["training_loss"]),
+        ))
+    return tuple(records)
+
+
+def context_prediction_record(
+    prediction: ContextPrediction, fit: ContextFitEvidence,
+    values: Sequence[float],
+) -> dict[str, object]:
+    """Serialize one label-free prediction vector for a bound fitted state."""
+    if not isinstance(prediction, ContextPrediction) or \
+       not isinstance(fit, ContextFitEvidence) or prediction.fit != fit.fit:
+        raise ValueError("context prediction fit is invalid")
+    payload = encode_f32le_base64(values)
+    if payload["count"] != prediction.prediction_count:
+        raise ValueError("context prediction count changed")
+    return {
+        "fit_provenance_id": fit.provenance_id,
+        "grid_sha256": prediction.grid_sha256,
+        "history": prediction.fit.history,
+        "model": prediction.fit.model,
+        "phase": prediction.fit.phase,
+        "prediction_count": prediction.prediction_count,
+        "predictions": payload,
+        "schema": 1,
+        "seed": prediction.fit.seed,
+        "series": prediction.series,
+        "state_fingerprint": fit.state_fingerprint,
+    }
+
+
+def validate_context_prediction_records(
+    value: object, master: Sequence[str], phase: ContextPhase,
+    fit_records: object, source_failure_sha256: str, config_sha256: str,
+) -> tuple[ContextPredictionEvidence, ...]:
+    """Require the complete ordered prediction ledger for one phase."""
+    expected = expected_context_predictions(master, phase)
+    fitted = validate_context_fit_records(
+        fit_records, master, phase, source_failure_sha256, config_sha256,
+    )
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or \
+       len(value) != len(expected):
+        raise ValueError("context prediction inputs have the wrong closure")
+    by_fit = {item.fit: item for item in fitted}
+    records = []
+    fields = {
+        "schema", "phase", "model", "history", "seed", "series",
+        "prediction_count", "grid_sha256", "fit_provenance_id",
+        "state_fingerprint", "predictions",
+    }
+    for index, (raw, prediction) in enumerate(zip(
+        value, expected, strict=True,
+    )):
+        item = _object(raw, fields, f"context prediction[{index}]")
+        fit = by_fit[prediction.fit]
+        axes = (
+            item["phase"], item["model"], item["history"], item["seed"],
+            item["series"], item["prediction_count"],
+        )
+        expected_axes = (
+            prediction.fit.phase, prediction.fit.model,
+            prediction.fit.history, prediction.fit.seed,
+            prediction.series, prediction.prediction_count,
+        )
+        if _integer(item["schema"], "context prediction schema") != 1 or \
+           not _exact_json(list(axes), list(expected_axes)) or \
+           _sha256(item["grid_sha256"], "context prediction grid") != \
+                prediction.grid_sha256 or \
+           _sha256(
+               item["fit_provenance_id"], "context prediction provenance",
+           ) != fit.provenance_id or \
+           _sha256(
+               item["state_fingerprint"], "context prediction state",
+           ) != fit.state_fingerprint:
+            raise ValueError("context prediction closure changed")
+        records.append(ContextPredictionEvidence(
+            prediction, fit.provenance_id, fit.state_fingerprint,
+            decode_f32le_base64(
+                item["predictions"],
+                expected_count=prediction.prediction_count,
+            ),
+        ))
+    return tuple(records)
+
+
+def _run_identity(value: object) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("context run identity is invalid")
+    return (
+        _integer(value[0], "context run device", 0),
+        _integer(value[1], "context run inode", 1),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextReceipt:
+    """Bind complete phase evidence to one immutable run directory."""
+
+    phase: str
+    attempt: FileBinding
+    fits: FileBinding
+    predictions: FileBinding
+    evaluation_grid_sha256: str
+    family_sha256: str
+    phase_sha256: str
+    source_tree_sha256: str
+    run_identity: tuple[int, int]
+    fit_count: int
+    prediction_count: int
+
+    @classmethod
+    def parse(cls, value: object) -> ContextReceipt:
+        item = _object(
+            value,
+            {
+                "schema", "phase", "attempt", "fits", "predictions",
+                "evaluation_grid_sha256", "family_sha256",
+                "phase_sha256", "source_tree_sha256",
+                "run_identity", "fit_count", "prediction_count",
+            },
+            "context receipt",
+        )
+        phase = _string(item["phase"], "context receipt phase")
+        if _integer(item["schema"], "context receipt schema") != 1 or \
+           phase not in TARGET_PHASES:
+            raise ValueError("context receipt identity is invalid")
+        attempt = FileBinding.parse(item["attempt"], "receipt attempt")
+        fits = FileBinding.parse(item["fits"], "receipt fits")
+        predictions = FileBinding.parse(
+            item["predictions"], "receipt predictions",
+        )
+        if len({attempt.path, fits.path, predictions.path}) != 3:
+            raise ValueError("context receipt paths must be distinct")
+        return cls(
+            phase, attempt, fits, predictions,
+            _sha256(
+                item["evaluation_grid_sha256"], "receipt evaluation grid",
+            ),
+            _sha256(item["family_sha256"], "receipt family"),
+            _sha256(item["phase_sha256"], "receipt phase"),
+            _sha256(item["source_tree_sha256"], "receipt source tree"),
+            _run_identity(item["run_identity"]),
+            _integer(item["fit_count"], "receipt fit count"),
+            _integer(item["prediction_count"], "receipt prediction count"),
+        )
+
+    def value(self) -> dict[str, object]:
+        return {
+            "attempt": asdict(self.attempt),
+            "evaluation_grid_sha256": self.evaluation_grid_sha256,
+            "family_sha256": self.family_sha256,
+            "fit_count": self.fit_count,
+            "fits": asdict(self.fits),
+            "phase": self.phase,
+            "phase_sha256": self.phase_sha256,
+            "prediction_count": self.prediction_count,
+            "predictions": asdict(self.predictions),
+            "run_identity": list(self.run_identity),
+            "schema": 1,
+            "source_tree_sha256": self.source_tree_sha256,
+        }
+
+    def validate(
+        self, phase: ContextPhase, attempt: FileBinding,
+        fits: FileBinding, predictions: FileBinding,
+        source_tree_sha256: str, run_identity: tuple[int, int],
+    ) -> None:
+        if not isinstance(phase, ContextPhase) or \
+           self != ContextReceipt(
+               phase.phase, attempt, fits, predictions,
+               phase.evaluation_grid_sha256, context_family_sha256(),
+               context_phase_sha256(phase),
+               _sha256(source_tree_sha256, "receipt source tree"),
+               _run_identity(run_identity),
+               EXPECTED_FITS_PER_PHASE, EXPECTED_PREDICTIONS_PER_PHASE,
+           ):
+            raise ValueError("context receipt does not bind the phase")
