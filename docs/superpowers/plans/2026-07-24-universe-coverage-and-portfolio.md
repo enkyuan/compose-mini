@@ -505,16 +505,24 @@ terminal log growth and then lower turnover. Cash wins an exact
 growth-and-turnover tie against a forecast trial; among forecast trials, prefer
 higher safety and then smaller lambda.
 
-For each selection trial, define gross turnover as the sum of entry and exit
-notionals divided by that trial's initial `$100`. Fold-0 is selection-only and
-contributes no evidence equity. Start one evidence account at `$100` on fold-1
-using the fold-0-selected rule. Require all fold-1 positions closed before its
-boundary. Select the calibration rule from fold-1 after fold-1 closes, then
-carry that same account's terminal cash unchanged through the zero-yield
-embargo into calibration. The new rule controls only future calibration
+For each fold-1 selection trial, define gross turnover as the sum of entry and
+exit notionals divided by that trial's initial `$100`. Fold-0 has no
+forward-clean ledger and contributes neither portfolio-policy selection nor
+evidence equity. Before any fold-1 truth is read, freeze its evidence rule as
+`long_above` with `safety_bps = 0` and `disagreement_lambda = 0`. Start one
+evidence account at `$100` under that rule and require every fold-1 position to
+close before its boundary.
+
+After fold-1 closes, evaluate the registered 13 trials on fold-1 from separate
+`$100` selection accounts and select the rule for calibration. Carry the
+evidence account's actual fold-1 terminal cash unchanged through the zero-yield
+embargo into calibration. The selected rule controls only future calibration
 actions; it cannot replace or rewind the fold-1 cash path. Combined evidence
 turnover sums both phases' notionals and divides once by the original `$100`.
-No position may cross a policy or phase boundary.
+No position may cross a policy or phase boundary. Selection and control
+accounts are counterfactual replays: they are neither simultaneously funded nor
+pooled with the one carried `$100` evidence account, and selection-account cash
+is discarded after ranking.
 
 The comparison controls are:
 
@@ -577,7 +585,8 @@ outside this checkpoint.
 
 ### Frozen promotion gate
 
-Before reading portfolio results, require all of:
+Freeze these predicates before reading portfolio results, then evaluate them
+against the terminal portfolio outcome:
 
 - exact candidate axes and complete five-seed forward ledgers;
 - no protected rows and no position crossing a phase boundary;
@@ -586,20 +595,31 @@ Before reading portfolio results, require all of:
 - final equity above both `$100` cash and the costed always-up control.
 
 This is a new scaling gate, not the historical H13 per-stock gate. Failure
-keeps the protected block closed.
+of any predicate keeps the protected block closed.
 
 Tests must prove:
 
 - future-phase label mutation cannot change an earlier model or policy;
-- fold-0 contributes zero evidence equity;
+- fold-0 contributes neither portfolio-policy selection nor evidence equity;
+- the fixed fold-1 evidence rule is bound before truth access and is unchanged
+  by the fold-1-selected calibration portfolio policy;
 - fold-1 terminal cash is calibration initial cash exactly;
+- a divergent synthetic path proves calibration receives the fixed-rule
+  evidence cash, not the winning selection trial's cash, and that every
+  selection-account balance is discarded after ranking;
+- a separate divergent path proves cash and always-up each start at `$100`,
+  carry only their own balances across phases, and cannot alter evidence cash;
 - equal-score lower-rank selection, exact manifest-map validation, duplicate
   rejection, seed completeness, costs, and returns are exact;
 - an entry at the same timestamp as the prior target is rejected;
 - exposure never exceeds one and positions never overlap or cross boundaries;
 - unrelated phase/provenance/question/mode/cohort/model records are rejected;
 - sparse reports contain no bar-close, period-return, or intratrade claim;
-- protected rows are rejected before any outcome accessor is called.
+- protected rows are rejected before any outcome accessor is called;
+- promotion-gate boundaries fail closed at `7` versus `8` trades in either
+  phase, `19` versus `20` total trades, zero phase log return, and final-equity
+  equality with either cash or always-up; every failed predicate keeps the
+  protected block closed.
 
 ## Protected and future-confirmation boundary
 
