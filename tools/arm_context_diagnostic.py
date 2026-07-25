@@ -58,7 +58,8 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in tuple(map(os.path.realpath, sys.path)):
+    sys.path.insert(0, str(ROOT))
 
 from tools.context_diagnostic_contract import (
     BATCH_SIZE, CONTEXT_CONFIG, CONTEXT_SOURCE_PATHS, EVALUATION_RANKS,

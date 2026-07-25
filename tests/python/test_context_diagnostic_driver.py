@@ -446,6 +446,21 @@ def test_controller_authenticates_before_claim_and_finalizes_after_exit() -> Non
         assert events.index("finalize") > events.index("lease-exit")
 
 
+def test_armer_preserves_authenticated_repository_path() -> None:
+    script = (
+        f"import os,sys; root={str(ROOT)!r}; sys.path.append(root); "
+        "import tools.arm_context_diagnostic; "
+        "paths=tuple(map(os.path.realpath,sys.path)); "
+        "assert paths.count(root)==1 and paths[-1]==root"
+    )
+    result = subprocess.run(
+        (sys.executable, "-I", "-S", "-B", "-c", script),
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
 def test_controller_failure_publishes_one_terminal_outcome() -> None:
     import tools.run_universe_scaling as scaling_runner
 
@@ -1462,6 +1477,7 @@ def main() -> None:
     test_failed_authentication_exit_cannot_complete_a_phase()
     test_loose_executor_cannot_complete_an_armed_attempt()
     test_controller_authenticates_before_claim_and_finalizes_after_exit()
+    test_armer_preserves_authenticated_repository_path()
     test_controller_failure_publishes_one_terminal_outcome()
     test_isolated_controller_bootstrap_rejects_an_unbound_attempt()
     test_claim_is_parent_synced()

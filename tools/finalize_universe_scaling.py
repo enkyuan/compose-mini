@@ -136,7 +136,8 @@ import os
 import stat
 
 ROOT = Path(__file__).resolve().parents[1]
-if sys.flags.isolated and _BOOTSTRAP_CACHE_PREFIX is None:
+if sys.flags.isolated and _BOOTSTRAP_CACHE_PREFIX is None and \
+        str(ROOT) not in tuple(map(os.path.realpath, sys.path)):
     sys.path.append(str(ROOT))
 
 from tools.files import (

@@ -19,7 +19,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in tuple(map(os.path.realpath, sys.path)):
+    sys.path.insert(0, str(ROOT))
 
 from tools.data_v1 import CSV_HEADER, read_csv
 from tools.float32 import f32
