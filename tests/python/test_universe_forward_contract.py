@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the PASS-only universe-forward selection contract."""
+"""Verify terminal scaling evidence and PASS-only forward selection."""
 
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, asdict, replace
@@ -20,7 +20,8 @@ from tools.panel_contract import FileBinding
 from tools.universe_forward_contract import (
     CheckpointSelection, ForwardFitSpec, ForwardPredictionSpec,
     forward_fit_specs, forward_model_fingerprint, forward_prediction_specs,
-    read_passing_scaling_outcome, resolve_prior_checkpoint,
+    read_passing_scaling_outcome, read_scaling_failure,
+    resolve_prior_checkpoint,
 )
 from tools.universe_scaling_contract import (
     EXPECTED_BUDGETS, PHASES, SEEDS, FitJob, PhaseCoverage,
@@ -123,9 +124,11 @@ def fit_closure(
 def fixture(
     root: Path,
     *,
+    status: str = "pass",
     change_summary: object | None = None,
     change_outcome: object | None = None,
 ) -> tuple[FileBinding, object, FitClosure]:
+    failed = status == "gate-failure"
     attempt_path = root / "experiments/run-attempt.json"
     outcome_path = root / "experiments/run-outcome.json"
     fits_path = root / "reports/run/fits.jsonl"
@@ -139,7 +142,7 @@ def fixture(
     predictions = binding(predictions_path, digest(3))
     summary = {
         "schema": 1,
-        "status": "pass",
+        "status": status,
         "evidence_role": "development-diagnostic-not-forward-clean",
         "ensemble": "arithmetic-mean-of-five-neural-returns",
         "fold_role": "checkpoint-selection-audit-development-diagnostic",
@@ -158,8 +161,11 @@ def fixture(
         "results": [],
         "paired_calibration": {},
         "gates": {
-            **{name: {"pass": True} for name in GATES},
-            "all_pass": True,
+            **{
+                name: {"pass": not failed or index > 0}
+                for index, name in enumerate(GATES)
+            },
+            "all_pass": not failed,
         },
         "inputs": {
             "attempt": attempt, "fits": fits, "predictions": predictions,
@@ -186,8 +192,8 @@ def fixture(
         "started": "2026-07-24T00:00:00Z",
         "ended": "2026-07-24T01:00:00Z",
         "stage": "analysis",
-        "exit": 0,
-        "status": "pass",
+        "exit": 3 if failed else 0,
+        "status": status,
         "outputs": outputs,
         "integrity": {
             "trusted_finalizer_tree": digest(6),
@@ -320,6 +326,74 @@ def test_pass_rejections() -> None:
             ),
         )
         raises(read_fixture, expected, manifest, closure, root)
+
+
+def test_failure_reader() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        expected, manifest, closure = fixture(root, status="gate-failure")
+        value = read_fixture(
+            expected, manifest, closure, root,
+            reader=read_scaling_failure,
+        )
+        assert value.run_id == "run"
+        assert value.outcome == expected
+        assert value.summary.path == str(root / "reports/run/summary.json")
+        assert value.failed_gates == (GATES[0],)
+        assert not hasattr(value, "manifest")
+
+        try:
+            value.failed_gates = ()  # type: ignore[misc]
+        except FrozenInstanceError:
+            pass
+        else:
+            raise AssertionError("scaling failure is mutable")
+
+        raises(
+            read_fixture, replace(expected, sha256=digest(99)),
+            manifest, closure, root, reader=read_scaling_failure,
+        )
+
+
+def test_failure_rejections() -> None:
+    cases = (
+        (None, lambda item: item.__setitem__("status", "pass")),
+        (None, lambda item: item.__setitem__("exit", 0)),
+        (lambda item: item.__setitem__("status", "pass"), None),
+        (lambda item: item["gates"].__setitem__("all_pass", True), None),
+        (lambda item: item["gates"][GATES[0]].__setitem__("pass", True),
+         None),
+        (lambda item: item["gates"][GATES[0]].__setitem__("pass", 0), None),
+        (lambda item: item["locks"].__setitem__(
+            "trading_authorized", True,
+        ), None),
+        (None, lambda item: item["outputs"]["fits"].__setitem__(
+            "sha256", digest(99),
+        )),
+    )
+    for change_summary, change_outcome in cases:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            values = fixture(
+                root, status="gate-failure",
+                change_summary=change_summary,
+                change_outcome=change_outcome,
+            )
+            raises(
+                read_fixture, *values, root, reader=read_scaling_failure,
+            )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        expected, manifest, closure = fixture(
+            root, status="gate-failure",
+            change_outcome=lambda item:
+            item["outputs"]["summary"].__setitem__("path", "/outside.json"),
+        )
+        raises(
+            read_fixture, expected, manifest, closure, root,
+            reader=read_scaling_failure,
+        )
 
 
 def test_checkpoint_selection() -> None:
@@ -711,6 +785,8 @@ def test_forward_prediction_specs() -> None:
 def main() -> None:
     test_pass_reader()
     test_pass_rejections()
+    test_failure_reader()
+    test_failure_rejections()
     test_checkpoint_selection()
     test_forward_fit_specs()
     test_forward_model_fingerprint()

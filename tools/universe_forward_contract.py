@@ -88,6 +88,14 @@ class PassingScalingOutcome:
     selections: tuple[CheckpointSelection, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ScalingFailure:
+    run_id: str
+    outcome: FileBinding
+    summary: FileBinding
+    failed_gates: tuple[str, ...]
+
+
 def _external(value: object, label: str) -> FileBinding:
     if not isinstance(value, FileBinding):
         raise ValueError(f"{label} is invalid")
@@ -118,14 +126,28 @@ def _rooted(binding: FileBinding, root: Path, label: str) -> Path:
     return path
 
 
+def _repository_root(root: Path) -> Path:
+    if not isinstance(root, Path):
+        raise ValueError("repository root must be resolved")
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("repository root is unavailable") from error
+    if root != resolved:
+        raise ValueError("repository root must be resolved")
+    return root
+
+
 def _summary(
     value: object,
     bindings: tuple[FileBinding, FileBinding, FileBinding],
-) -> None:
+    status: str = "pass",
+) -> tuple[str, ...]:
     item = _object(value, SUMMARY_FIELDS, "scaling summary")
     locks = _object(item["locks"], set(LOCKS), "summary locks")
-    if type(item["schema"]) is not int or item["schema"] != 1 or \
-       item["status"] != "pass" or \
+    if status not in ("pass", "gate-failure") or \
+       type(item["schema"]) is not int or item["schema"] != 1 or \
+       item["status"] != status or \
        item["evidence_role"] != \
             "development-diagnostic-not-forward-clean" or \
        item["gate_source"] != "fixed-update-calibration-only" or \
@@ -137,12 +159,18 @@ def _summary(
        ):
         raise ValueError("scaling summary is not a passing diagnostic")
     gates = _object(item["gates"], {*GATES, "all_pass"}, "summary gates")
-    if gates["all_pass"] is not True or any(
+    if any(
         not isinstance(gates[name], Mapping) or
-        gates[name].get("pass") is not True
+        type(gates[name].get("pass")) is not bool
         for name in GATES
     ):
-        raise ValueError("scaling summary gates did not all pass")
+        raise ValueError("scaling summary gates are invalid")
+    failed = tuple(sorted(
+        name for name in GATES if gates[name]["pass"] is False
+    ))
+    passed = status == "pass"
+    if gates["all_pass"] is not passed or bool(failed) == passed:
+        raise ValueError("scaling summary status and gates disagree")
     inputs = _object(
         item["inputs"], {"attempt", "fits", "predictions"}, "summary inputs",
     )
@@ -153,18 +181,21 @@ def _summary(
     )
     if observed != bindings:
         raise ValueError("scaling summary inputs changed")
+    return failed
 
 
 def _outcome(
     value: object, expected: FileBinding, root: Path,
+    terminal: tuple[str, int] = ("pass", 0),
 ) -> tuple[
     str, FileBinding, FileBinding, FileBinding, FileBinding, str, FileBinding,
 ]:
     item = _object(value, OUTCOME_FIELDS, "scaling outcome")
-    if type(item["schema"]) is not int or item["schema"] != 1 or \
-       item["status"] != "pass" or item["stage"] != "analysis" or \
-       type(item["exit"]) is not int or item["exit"] != 0:
-        raise ValueError("scaling outcome is not a terminal pass")
+    if terminal not in (("pass", 0), ("gate-failure", 3)) or \
+       type(item["schema"]) is not int or item["schema"] != 1 or \
+       item["status"] != terminal[0] or item["stage"] != "analysis" or \
+       type(item["exit"]) is not int or item["exit"] != terminal[1]:
+        raise ValueError("scaling outcome terminal state is invalid")
     started = _timestamp(item["started"], "outcome start")
     ended = _timestamp(item["ended"], "outcome end")
     if ended < started:
@@ -248,14 +279,7 @@ def read_passing_scaling_outcome(
 ) -> PassingScalingOutcome:
     """Load one exact terminal PASS and its validated physical-fit closure."""
     expected = _external(outcome, "scaling outcome")
-    if not isinstance(root, Path):
-        raise ValueError("repository root must be resolved")
-    try:
-        resolved_root = root.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ValueError("repository root is unavailable") from error
-    if root != resolved_root:
-        raise ValueError("repository root must be resolved")
+    root = _repository_root(root)
     outcome_path = root / expected.path
     outcome_identity = _regular_inputs((outcome_path,))
     with freeze_inputs((outcome_path,)) as (outcome_input,):
@@ -312,6 +336,44 @@ def read_passing_scaling_outcome(
         run_id, expected, attempt, fits, predictions, summary,
         manifest, selections,
     )
+
+
+def read_scaling_failure(
+    outcome: FileBinding, *, root: Path,
+) -> ScalingFailure:
+    """Authenticate one exact terminal development failure."""
+    expected = _external(outcome, "scaling outcome")
+    root = _repository_root(root)
+    outcome_path = root / expected.path
+    outcome_identity = _regular_inputs((outcome_path,))
+    with freeze_inputs((outcome_path,)) as (outcome_input,):
+        if outcome_input.sha256 != expected.sha256:
+            raise ValueError("scaling outcome hash changed")
+        values = _outcome(
+            read_canonical_json(outcome_input.snapshot), expected, root,
+            ("gate-failure", 3),
+        )
+        run_id, attempt, fits, predictions, summary, _, _ = values
+        for binding, label in (
+            (attempt, "attempt"),
+            (fits, "fit ledger"),
+            (predictions, "prediction ledger"),
+            (summary, "summary"),
+        ):
+            _rooted(binding, root, label)
+        summary_path = Path(summary.path)
+        summary_identity = _regular_inputs((summary_path,))
+        with freeze_inputs((summary_path,)) as (summary_input,):
+            summary.validate(summary_input, "summary")
+            failed = _summary(
+                read_canonical_json(summary_input.snapshot),
+                (attempt, fits, predictions), "gate-failure",
+            )
+            _verify_identities(summary_identity)
+            verify_frozen((summary_input,))
+        _verify_identities(outcome_identity)
+        verify_frozen((outcome_input,))
+    return ScalingFailure(run_id, expected, summary, failed)
 
 
 def _selection(
