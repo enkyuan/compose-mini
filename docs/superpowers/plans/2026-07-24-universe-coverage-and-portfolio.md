@@ -106,29 +106,29 @@ reserved-data argument.
 
 ### Public interface
 
-```python
-def replacement_candidate(
+The implementation exposes:
+
+```text
+replacement_candidate(
     selection: Mapping[str, object],
     failed_ticker: str,
-) -> Mapping[str, object]: ...
+) -> Mapping[str, object]
 
-
-def revised_manifest(
+revised_manifest(
     base: Mapping[str, object],
     failed: Mapping[str, object],
     replacement: Mapping[str, object],
     *,
     purpose: str,
     declared_on: str,
-) -> dict[str, object]: ...
+) -> dict[str, object]
 
-
-def apply_overlay(
+apply_overlay(
     policy_path: Path,
     output_path: Path,
     *,
     root: Path = ROOT,
-) -> dict[str, object]: ...
+) -> dict[str, object]
 ```
 
 `replacement_candidate()` requires one selected failed member and chooses the
@@ -233,10 +233,8 @@ manifest hashes, expected phase coverage, update budgets, fetch paths, and
 fit-count assertions into the armer, where a concrete attempt is frozen.
 
 Run focused driver/armer tests, the aggregate gate, and optional Torch gate.
-Before arming, complete Tasks 2 through 4 of
-`2026-07-24-universe-scaling-execution.md`; the referenced runner and finalizer
-do not yet exist. Compare only the already-bound zero, ridge, MLP,
-unconditioned panel Transformer, and conditioned panel Transformer using
+The bound runner and finalizer execute the zero, ridge, MLP, unconditioned
+panel Transformer, conditioned panel Transformer, and local Transformer using
 stock-balanced loss and five fixed seeds. DLinear requires its own later
 checkpoint and must not be added to this frozen attempt implicitly.
 
@@ -247,24 +245,67 @@ phase it predicts. Those ledgers are valid model-development diagnostics, but
 they are not forward-clean trading inputs. Do not pass them to a portfolio
 engine as out-of-sample evidence.
 
-Add a forward-state mode to the scaling runner:
+Do not add a mode to the immutable scaling runner. Arm a separate forward
+attempt only after its bound scaling outcome has status `pass`:
 
-1. Train/evaluate fold-0 only to choose one checkpoint index per exact
-   `(question, mode, cohort, model, seed)` identity.
+1. Consume the canonical fold-0 `selected_checkpoint` record for each exact
+   `(question, mode, cohort, model, seed)` identity; do not retrain fold-0 to
+   rediscover it.
 2. Reinitialize deterministically, train on fold-1's training range for exactly
-   that frozen index and phase-specific updates-per-checkpoint, never evaluate
-   fold-1 during fitting, then predict fold-1 once.
-3. After fold-1 outcomes are complete, use fold-1 only to choose the checkpoint
-   index for calibration.
+   that frozen checkpoint count and phase-specific updates per checkpoint,
+   never evaluate fold-1 during fitting, then predict fold-1 once.
+3. After fold-1 outcomes are complete, freeze the canonical fold-1
+   `selected_checkpoint` record for calibration.
 4. Reinitialize deterministically, train on calibration's training range for
-   exactly that index, never evaluate calibration during fitting, then predict
-   calibration once.
+   exactly that checkpoint count, never evaluate calibration during fitting,
+   then predict calibration once.
 
-Every forward ledger record must bind its prior-phase selection record, fit
-fingerprint, source/runtime/input hashes, exact update count, phase, cohort,
-model, seed, series, and timestamp grid. Mutating fold-1 labels must not change
-the fold-1 model state; mutating calibration labels must not change the
-calibration state.
+After the scaling finalizer is terminal, add one no-validation primitive beside
+`fit_epochs()` in `tools/train.py`:
+
+```python
+def fit_exact_updates(
+    model: nn.Module, loader: DataLoader, updates: int,
+    learning_rate: float, weight_decay: float, device: torch.device,
+) -> int:
+    """Fit one frozen update budget without validation or checkpoint selection."""
+    if type(updates) is not int or updates < 1 or len(loader) != updates:
+        raise ValueError("fixed-update loader does not match its budget")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay,
+    )
+    model.train()
+    batches = iter(loader)
+    for _ in range(updates):
+        try:
+            batch = next(batches)
+        except StopIteration as error:
+            raise ValueError(
+                "fixed-update loader ended before its budget"
+            ) from error
+        _train_batch(model, batch, optimizer, device)
+    return updates
+```
+
+The target phase trains for
+`selected_checkpoint * target_budget.updates_per_checkpoint`; fold-1 therefore
+uses `321` updates per checkpoint and calibration uses `368`. Reuse
+`_neural_model()`, `_stock_uniform_loader()`, `_phase_data()`,
+`model_fingerprint()`, and the existing fit, prediction, and market-truth
+validators. Do not modify `experiment.py` or `run_universe_scaling.py`. Keep the
+forward attempt, one-shot runner, terminal finalizer, and focused tests in
+separate `universe_forward` files so the completed scaling evidence remains
+immutable.
+
+Every forward ledger record must bind the passing scaling outcome, its
+prior-phase selection record, fit fingerprint, source/runtime/input hashes,
+exact update count, phase, cohort, model, seed, series, and timestamp grid.
+Mutating fold-1 validation or outcome labels must not change the fold-1 model
+state; mutating calibration validation or outcome labels must not change the
+calibration state. Mutating a phase's training labels must change its state.
+Test exact update count, early loader exhaustion, non-finite loss rejection,
+deterministic reinitialization, target-phase budget selection, and validation
+and outcome label invariance before arming a forward attempt.
 
 The first portfolio candidate is fixed before its results:
 
@@ -275,18 +316,76 @@ The first portfolio candidate is fixed before its results:
 - seeds: `7, 19, 31, 43, 61`
 - series: every development-evaluable manifest member, in manifest order
 
-Controls use their own separately complete forward ledgers; records from
-another question, mode, cohort, model, seed set, phase, or provenance identity
-must be rejected rather than silently dropped.
+Cash and always-up require no model ledger. Any later forecast-model control
+requires its own complete forward ledger. Records from another question, mode,
+cohort, model, seed set, phase, or provenance identity must be rejected rather
+than silently dropped.
 
 ## Checkpoint 5: Add one shared `$100` development portfolio
 
-Do not change `tools/backtest.py`; it intentionally resets capital per
-series/fold. Add:
+Keep the legacy per-series behavior unchanged. A behavior-preserving refactor
+may move its execution-price and cash arithmetic into one shared pure helper;
+do not duplicate that math. Add:
 
 - `tools/portfolio_backtest.py`
 - `tools/select_portfolio_policy.py`
 - focused tests under `tests/python/`
+
+After the scaling finalizer is terminal, add this public arithmetic seam beside
+`Costs` and make the legacy `_execute()` adapter call it:
+
+```python
+@dataclass(frozen=True, slots=True)
+class LongExecution:
+    shares: float
+    entry_execution_price: float
+    exit_execution_price: float
+    entry_notional: float
+    exit_notional: float
+    cash_after: float
+
+
+def execute_long(
+    cash: float, reference_price: float, outcome_price: float, costs: Costs,
+) -> LongExecution:
+    entry = reference_price * (1.0 + costs.impact)
+    exit_ = outcome_price * (1.0 - costs.impact)
+    shares = cash / (entry * (1.0 + costs.fee))
+    entry_notional, exit_notional = shares * entry, shares * exit_
+    return LongExecution(
+        shares, entry, exit_, entry_notional, exit_notional,
+        exit_notional * (1.0 - costs.fee),
+    )
+```
+
+The portfolio engine consumes validated, market-truth-joined opportunities:
+
+```python
+@dataclass(frozen=True, slots=True)
+class PortfolioOpportunity:
+    phase: str
+    series: str
+    manifest_rank: int
+    as_of: str
+    entry_time: str
+    target_time: str
+    reference_price: float
+    outcome_price: float
+    actual_return: float
+    prediction_mean: float | None
+    prediction_pstdev: float | None
+
+
+```
+
+Implement
+`run_phase(opportunities: Sequence[PortfolioOpportunity], initial_cash: float,
+costs: Costs, *, action: str, safety_bps: float = 0.0,
+disagreement_lambda: float = 0.0) -> dict[str, object]` only after the forward
+ledger schema is frozen. The forward-ledger validator aggregates the exact
+five-seed set once; policy trials reuse `prediction_mean` and
+`prediction_pstdev`. `action` accepts exactly `long_above`, `always_up`, or
+`cash`.
 
 ### Frozen execution contract
 
@@ -296,7 +395,8 @@ Use the existing `Costs` math with:
 - slippage: `1` basis point per side;
 - proportional fee: `0`;
 - cash yield: `0`;
-- fractional shares, no leverage, and gross exposure at most `1`.
+- fractional shares, no leverage, and gross exposure at most `1`;
+- invest `100%` of available cash in the single ranked winner.
 
 For impact
 
@@ -331,6 +431,9 @@ as_of < entry_time <= target_time
 actual_return == log(outcome_price / reference_price)
 ```
 
+The forward ledger has its own schema; it is not legacy backtest schema `2`.
+Join it to the scaling finalizer's bound market truth before executing trades.
+
 At one entry time, rank threshold-passing candidates by descending score, then
 frozen manifest rank, then ticker. A position remains active through the target
 close, so reject every candidate with
@@ -345,18 +448,21 @@ Use the Cartesian grid:
 - cash: an explicit no-trade trial
 
 Select by highest terminal log growth, then lower turnover, higher safety, and
-smaller lambda. Fold-0 is selection-only and contributes no evidence equity.
-Start the evidence account at `$100` on fold-1 using the fold-0-selected rule.
-Require all fold-1 positions closed before its boundary. Select the calibration
-rule from fold-1 after fold-1 closes, then carry fold-1 terminal cash unchanged
-through the zero-yield embargo into calibration. No position may cross a
-policy or phase boundary.
+smaller lambda. Each selection trial may start from a notional `$100`; fold-0
+is selection-only and contributes no evidence equity. Start the one evidence
+account at `$100` on fold-1 using the fold-0-selected rule. Require all fold-1
+positions closed before its boundary. Select the calibration rule from fold-1
+after fold-1 closes, then carry that same account's terminal cash unchanged
+through the zero-yield embargo into calibration. The new rule controls only
+future calibration actions; it cannot replace or rewind the fold-1 cash path.
+No position may cross a policy or phase boundary.
 
 The comparison controls are:
 
 - cash at `$100`, zero yield;
 - always-up, which enters the lowest-manifest-rank eligible genuine bar whenever
-  idle, under the same collision, holding-period, and cost rules.
+  idle on the same phase-evaluable opportunity grid, under the same collision,
+  holding-period, and cost rules.
 
 Omit buy-and-hold until an exact multi-stock basket, missing-bar, rebalance, and
 exit contract is separately frozen.
@@ -366,6 +472,12 @@ Report terminal equity, realized-event drawdown explicitly labeled as neither
 bar-close nor intratrade risk, turnover, completed trades, phase coverage, and
 rejection counts. Do not synthesize daily/weekly/monthly equity or compare this
 drawdown with legacy bar-close curves.
+
+Test costed and frictionless execution, strict break-even comparison,
+manifest-rank and ticker tie-breaking, entry-at-exit collision rejection,
+cross-phase cash carry, cash and always-up without model records, protected
+phase rejection, and the absence of period or bar-close risk claims. One
+zero-cost synthetic path must prove two trades compound `$100 -> $110 -> $121`.
 
 ### Frozen promotion gate
 
