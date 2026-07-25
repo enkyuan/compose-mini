@@ -79,7 +79,9 @@ fold-1 and calibration separately:
 - stock-macro return MAE is strictly decreasing over core breadths
   `11/22/33/55` and unseen-transfer breadths `11/22/33/44`;
 - the largest-breadth unseen-transfer mean \(\Delta\) is nonpositive in each of
-  the five manifest-bound liquidity strata; and
+  the five manifest-bound liquidity strata;
+- the largest-breadth unconditioned global Transformer passes the
+  cross-sectional loss gate below; and
 - no conditioned model is counted as unseen-stock transfer because its ticker
   identity is unavailable for a new stock.
 
@@ -87,6 +89,47 @@ If the curve plateaus or worsens, keep the smaller manifest. More correlated
 rows are not independent evidence. Any later universe requires a new
 point-in-time manifest and a fresh attempt; never append tickers to an existing
 attempt.
+
+Separate market timing from stock selection. Define an execution group as
+\(g=(\text{phase},\text{as-of},\text{entry time},\text{target time})\). Before
+revealing outcomes, bind each group's opportunity identities and require
+exactly one opportunity for every series in the candidate's digest-bound
+manifest. Reject the attempt rather than drop a missing series after outcomes
+are available.
+
+For each group, report the common-signal control
+\(\hat y^{\mathrm{common}}_{i,g}=\bar{\hat y}_g\), mean per-group Spearman
+correlation, and
+
+\[
+R^2_{\mathrm{XS}}
+=
+1-
+\frac{\sum_{g,i}[(y_{i,g}-\bar y_g)-
+(\hat y_{i,g}-\bar{\hat y}_g)]^2}
+{\sum_{g,i}(y_{i,g}-\bar y_g)^2}.
+\]
+
+Also compute the paired cross-sectional absolute-loss difference
+
+\[
+\Delta^{\mathrm{XS}}_{i,g}
+=
+\left|(y_{i,g}-\bar y_g)-(\hat y_{i,g}-\bar{\hat y}_g)\right|
+-|y_{i,g}-\bar y_g|.
+\]
+
+Bootstrap complete trading-day vectors with the same block lengths,
+replicates, seed, and maximum-upper-bound rule used above. The gate passes only
+when the maximum bootstrap 97.5th-percentile upper bound for
+\(\operatorname{mean}(\Delta^{\mathrm{XS}})\) is below zero.
+The \(R^2_{\mathrm{XS}}\) denominator must be positive or the gate fails.
+Include a group in mean Spearman only when it has at least two cells and both
+truth and prediction ranks are nonconstant. Report eligible and excluded
+counts; if no group is eligible, report mean Spearman as `unavailable` without
+changing the loss gate. Better aggregate MAE without this gate is only
+consistent with a common market signal and cannot authorize universe expansion
+or a ranked-winner policy.
 
 ## Checkpoint 2: Test context before architecture
 
@@ -157,48 +200,72 @@ The current score
 
 uses seed disagreement as a ranking heuristic, not predictive uncertainty.
 After the original 13-trial family is frozen, arm one separate one-sided split
-conformal comparison with:
+conformal comparison with scaled and unscaled arms:
 
 - miscoverage target `alpha = 0.10`;
 - numerical floor `epsilon = 1e-6` log-return units;
 - the exact calibration-phase ensemble held fixed across scoring and
   evaluation; and
-- for \(D\) sorted distinct calibration target dates, the first
-  \(\lfloor D/2\rfloor\) as score dates and the remainder as evaluation
-  candidates.
+- for \(D\) sorted distinct calibration target dates, require \(D\ge18\), use
+  the first \(\lfloor D/2\rfloor\) as score dates, and reserve the remainder
+  as evaluation candidates.
 
 The runner must publish every calibration prediction before reading any
 calibration label. It then reveals score-date outcomes, freezes \(q\), and only
 then evaluates a candidate whose `as_of` is strictly later than every score
 `target_time`. Candidates failing that embargo are excluded before policy
-execution. Require at least `2` distinct target dates, `9` score opportunities,
-and one post-embargo evaluation opportunity. For each score opportunity,
-compute
+execution. Require at least `9` score dates and one post-embargo evaluation
+date. Let \(G_d\) contain every opportunity from every complete, prebound
+execution group whose `target_time` maps to registered exchange-session date
+\(d\). Compute the two date-level maximum nonconformity scores
 
 \[
-a_t=\frac{\mu_t-y_t}{\sigma_t+\epsilon}.
+A_d^{(0)}
+=
+\max_{t\in G_d}(\mu_t-y_t),
+\qquad
+A_d^{(\sigma)}
+=
+\max_{t\in G_d}
+\frac{\mu_t-y_t}{\sigma_t+\epsilon}.
 \]
 
-Let \(q\) be the 1-based order statistic at rank
-\(\lceil(n+1)(1-\alpha)\rceil\). The sample-size requirement makes that rank at
-most \(n\). The later lower bound is
+For each arm \(m\), let \(q_m\) be the 1-based order statistic of its
+\(n\) date scores at rank \(\lceil(n+1)(1-\alpha)\rceil\). The sample-size
+requirement makes that rank at most \(n\). Each execution group must contain
+exactly one opportunity for every series in the same digest-bound manifest; a
+date may contain multiple groups and therefore multiple opportunities per
+series. Bind the groups and their date mapping before labels and form them
+identically across phases; reject the attempt if any execution group is
+incomplete. Membership cannot depend on the arm, quantile, threshold, policy,
+prediction, or outcome. The later lower bounds are
 
 \[
-L_t=\mu_t-q(\sigma_t+\epsilon).
+L_t^{(0)}=\mu_t-q_0,
+\qquad
+L_t^{(\sigma)}=\mu_t-q_\sigma(\sigma_t+\epsilon).
 \]
 
-Enter only when \(L_t\) strictly exceeds the cost-only round-trip break-even:
-use `safety_bps = 0` and no additional disagreement penalty. Reject incomplete
-seed sets, non-finite values, duplicate opportunities, and any score fitted
-with an evaluation-date label.
+Date maxima account for within-date multiplicity only; chronological
+dependence still prevents a finite-sample coverage guarantee. Evaluate both
+frozen arms without choosing between them after results. For each arm, replace
+the portfolio score with \(L_t\), enter only when \(L_t\) strictly exceeds the
+cost-only round-trip break-even, and rank passers by descending \(L_t\), then
+ascending manifest rank. Use `safety_bps = 0` and no additional disagreement
+penalty. Reject incomplete seed sets, non-finite values, duplicate
+opportunities, empty date groups, and any score fitted with an evaluation-date
+label.
 
-Report empirical one-sided coverage, the mean/median/90th-percentile lower-bound
-offset \(\mu_t-L_t\), trades, turnover, terminal cash, and realized-exit
-drawdown. A one-sided set \([L_t,\infty)\) has no finite interval width. Time
-dependence and reused development history make this a calibration diagnostic,
-not a claim of conditional or independent 90% coverage. Do not tune `alpha`,
-`epsilon`, or the date split after inspection; adaptive calibration is outside
-this plan.
+Report per-cell and simultaneous-date one-sided coverage, selected-opportunity
+coverage, the mean/median/90th-percentile lower-bound offset \(\mu_t-L_t\),
+trades, turnover, terminal cash, and realized-exit drawdown for both arms.
+Smaller scaled offsets without lower coverage support seed disagreement as an
+uncertainty signal; calibration alone does not. A one-sided set
+\([L_t,\infty)\) has no finite interval width. Time dependence and reused
+development history make all reported coverage empirical diagnostics, with no
+finite-sample marginal, conditional, selected-opportunity, or
+simultaneous-date 90% guarantee. Do not tune `alpha`, `epsilon`, the date
+split, or the arm after inspection; adaptive calibration is outside this plan.
 
 ## Checkpoint 4: Change the Transformer only for an observed limitation
 
@@ -342,15 +409,27 @@ the best member. Report forecast-loss and reference-cost portfolio tests
 separately. A high terminal balance without family-wise evidence remains
 exploratory.
 
-Replay the selected trades without retuning at:
+Replay each frozen alternative's reference-cost trade schedule without
+retuning at:
 
 - zero costs, as an arithmetic diagnostic;
 - the frozen `1 bp` spread plus `1 bp` per-side slippage reference; and
-- twice those reference costs.
+- `2`, `5`, and `10` times those reference costs.
 
-Do not rerank, rethreshold, or reselect trades during cost replay. These three
-paths are sensitivity diagnostics; only the frozen reference-cost path enters
-the return SPA family.
+Only spread and slippage scale; fees remain zero. Do not rerank, rethreshold,
+or reselect trades during cost replay. The approximate round-trip break-even
+levels are `3`, `6`, `15`, and `30` log basis points at `1`, `2`, `5`, and
+`10` times reference costs. These multiples are sensitivity diagnostics; only
+the frozen reference-cost path enters the return SPA family.
+
+This plan does not claim quote-validated execution. Label every dollar result
+assumption-bound and the spread assumption unvalidated; bar OHLC cannot
+substitute for quotes. A future NBBO audit requires a separate registered
+attempt, an access preflight for Massive Stocks Advanced or another bound
+quote source, and a frozen sampling and quality contract. NBBO can describe
+the prevailing spread and depth at or immediately before the registered
+timestamps; slippage, latency, full fills, and open/close execution proxies
+remain assumptions.
 
 At `$100`, do not add nonlinear market-impact or optimal-execution machinery.
 Quote/spread uncertainty dominates capacity impact at this notional. Freeze
@@ -383,8 +462,14 @@ verify and do not duplicate execution, chronology, hashing, or metric math.
 ## Primary references
 
 - [Deep Ensembles](https://proceedings.neurips.cc/paper_files/paper/2017/hash/9ef2ed4b7fd2c810847ffa5fa85bce38-Abstract.html)
+- [Predictive Uncertainty under Dataset Shift](https://proceedings.neurips.cc/paper_files/paper/2019/hash/8558cb408c1d76621371888657d2eb1d-Abstract.html)
 - [Distribution-Free Predictive Inference for Regression](https://www.stat.berkeley.edu/~ryantibs/papers/conformal.pdf)
+- [Conformal Inference with Dependent Data](https://proceedings.mlr.press/v75/chernozhukov18a.html)
+- [Conformal Prediction Beyond Exchangeability](https://arxiv.org/abs/2202.13415)
+- [Selective Conformal Inference](https://arxiv.org/abs/2301.00584)
 - [Principles and Algorithms for Forecasting Groups of Time Series](https://arxiv.org/abs/2008.00444)
+- [Deep Factors for Forecasting](https://proceedings.mlr.press/v97/wang19k.html)
+- [Empirical Asset Pricing via Machine Learning](https://academic.oup.com/rfs/article/33/5/2223/5758276)
 - [Universal Features of Price Formation](https://arxiv.org/abs/1803.06917)
 - [PatchTST](https://arxiv.org/abs/2211.14730)
 - [DLinear](https://ojs.aaai.org/index.php/AAAI/article/view/26317)
@@ -394,3 +479,4 @@ verify and do not duplicate execution, chronology, hashing, or metric math.
 - [White's Reality Check](https://doi.org/10.1111/1468-0262.00152)
 - [The Stationary Bootstrap](https://doi.org/10.1080/01621459.1994.10476870)
 - [Almgren--Chriss](https://doi.org/10.21314/JOR.2001.041)
+- [Massive historical NBBO quotes](https://massive.com/docs/rest/stocks/trades-quotes/quotes)
