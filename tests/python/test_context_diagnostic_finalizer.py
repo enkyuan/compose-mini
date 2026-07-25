@@ -6,7 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
-from math import exp
+from math import exp, isclose
 from pathlib import Path
 from unittest.mock import patch
 import hashlib
@@ -20,6 +20,7 @@ from tools.context_diagnostic_contract import (
     ContextPhase, ContextPredictionEvidence, context_phase_sha256,
     expected_context_predictions,
 )
+from tools.context_cross_section import evaluate_context_cross_section
 from tools.finalize_context_diagnostic import (
     BOOTSTRAP_SEED, ContextTruthRow, _select_context_history,
     evaluate_context_phase,
@@ -38,9 +39,9 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def raises(function: object, *args: object) -> None:
+def raises(function: object, *args: object, **kwargs: object) -> None:
     try:
-        function(*args)  # type: ignore[operator]
+        function(*args, **kwargs)  # type: ignore[operator]
     except (TypeError, ValueError):
         return
     raise AssertionError("expected context finalizer failure")
@@ -121,7 +122,9 @@ def evidence_for(
             scale, offset = 0.25, offsets[fit.seed]
         else:
             scale = offset = 0.0
-        values = tuple(value * scale + offset for value in actual)
+        values = tuple(
+            value * scale + offset for value in actual
+        )[:prediction.prediction_count]
         records.append(ContextPredictionEvidence(
             prediction, digest(f"{fit}-provenance"),
             digest(f"{fit}-state"), values,
@@ -178,6 +181,90 @@ def test_evidence_and_truth_closure() -> None:
     raises(evaluate_context_phase, MASTER, phase, evidence, changed)
 
 
+def test_selected_context_cross_section() -> None:
+    phase = phase_for()
+    truth = {
+        series: tuple(
+            replace(
+                row,
+                outcome_price=row.reference_price * exp(
+                    row.actual_return + (index - 5) / 1_000,
+                ),
+            )
+            for row in truth_rows()
+        )
+        for index, series in enumerate(MASTER[44:])
+    }
+    expected = {
+        series: tuple(row.actual_return for row in rows)
+        for series, rows in truth.items()
+    }
+    factors = dict(zip(SEEDS, (0.1, 0.3, 0.4, 0.7, 0.9), strict=True))
+    evidence = tuple(
+        replace(
+            record,
+            values=tuple(
+                value * factors[record.prediction.fit.seed]
+                for value in expected[record.prediction.series]
+            ),
+        )
+        if record.prediction.fit.model == "panel_transformer" and
+        record.prediction.fit.history == 17 else record
+        for record in evidence_for(phase)
+    )
+    groups = tuple(
+        (row.as_of, row.entry_time, row.target_time)
+        for row in truth_rows()
+    )
+    result = evaluate_context_cross_section(
+        MASTER, phase, evidence, truth, 17, groups,
+        block_days=(1, 2), replicates=100, seed=7,
+    )
+    diagnostic = result["diagnostic"]
+    assert result["evidence_role"] == \
+        "development-post-hoc-not-forward-clean"
+    assert (result["phase"], result["model"], result["history"]) == (
+        "fold-1", "panel_transformer", 17,
+    )
+    assert result["group_grid_sha256"] == timestamp_grid_sha256(groups)
+    assert isclose(diagnostic["r2"], 0.7296)
+    assert diagnostic["mean_spearman"] == 1.0
+    assert isclose(diagnostic["paired_mean"], -0.0144 / 11)
+    assert diagnostic["meets_statistical_gate"]
+    assert diagnostic["group_count"] == diagnostic["date_count"] == 20
+    assert max(
+        bounds[1] for bounds in diagnostic["intervals"].values()
+    ) < 0.0
+
+    common = evaluate_context_cross_section(
+        MASTER, phase, evidence_for(phase), truth_for(), 17, groups,
+        block_days=(1, 2), replicates=20, seed=7,
+    )["diagnostic"]
+    assert common["r2"] is common["mean_spearman"] is None
+    assert common["paired_mean"] == 0.0
+    assert not common["meets_statistical_gate"]
+    missing = MASTER[-1]
+    shortened = truth[missing][:-1]
+    uneven = replace(
+        phase,
+        evaluation_rows=tuple(
+            (
+                missing, len(shortened), timestamp_grid_sha256(tuple(
+                    (row.as_of, row.entry_time, row.target_time)
+                    for row in shortened
+                )),
+            ) if row[0] == missing else row
+            for row in phase.evaluation_rows
+        ),
+    )
+    raises(
+        evaluate_context_cross_section,
+        MASTER, uneven, evidence_for(uneven),
+        truth | {missing: shortened}, 17, groups,
+        block_days=(1, 2), replicates=20, seed=7,
+    )
+
+
 def test_primary_only_decision(result: dict[str, object]) -> None:
     phases = (phase_for(), phase_for("calibration"))
     evaluations = {
@@ -230,6 +317,7 @@ def test_primary_only_decision(result: dict[str, object]) -> None:
 def main() -> None:
     result = test_seed_ensemble_precedes_metrics()
     test_evidence_and_truth_closure()
+    test_selected_context_cross_section()
     test_primary_only_decision(result)
     print("context diagnostic finalizer tests passed")
 
