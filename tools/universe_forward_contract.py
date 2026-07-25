@@ -1,4 +1,4 @@
-"""Load a passing scaling result and bind its forward selections."""
+"""Load a passing scaling result and bind its forward work."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -16,8 +16,9 @@ from tools.panel_contract import (
     _verify_identities, read_canonical_json, read_canonical_json_lines,
 )
 from tools.universe_scaling_contract import (
-    EXPECTED_BUDGETS, SEEDS, FitJob, ScalingAttempt, fit_provenance_id,
-    question_uses,
+    EXPECTED_BUDGETS, PHASES, SEEDS, FitJob, PhaseCoverage,
+    ScalingAttempt, ScalingCoverage, SeriesCoverage, fit_provenance_id,
+    question_uses, timestamp_grid_sha256,
 )
 
 OUTCOME_FIELDS = {
@@ -64,6 +65,15 @@ class ForwardFitSpec:
     selection: CheckpointSelection
     optimizer_updates: int
     provenance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardPredictionSpec:
+    fit: ForwardFitSpec
+    series: str
+    manifest_rank: int
+    prediction_count: int
+    timestamp_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +391,32 @@ def _forward_provenance_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _forward_coverage(source: PassingScalingOutcome) -> ScalingCoverage:
+    try:
+        coverage = source.manifest.coverage
+    except AttributeError as error:
+        raise ValueError("forward coverage is invalid") from error
+    if type(coverage) is not ScalingCoverage or \
+       type(coverage.phases) is not tuple or \
+       len(coverage.phases) != len(PHASES) or any(
+           type(phase) is not PhaseCoverage or
+           type(phase.series) is not tuple or
+           len(phase.series) != FORWARD_COHORT or
+           any(type(item) is not SeriesCoverage for item in phase.series)
+           for phase in coverage.phases
+       ) or tuple(phase.phase for phase in coverage.phases) != PHASES:
+        raise ValueError("forward coverage is invalid")
+    master = tuple(item.series for item in coverage.phases[0].series)
+    if any(
+        not isinstance(member, str) or not member for member in master
+    ) or len(set(master)) != FORWARD_COHORT or any(
+        tuple(item.series for item in phase.series) != master
+        for phase in coverage.phases[1:]
+    ):
+        raise ValueError("forward coverage is invalid")
+    return coverage
+
+
 def _forward_fit_specs(
     source: PassingScalingOutcome, target_phase: str,
 ) -> tuple[ForwardFitSpec, ...]:
@@ -399,14 +435,7 @@ def _forward_fit_specs(
            (item.target_phase, item.seed) for item in source.selections
        ) != axes:
         raise ValueError("forward checkpoint selections are invalid")
-    try:
-        members = source.manifest.coverage.master
-    except AttributeError as error:
-        raise ValueError("forward fit universe is invalid") from error
-    if type(members) is not tuple or len(members) != FORWARD_COHORT or \
-       any(not isinstance(member, str) or not member for member in members) or \
-       len(set(members)) != len(members):
-        raise ValueError("forward fit universe is invalid")
+    members = _forward_coverage(source).master
     outcome = _external(source.outcome, "scaling outcome").sha256
     budgets = dict(EXPECTED_BUDGETS)
     specs = []
@@ -441,6 +470,32 @@ def _forward_fit_specs(
     return tuple(specs)
 
 
+def _forward_prediction_specs(
+    source: PassingScalingOutcome, target_phase: str,
+) -> tuple[ForwardPredictionSpec, ...]:
+    """Derive one target phase's label-free prediction schedule."""
+    fits = _forward_fit_specs(source, target_phase)
+    coverage = _forward_coverage(source)
+    phase = coverage.phases[PHASES.index(target_phase)]
+    empty = timestamp_grid_sha256(())
+    records = []
+    for rank, item in enumerate(phase.series, 1):
+        count = item.validation_rows
+        if type(count) is not int or count < 0:
+            raise ValueError("forward prediction count is invalid")
+        grid = _sha256(
+            item.timestamp_sha256, "forward prediction timestamp grid",
+        )
+        if (count == 0) != (grid == empty):
+            raise ValueError("forward prediction timestamp grid is invalid")
+        if count:
+            records.append((item.series, rank, count, grid))
+    return tuple(
+        ForwardPredictionSpec(fit, *record)
+        for fit in fits for record in records
+    )
+
+
 def forward_fit_specs(
     outcome: FileBinding, target_phase: str, *, root: Path,
 ) -> tuple[ForwardFitSpec, ...]:
@@ -448,5 +503,16 @@ def forward_fit_specs(
     if not isinstance(target_phase, str) or target_phase not in PRIOR_PHASE:
         raise ValueError("forward fit phase is invalid")
     return _forward_fit_specs(
+        read_passing_scaling_outcome(outcome, root=root), target_phase,
+    )
+
+
+def forward_prediction_specs(
+    outcome: FileBinding, target_phase: str, *, root: Path,
+) -> tuple[ForwardPredictionSpec, ...]:
+    """Read one exact PASS and bind one target phase's prediction schedule."""
+    if not isinstance(target_phase, str) or target_phase not in PRIOR_PHASE:
+        raise ValueError("forward prediction phase is invalid")
+    return _forward_prediction_specs(
         read_passing_scaling_outcome(outcome, root=root), target_phase,
     )

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify the PASS-only universe-forward selection contract."""
 
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,14 +18,23 @@ from tools.files import file_sha256, write_json
 from tools.finalize_universe_scaling import FitClosure
 from tools.panel_contract import FileBinding
 from tools.universe_forward_contract import (
-    CheckpointSelection, ForwardFitSpec, forward_fit_specs,
+    CheckpointSelection, ForwardFitSpec, ForwardPredictionSpec,
+    forward_fit_specs, forward_prediction_specs,
     read_passing_scaling_outcome, resolve_prior_checkpoint,
 )
 from tools.universe_scaling_contract import (
-    EXPECTED_BUDGETS, SEEDS, FitJob, fit_provenance_id,
+    EXPECTED_BUDGETS, PHASES, SEEDS, FitJob, PhaseCoverage,
+    ScalingCoverage, SeriesCoverage, fit_provenance_id,
+    timestamp_grid_sha256,
 )
 
 MASTER = tuple(f"S{index:02}" for index in range(55))
+MISSING_RANKS = {
+    "fold-0": frozenset((15, 29)),
+    "fold-1": frozenset((15, 29, 40)),
+    "calibration": frozenset((15, 29, 33, 40)),
+}
+EMPTY_GRID_SHA256 = timestamp_grid_sha256(())
 GATES = (
     "unseen_mae_improvement",
     "positive_paired_intervals",
@@ -47,6 +57,23 @@ def raises(function: object, *args: object, **kwargs: object) -> None:
 
 def digest(index: int) -> str:
     return f"{index:064x}"
+
+
+def coverage() -> ScalingCoverage:
+    return ScalingCoverage(tuple(
+        PhaseCoverage(phase, tuple(
+            SeriesCoverage(
+                series,
+                1_000 + phase_index,
+                0 if rank in MISSING_RANKS[phase]
+                else 100 * phase_index + rank,
+                EMPTY_GRID_SHA256 if rank in MISSING_RANKS[phase]
+                else digest(1_000 + 100 * phase_index + rank),
+            )
+            for rank, series in enumerate(MASTER, 1)
+        ))
+        for phase_index, phase in enumerate(PHASES, 1)
+    ))
 
 
 def binding(path: Path, sha256: str) -> dict[str, str]:
@@ -189,7 +216,7 @@ def fixture(
         },
         finalizer_tree=SimpleNamespace(sha256=digest(6)),
         primary_python=SimpleNamespace(path="/python", sha256=digest(7)),
-        coverage=SimpleNamespace(master=MASTER),
+        coverage=coverage(),
     )
     return FileBinding(
         "experiments/run-outcome.json", file_sha256(outcome_path),
@@ -198,7 +225,8 @@ def fixture(
 
 def read_fixture(
     expected: FileBinding, manifest: object,
-    closure: FitClosure, root: Path, target_phase: str | None = None,
+    closure: FitClosure, root: Path, *args: object,
+    reader: Callable[..., object] = read_passing_scaling_outcome,
 ) -> object:
     def read_attempt(
         snapshot: Path, logical: Path, repository: Path,
@@ -223,11 +251,7 @@ def read_fixture(
     ), patch.object(
         contract, "validate_fit_ledger", side_effect=validate_fits,
     ):
-        return (
-            read_passing_scaling_outcome(expected, root=root)
-            if target_phase is None else
-            forward_fit_specs(expected, target_phase, root=root)
-        )
+        return reader(expected, *args, root=root)
 
 
 def test_pass_reader() -> None:
@@ -356,11 +380,13 @@ def test_forward_fit_specs() -> None:
             item for phase in ("fold-1", "calibration")
             for item in read_fixture(
                 expected, manifest, closure, root, phase,
+                reader=forward_fit_specs,
             )
         )
         raises(
             read_fixture, replace(expected, sha256=digest(90)),
             manifest, closure, root, "fold-1",
+            reader=forward_fit_specs,
         )
     budgets = dict(EXPECTED_BUDGETS)
     assert tuple(
@@ -461,11 +487,221 @@ def test_forward_fit_specs() -> None:
     raises(forward_fit_specs, object(), "fold-1", root=root)
 
 
+def test_forward_prediction_specs() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        expected, manifest, closure = fixture(root)
+        source = read_fixture(expected, manifest, closure, root)
+        predictions_path = root / "reports/run/predictions.jsonl"
+        assert not predictions_path.exists()
+        assert not (root / "data").exists()
+        fits = {
+            phase: read_fixture(
+                expected, manifest, closure, root, phase,
+                reader=forward_fit_specs,
+            )
+            for phase in ("fold-1", "calibration")
+        }
+        specs = tuple(
+            item for phase in fits
+            for item in read_fixture(
+                expected, manifest, closure, root, phase,
+                reader=forward_prediction_specs,
+            )
+        )
+        raises(
+            read_fixture, replace(expected, sha256=digest(90)),
+            manifest, closure, root, "fold-1",
+            reader=forward_prediction_specs,
+        )
+        assert not predictions_path.exists()
+        assert not (root / "data").exists()
+
+    phases = {
+        phase.phase: phase for phase in manifest.coverage.phases
+    }
+    expected_specs = tuple(
+        (
+            fit, record.series, rank, record.validation_rows,
+            record.timestamp_sha256,
+        )
+        for phase, phase_fits in fits.items()
+        for fit in phase_fits
+        for rank, record in enumerate(phases[phase].series, 1)
+        if record.validation_rows
+    )
+    assert tuple(
+        (
+            item.fit, item.series, item.manifest_rank,
+            item.prediction_count, item.timestamp_sha256,
+        )
+        for item in specs
+    ) == expected_specs
+    assert len(specs) == len(SEEDS) * (52 + 51) == 515
+    assert tuple(
+        sum(
+            item.fit.selection.target_phase == phase for item in specs
+        )
+        for phase in ("fold-1", "calibration")
+    ) == (260, 255)
+    assert sum(item.prediction_count for item in specs) == len(SEEDS) * sum(
+        record.validation_rows
+        for phase in ("fold-1", "calibration")
+        for record in phases[phase].series
+    )
+    assert all(
+        item.series == MASTER[item.manifest_rank - 1] and
+        item.fit.selection.target_phase in ("fold-1", "calibration")
+        for item in specs
+    )
+
+    first = specs[0]
+    try:
+        first.prediction_count = 1  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("forward prediction specification is mutable")
+    assert isinstance(first, ForwardPredictionSpec)
+
+    def with_coverage(value: ScalingCoverage) -> object:
+        changed = SimpleNamespace(**{
+            **vars(source.manifest), "coverage": value,
+        })
+        return replace(source, manifest=changed)
+
+    original = manifest.coverage
+    fold1 = original.phases[1]
+    calibration = original.phases[2]
+    calibration_index = next(
+        index for index, item in enumerate(calibration.series)
+        if item.validation_rows
+    )
+    calibration_records = list(calibration.series)
+    calibration_records[calibration_index] = replace(
+        calibration_records[calibration_index],
+        validation_rows=
+            calibration_records[calibration_index].validation_rows + 1,
+        timestamp_sha256=digest(9_000),
+    )
+    changed_calibration = replace(
+        original, phases=(
+            *original.phases[:2],
+            replace(calibration, series=tuple(calibration_records)),
+        ),
+    )
+    assert contract._forward_prediction_specs(
+        with_coverage(changed_calibration), "fold-1",
+    ) == contract._forward_prediction_specs(source, "fold-1")
+    assert contract._forward_prediction_specs(
+        with_coverage(changed_calibration), "calibration",
+    ) != contract._forward_prediction_specs(source, "calibration")
+
+    reordered = replace(
+        fold1, series=(
+            fold1.series[1], fold1.series[0], *fold1.series[2:],
+        ),
+    )
+    duplicate = replace(
+        fold1, series=(
+            fold1.series[0], fold1.series[0], *fold1.series[2:],
+        ),
+    )
+    empty_mismatch = replace(
+        fold1, series=(
+            replace(fold1.series[0], timestamp_sha256=EMPTY_GRID_SHA256),
+            *fold1.series[1:],
+        ),
+    )
+    zero_mismatch = replace(
+        fold1, series=(
+            *fold1.series[:14],
+            replace(fold1.series[14], timestamp_sha256=digest(9_001)),
+            *fold1.series[15:],
+        ),
+    )
+    bool_count = replace(
+        fold1, series=(
+            replace(fold1.series[0], validation_rows=True),
+            *fold1.series[1:],
+        ),
+    )
+    negative_count = replace(
+        fold1, series=(
+            replace(fold1.series[0], validation_rows=-1),
+            *fold1.series[1:],
+        ),
+    )
+    malformed_digest = replace(
+        fold1, series=(
+            replace(fold1.series[0], timestamp_sha256="invalid"),
+            *fold1.series[1:],
+        ),
+    )
+    calibration_bool = replace(
+        calibration, series=(
+            replace(calibration.series[0], validation_rows=True),
+            *calibration.series[1:],
+        ),
+    )
+    assert contract._forward_prediction_specs(
+        with_coverage(replace(
+            original, phases=(
+                original.phases[0], fold1, calibration_bool,
+            ),
+        )),
+        "fold-1",
+    ) == contract._forward_prediction_specs(source, "fold-1")
+    assert contract._forward_prediction_specs(
+        with_coverage(replace(
+            original, phases=(
+                original.phases[0], bool_count, calibration,
+            ),
+        )),
+        "calibration",
+    ) == contract._forward_prediction_specs(source, "calibration")
+    for changed in (
+        replace(original, phases=(
+            original.phases[1], original.phases[0], original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], reordered, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], duplicate, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], empty_mismatch, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], zero_mismatch, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], bool_count, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], negative_count, original.phases[2],
+        )),
+        replace(original, phases=(
+            original.phases[0], malformed_digest, original.phases[2],
+        )),
+    ):
+        raises(
+            contract._forward_prediction_specs,
+            with_coverage(changed), "fold-1",
+        )
+
+    for target in ("fold-0", "unknown", 1):
+        raises(forward_prediction_specs, source.outcome, target, root=root)
+    raises(forward_prediction_specs, object(), "fold-1", root=root)
+
+
 def main() -> None:
     test_pass_reader()
     test_pass_rejections()
     test_checkpoint_selection()
     test_forward_fit_specs()
+    test_forward_prediction_specs()
 
 
 if __name__ == "__main__":
