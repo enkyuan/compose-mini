@@ -18,10 +18,14 @@ from tools.context_diagnostic_contract import (
 from tools.panel_contract import read_canonical_json
 from tools.relative_context_contract import (
     HISTORY_BARS, HORIZON_BARS, MODELS, PHASE_BUDGETS,
-    SPY_RESIDUAL_TARGET, ResidualPhaseInput, ResidualScalerInput,
-    expected_residual_fits, expected_residual_protocol,
-    parse_residual_phases, residual_scaler_inputs_sha256,
-    validate_residual_protocol, validate_spy_session_audit,
+    RESIDUAL_BENCHMARK, RESIDUAL_CALENDAR, RESIDUAL_CONFIG,
+    RESIDUAL_SOURCE, SPY_RESIDUAL_TARGET, ResidualPhaseInput,
+    ResidualScalerInput, expected_residual_fits,
+    expected_residual_protocol, expected_source_context_outcome,
+    expected_spy_fetch_report, parse_residual_phases,
+    residual_scaler_inputs_sha256, validate_residual_protocol,
+    validate_source_context_outcome, validate_spy_fetch_report,
+    validate_spy_session_audit,
 )
 
 CONFIG = ROOT / "experiments/executable-h13-spy-residual.example.json"
@@ -97,6 +101,105 @@ def spy_audit() -> dict[str, object]:
         "missing_bins": 0,
         "ranges": [],
     }
+
+
+def verify_fixed_inputs() -> None:
+    assert RESIDUAL_CONFIG.path == \
+        "experiments/executable-h13-spy-residual.example.json"
+    assert RESIDUAL_CONFIG.sha256 == \
+        "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19"
+    assert tuple(RESIDUAL_SOURCE) == (
+        "context_attempt", "context_outcome",
+    )
+    assert RESIDUAL_SOURCE["context_attempt"].sha256 == \
+        "700d4e27ccd714e6156522be22515c9b3b04aa97dbdd6f09fd199e13463c1394"
+    assert RESIDUAL_SOURCE["context_outcome"].sha256 == \
+        "bc33d4c86afeab4d7273215a81f2f701c68ff1a251fcb9935508098677063040"
+    assert tuple(RESIDUAL_BENCHMARK) == ("fetch_report", "spy_csv")
+    assert RESIDUAL_BENCHMARK["fetch_report"].sha256 == \
+        "024e710102f866a3ffcd89ae22688d333f2736ed99b086f03680f380f3fbbaf6"
+    assert RESIDUAL_BENCHMARK["spy_csv"].sha256 == \
+        "ce8de54c6fddac96d2866687e97cea2367579051c9da5b360ad4ccda53c1ed2b"
+    assert RESIDUAL_CALENDAR.sha256 == \
+        "b1e0835a60624a67e21f7941ac00ece6c488937989560bbd4d0333afd869e5f8"
+
+
+def verify_source_outcome() -> None:
+    expected = expected_source_context_outcome()
+    assert validate_source_context_outcome(expected) == expected
+    assert expected["decision"] == {
+        "qualifies": {"34": False, "68": False},
+        "selected_history": HISTORY_BARS,
+    }
+    assert expected["inputs"]["attempt"] == {
+        "path": RESIDUAL_SOURCE["context_attempt"].path,
+        "sha256": RESIDUAL_SOURCE["context_attempt"].sha256,
+    }
+    assert tuple(
+        item["phase"] for item in expected["inputs"]["phases"]
+    ) == ("fold-1", "calibration")
+
+    mutations = (
+        lambda item: item["decision"].update({"selected_history": 34}),
+        lambda item: item["decision"]["qualifies"].update({"34": True}),
+        lambda item: item.update({"evidence_role": "forward-clean"}),
+        lambda item: item["inputs"]["attempt"].update(
+            {"sha256": digest("wrong-attempt")},
+        ),
+        lambda item: item["inputs"]["phases"].reverse(),
+        lambda item: item["integrity"].update(
+            {"source_tree_sha256": digest("wrong-tree")},
+        ),
+        lambda item: item.update({"extra": True}),
+        lambda item: item.pop("integrity"),
+    )
+    for mutate in mutations:
+        invalid = deepcopy(expected)
+        mutate(invalid)
+        raises(validate_source_context_outcome, invalid)
+    assert expected_source_context_outcome() == expected
+
+
+def verify_spy_report() -> None:
+    expected = expected_spy_fetch_report(ROOT)
+    assert validate_spy_fetch_report(expected, ROOT) == expected
+    assert expected["calendar"] == {
+        "applicability": expected["calendar"]["applicability"],
+        "path": str(ROOT / RESIDUAL_CALENDAR.path),
+        "sha256": RESIDUAL_CALENDAR.sha256,
+    }
+    assert expected["csv"]["session_audit"] == spy_audit()
+    assert (expected["csv"]["rows"], expected["csv"]["sessions"]) == (
+        5_534, 428,
+    )
+    assert expected["return_basis"] == \
+        "split-adjusted-price-return-not-dividend-adjusted"
+
+    mutations = (
+        lambda item: item.update({"ticker": "QQQ"}),
+        lambda item: item.update({"adjusted": False}),
+        lambda item: item["calendar"].update({"path": "/tmp/calendar.json"}),
+        lambda item: item["calendar"].update(
+            {"sha256": digest("wrong-calendar")},
+        ),
+        lambda item: item["csv"].update({"path": "/tmp/spy.csv"}),
+        lambda item: item["csv"].update({"sha256": digest("wrong-spy")}),
+        lambda item: item["csv"].update({"rows": 5_533}),
+        lambda item: item["csv"]["session_audit"].update({"missing_bins": 1}),
+        lambda item: item["aggregate"]["request"]["query"].update(
+            {"adjusted": "false"},
+        ),
+        lambda item: item.update({"return_basis": "total-return"}),
+        lambda item: item.update({"extra": True}),
+        lambda item: item.pop("reference"),
+    )
+    for mutate in mutations:
+        invalid = deepcopy(expected)
+        mutate(invalid)
+        raises(validate_spy_fetch_report, invalid, ROOT)
+    raises(expected_spy_fetch_report, Path("."))
+    raises(validate_spy_fetch_report, expected, Path("/tmp"))
+    assert expected_spy_fetch_report(ROOT) == expected
 
 
 def verify_exact_protocol() -> None:
@@ -300,6 +403,9 @@ def verify_spy_audit() -> None:
 
 
 def main() -> None:
+    verify_fixed_inputs()
+    verify_source_outcome()
+    verify_spy_report()
     verify_exact_protocol()
     verify_rejections()
     verify_scaler_closure()

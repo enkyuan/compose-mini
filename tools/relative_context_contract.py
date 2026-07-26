@@ -2,13 +2,15 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
 
 from tools.context_diagnostic_contract import (
     ContextFit, ContextPhase, _json_sha256, context_phase_sha256,
     expected_context_fits,
 )
 from tools.panel_contract import (
-    _exact_json, _integer, _object, _sha256, _string,
+    FileBinding, _exact_json, _integer, _object, _sha256, _string,
 )
 from tools.universe_contract import universe_roles
 from tools.universe_cross_section import CROSS_SECTION_SEED
@@ -34,6 +36,214 @@ PAIRED_COMPARISONS = (
     ("panel_transformer", "global_ridge"),
     ("panel_transformer", "global_mlp"),
 )
+RESIDUAL_CONFIG = FileBinding(
+    "experiments/executable-h13-spy-residual.example.json",
+    "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19",
+)
+RESIDUAL_SOURCE = MappingProxyType({
+    "context_attempt": FileBinding(
+        "experiments/h13-context-diagnostic-20260725-03-attempt.json",
+        "700d4e27ccd714e6156522be22515c9b3b04aa97dbdd6f09fd199e13463c1394",
+    ),
+    "context_outcome": FileBinding(
+        "reports/h13-context-diagnostic-20260725-03/outcome.json",
+        "bc33d4c86afeab4d7273215a81f2f701c68ff1a251fcb9935508098677063040",
+    ),
+})
+RESIDUAL_BENCHMARK = MappingProxyType({
+    "fetch_report": FileBinding(
+        "data/spy-residual-20260725/fetch.json",
+        "024e710102f866a3ffcd89ae22688d333f2736ed99b086f03680f380f3fbbaf6",
+    ),
+    "spy_csv": FileBinding(
+        "data/spy-residual-20260725/spy.csv",
+        "ce8de54c6fddac96d2866687e97cea2367579051c9da5b360ad4ccda53c1ed2b",
+    ),
+})
+RESIDUAL_CALENDAR = FileBinding(
+    "universes/us-equities-core-2024-07-22_2026-07-21.json",
+    "b1e0835a60624a67e21f7941ac00ece6c488937989560bbd4d0333afd869e5f8",
+)
+_SOURCE_PHASE_OUTPUTS = (
+    ("fold-1", (
+        ("access", "d82ae9819c08c43a805cc7d0c49e8997ce06404a64b2710b6c3089430b29c970"),
+        ("evaluation",
+         "2cfe45ff04145a9b0587bf6a12e04eb2d7083df461d9736777e7dbfac8fe7053"),
+        ("fits", "d79fce757a67c7fbdf4138ea8c39d50d8907322dc0c50208fd3318a4023b8329"),
+        ("predictions",
+         "a01334b98f2ce90219d5a051f9975d54091943702b9a1f0902039e4efeefab15"),
+        ("receipt", "fa81f7bd2a86e7d4b911fca14c405072f3c65701cce13a6118a19dcd7e7c8167"),
+    )),
+    ("calibration", (
+        ("access", "870384b811febdeafdb9dab267c3fd41a41774cebf371d8bf1659068cacf7045"),
+        ("evaluation",
+         "3fc6f400de16c723813eaab573b445838bab8ff24100c191fc9ad02a37686762"),
+        ("fits", "389ab192e532b27051172d3711c2efe748640ca73ee725bb13d3af9f4b9fd3a2"),
+        ("predictions",
+         "1a011efedb4a63785c6923d85c4f838ff6c76f4da2bb181c6d3dca9e9532581f"),
+        ("receipt", "dfd7d6a8cbb04e9394ae28d32c1bb5f803639815c66c9333e281f0167524e183"),
+    )),
+)
+
+
+def _binding_value(binding: FileBinding) -> dict[str, str]:
+    return {"path": binding.path, "sha256": binding.sha256}
+
+
+def _source_output_path(run: str, phase: str, name: str) -> str:
+    suffix = "truth-access" if name == "access" else name
+    extension = "jsonl" if name in ("fits", "predictions") else "json"
+    return f"{run}/{phase}-{suffix}.{extension}"
+
+
+def expected_source_context_outcome() -> dict[str, object]:
+    """Return the exact successful context outcome used as source evidence."""
+    run = "reports/h13-context-diagnostic-20260725-03"
+    return {
+        "decision": {
+            "qualifies": {"34": False, "68": False},
+            "selected_history": HISTORY_BARS,
+        },
+        "evidence_role": "development-diagnostic-not-forward-clean",
+        "inputs": {
+            "attempt": _binding_value(RESIDUAL_SOURCE["context_attempt"]),
+            "phases": [
+                {
+                    **{
+                        name: {
+                            "path": _source_output_path(
+                                run, phase, name,
+                            ),
+                            "sha256": sha256,
+                        }
+                        for name, sha256 in outputs
+                    },
+                    "phase": phase,
+                }
+                for phase, outputs in _SOURCE_PHASE_OUTPUTS
+            ],
+        },
+        "integrity": {
+            "config_sha256":
+                "4224b532e0b3b3b16d9638be7b53b59003b9b04841ce45d1ca8e998afbd89a04",
+            "source_failure_sha256":
+                "8ff90ca089ac4e3e0836b8e76d436ff0748a547eaee21fe623e2846ab9f86db6",
+            "source_tree_sha256":
+                "5ae25974c2d4e109fafe249ea17a5e14885ecd838d71fdbe7b47cd3550793fcf",
+        },
+        "schema": 1,
+    }
+
+
+def validate_source_context_outcome(
+    value: object,
+) -> Mapping[str, object]:
+    """Reject source evidence other than the successful history-17 outcome."""
+    expected = expected_source_context_outcome()
+    if not _exact_json(value, expected):
+        raise ValueError("source context outcome changed")
+    return expected
+
+
+def _repository_root(value: Path) -> Path:
+    if not isinstance(value, Path) or not value.is_absolute():
+        raise ValueError("repository root must be an absolute path")
+    try:
+        resolved = value.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("repository root is invalid") from error
+    if value != resolved:
+        raise ValueError("repository root must not use an alias")
+    return value
+
+
+def expected_spy_fetch_report(
+    repository_root: Path,
+) -> dict[str, object]:
+    """Return the exact authenticated SPY fetch report for this checkout."""
+    root = _repository_root(repository_root)
+    return {
+        "adjusted": True,
+        "aggregate": {
+            "request": {
+                "path":
+                    "/v2/aggs/ticker/SPY/range/30/minute/2024-11-01/2026-07-21",
+                "query": {
+                    "adjusted": "true",
+                    "limit": "50000",
+                    "sort": "asc",
+                },
+            },
+        },
+        "calendar": {
+            "applicability": {
+                "benchmark": "SPY",
+                "calendar_venue": "XNYS",
+                "exchange_source":
+                    "https://massive.com/docs/rest/stocks/market-operations/exchanges",
+                "market_group": "NYSE Group",
+                "operating_mic": "XNYS",
+                "primary_exchange": "ARCX",
+                "session": "core",
+                "session_source":
+                    "https://www.nyse.com/trade/hours-calendars",
+            },
+            "path": str(root / RESIDUAL_CALENDAR.path),
+            "sha256": RESIDUAL_CALENDAR.sha256,
+        },
+        "csv": {
+            "path": str(root / RESIDUAL_BENCHMARK["spy_csv"].path),
+            "rows": 5_534,
+            "session_audit": {
+                "affected_sessions": 0,
+                "expected_bins": 5_534,
+                "expected_sessions": 428,
+                "missing_bins": 0,
+                "missing_sessions": [],
+                "ranges": [],
+                "scope": "all-expected-session-bins",
+            },
+            "sessions": 428,
+            "sha256": RESIDUAL_BENCHMARK["spy_csv"].sha256,
+            "source_rows": 13_653,
+        },
+        "end": SPY_END,
+        "gap_policy": "require-complete-core-session-grid",
+        "interval_minutes": INTERVAL_MINUTES,
+        "purpose":
+            "Authenticate SPY bars for development-only residual calibration.",
+        "reference": {
+            "identity": {
+                "active": True,
+                "currency_name": "usd",
+                "locale": "us",
+                "market": "stocks",
+                "primary_exchange": "ARCX",
+                "ticker": "SPY",
+                "type": "ETF",
+            },
+            "request": {
+                "path": "/v3/reference/tickers/SPY",
+                "query": {"date": "2024-10-31"},
+            },
+        },
+        "reference_date": "2024-10-31",
+        "return_basis": "split-adjusted-price-return-not-dividend-adjusted",
+        "schema": 1,
+        "session": "regular",
+        "start": SPY_START,
+        "ticker": "SPY",
+    }
+
+
+def validate_spy_fetch_report(
+    value: object, repository_root: Path,
+) -> Mapping[str, object]:
+    """Reject SPY metadata outside the authenticated complete-grid bundle."""
+    expected = expected_spy_fetch_report(repository_root)
+    if not _exact_json(value, expected):
+        raise ValueError("SPY fetch report changed")
+    return expected
 
 
 def expected_residual_protocol() -> dict[str, object]:

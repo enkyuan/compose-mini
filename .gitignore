@@ -61,6 +61,10 @@ dkms.conf
 /models/
 /reports/
 
+# One-shot residual calibration state
+/experiments/h13-spy-residual-*-attempt.json
+/experiments/h13-spy-residual-*-outcome.json
+
 # Python bytecode
 __pycache__/
 *.py[cod]
