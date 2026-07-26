@@ -730,22 +730,22 @@ def test_forward_prediction_specs() -> None:
             *calibration.series[1:],
         ),
     )
-    assert contract._forward_prediction_specs(
-        with_coverage(replace(
+    for target, changed in (
+        ("fold-1", replace(
             original, phases=(
                 original.phases[0], fold1, calibration_bool,
             ),
         )),
-        "fold-1",
-    ) == contract._forward_prediction_specs(source, "fold-1")
-    assert contract._forward_prediction_specs(
-        with_coverage(replace(
+        ("calibration", replace(
             original, phases=(
                 original.phases[0], bool_count, calibration,
             ),
         )),
-        "calibration",
-    ) == contract._forward_prediction_specs(source, "calibration")
+    ):
+        raises(
+            contract._forward_prediction_specs,
+            with_coverage(changed), target,
+        )
     for changed in (
         replace(original, phases=(
             original.phases[1], original.phases[0], original.phases[2],

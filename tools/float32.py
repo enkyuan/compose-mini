@@ -41,7 +41,9 @@ def decode_f32le_base64(
 ) -> tuple[float, ...]:
     """Decode one canonical finite little-endian binary32 payload."""
     fields = {"encoding", "count", "base64"}
-    if type(payload) is not dict or set(payload) != fields:
+    if type(payload) is not dict or any(
+        type(key) is not str for key in payload
+    ) or set(payload) != fields:
         raise ValueError("float32 payload fields are invalid")
     encoding = payload["encoding"]
     count = payload["count"]

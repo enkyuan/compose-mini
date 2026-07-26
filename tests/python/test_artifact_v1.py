@@ -18,6 +18,10 @@ from tools.artifact_v1 import Artifact, Config, WEIGHT_FIELDS, write_artifact
 from tools.float32 import decode_f32le_base64, encode_f32le_base64, f32
 
 
+class TextSubclass(str):
+    pass
+
+
 def rejects(call: Callable[[], object]) -> None:
     try:
         call()
@@ -52,6 +56,7 @@ def verify_float32_payloads() -> None:
     invalid = (
         [],
         {},
+        {TextSubclass(key): value for key, value in finite.items()},
         {**finite, "extra": None},
         {**finite, "encoding": "base64"},
         {**finite, "count": True},

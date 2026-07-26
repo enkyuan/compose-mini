@@ -479,15 +479,23 @@ def _forward_coverage(source: PassingScalingOutcome) -> ScalingCoverage:
        type(coverage.phases) is not tuple or \
        len(coverage.phases) != len(PHASES) or any(
            type(phase) is not PhaseCoverage or
+           type(phase.phase) is not str or
            type(phase.series) is not tuple or
            len(phase.series) != FORWARD_COHORT or
-           any(type(item) is not SeriesCoverage for item in phase.series)
+           any(
+               type(item) is not SeriesCoverage or
+               type(item.series) is not str or
+               type(item.train_rows) is not int or
+               type(item.validation_rows) is not int or
+               type(item.timestamp_sha256) is not str
+               for item in phase.series
+           )
            for phase in coverage.phases
        ) or tuple(phase.phase for phase in coverage.phases) != PHASES:
         raise ValueError("forward coverage is invalid")
     master = tuple(item.series for item in coverage.phases[0].series)
     if any(
-        not isinstance(member, str) or not member for member in master
+        not member for member in master
     ) or len(set(master)) != FORWARD_COHORT or any(
         tuple(item.series for item in phase.series) != master
         for phase in coverage.phases[1:]
@@ -503,13 +511,24 @@ def _forward_fit_specs(
     axes = tuple(
         (phase, seed) for phase in PRIOR_PHASE for seed in SEEDS
     )
-    if not isinstance(source, PassingScalingOutcome) or \
+    if type(source) is not PassingScalingOutcome or \
+       type(source.outcome) is not FileBinding or \
+       type(source.outcome.path) is not str or \
+       type(source.outcome.sha256) is not str or \
        type(source.selections) is not tuple or \
-       not isinstance(target_phase, str) or target_phase not in PRIOR_PHASE:
+       type(target_phase) is not str or target_phase not in PRIOR_PHASE:
         raise ValueError("forward fit source is invalid")
     if len(source.selections) != len(axes) or \
-       any(type(item) is not CheckpointSelection
-           for item in source.selections) or \
+       any(
+           type(item) is not CheckpointSelection or
+           type(item.target_phase) is not str or
+           type(item.source_phase) is not str or
+           type(item.seed) is not int or
+           type(item.checkpoint) is not int or
+           type(item.provenance_id) is not str or
+           type(item.model_fingerprint) is not str
+           for item in source.selections
+       ) or \
        tuple(
            (item.target_phase, item.seed) for item in source.selections
        ) != axes:

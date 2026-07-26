@@ -8,8 +8,8 @@ from types import MappingProxyType
 from tools.float32 import decode_f32le_base64
 from tools.panel_contract import FileBinding, _sha256
 from tools.universe_forward_contract import (
-    ForwardFitSpec, ForwardPredictionSpec, PassingScalingOutcome,
-    _forward_fit_specs, _forward_prediction_specs,
+    CheckpointSelection, ForwardFitSpec, ForwardPredictionSpec,
+    PassingScalingOutcome, _forward_fit_specs, _forward_prediction_specs,
 )
 
 FIT_FIELDS = frozenset({
@@ -20,6 +20,13 @@ PREDICTION_FIELDS = frozenset({
     "schema", "attempt_sha256", "provenance_id", "model_fingerprint",
     "phase", "series", "grid_sha256", "predictions",
 })
+_FIT_STRINGS = (
+    "attempt_sha256", "provenance_id", "model_fingerprint",
+)
+_PREDICTION_STRINGS = (
+    "attempt_sha256", "provenance_id", "model_fingerprint",
+    "phase", "series", "grid_sha256",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +67,8 @@ class ForwardPredictionClosure:
 
 
 def _attempt(value: object) -> FileBinding:
-    if not isinstance(value, FileBinding):
+    if type(value) is not FileBinding or type(value.path) is not str or \
+       type(value.sha256) is not str:
         raise ValueError("forward attempt binding is invalid")
     return FileBinding.parse(
         {"path": value.path, "sha256": value.sha256}, "forward attempt",
@@ -96,11 +104,20 @@ def _finish(records: Iterator[Mapping[str, object]], label: str) -> None:
 def _record(
     value: object, fields: frozenset[str], label: str,
 ) -> dict[str, object]:
-    if type(value) is not dict or value.keys() != fields:
+    if type(value) is not dict or any(
+        type(key) is not str for key in value
+    ) or value.keys() != fields:
         raise ValueError(f"{label} fields are invalid")
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ValueError(f"{label} schema is invalid")
     return value
+
+
+def _strings(
+    record: Mapping[str, object], fields: tuple[str, ...], label: str,
+) -> None:
+    if any(type(record[field]) is not str for field in fields):
+        raise ValueError(f"{label} strings are invalid")
 
 
 def _fit_closure(
@@ -111,8 +128,9 @@ def _fit_closure(
         record.spec.provenance_id: record.model_fingerprint
         for record in records
     }
-    if len(fingerprints) != len(records):
-        raise ValueError("forward fit provenance is duplicated")
+    if len(fingerprints) != len(records) or \
+       len(set(fingerprints.values())) != len(records):
+        raise ValueError("forward fit identity is duplicated")
     return ForwardFitClosure(
         attempt, target_phase, records, MappingProxyType(fingerprints),
     )
@@ -122,6 +140,35 @@ def _phase(value: object) -> str:
     if type(value) is not str or value not in ("fold-1", "calibration"):
         raise ValueError("forward target phase is invalid")
     return value
+
+
+def _selection_matches(
+    value: object, expected: CheckpointSelection,
+) -> bool:
+    return type(value) is CheckpointSelection and \
+        type(value.target_phase) is str and \
+        type(value.source_phase) is str and type(value.seed) is int and \
+        type(value.checkpoint) is int and \
+        type(value.provenance_id) is str and \
+        type(value.model_fingerprint) is str and (
+            value.target_phase, value.source_phase, value.seed,
+            value.checkpoint, value.provenance_id, value.model_fingerprint,
+        ) == (
+            expected.target_phase, expected.source_phase, expected.seed,
+            expected.checkpoint, expected.provenance_id,
+            expected.model_fingerprint,
+        )
+
+
+def _fit_spec_matches(value: object, expected: ForwardFitSpec) -> bool:
+    return type(value) is ForwardFitSpec and \
+        _selection_matches(value.selection, expected.selection) and \
+        type(value.optimizer_updates) is int and \
+        type(value.provenance_id) is str and (
+            value.optimizer_updates, value.provenance_id,
+        ) == (
+            expected.optimizer_updates, expected.provenance_id,
+        )
 
 
 def validate_forward_fit_records(
@@ -139,6 +186,7 @@ def validate_forward_fit_records(
     for index, spec in enumerate(specs):
         raw = _next(stream, "forward fit ledger")
         record = _record(raw, FIT_FIELDS, f"forward fit[{index}]")
+        _strings(record, _FIT_STRINGS, f"forward fit[{index}]")
         if _sha256(
             record["attempt_sha256"], "forward fit attempt",
         ) != binding.sha256 or _sha256(
@@ -163,15 +211,21 @@ def _normalize_fits(
 ) -> ForwardFitClosure:
     specs = _forward_fit_specs(source, target_phase)
     if type(value) is not ForwardFitClosure or \
-            value.attempt != attempt or value.target_phase != target_phase or \
+            type(value.attempt) is not FileBinding or \
+            type(value.attempt.path) is not str or \
+            type(value.attempt.sha256) is not str or \
             type(value.target_phase) is not str or \
             type(value.records) is not tuple or \
             len(value.records) != len(specs):
         raise ValueError("forward fit closure changed")
+    if _attempt(value.attempt) != attempt or \
+            value.target_phase != target_phase:
+        raise ValueError("forward fit closure changed")
     records = []
     for observed, expected in zip(value.records, specs, strict=True):
         if type(observed) is not ForwardFitRecord or \
-                observed.spec != expected:
+                not _fit_spec_matches(observed.spec, expected) or \
+                type(observed.model_fingerprint) is not str:
             raise ValueError("forward fit closure changed")
         records.append(ForwardFitRecord(
             expected,
@@ -180,7 +234,10 @@ def _normalize_fits(
             ),
         ))
     normalized = _fit_closure(attempt, target_phase, tuple(records))
-    if type(value.fingerprints) is not MappingProxyType or \
+    if type(value.fingerprints) is not MappingProxyType or any(
+        type(key) is not str or type(item) is not str
+        for key, item in value.fingerprints.items()
+    ) or \
             dict(value.fingerprints) != dict(normalized.fingerprints):
         raise ValueError("forward fit fingerprints changed")
     return normalized
@@ -228,6 +285,9 @@ def validate_forward_prediction_records(
         raw = _next(stream, "forward prediction ledger")
         record = _record(
             raw, PREDICTION_FIELDS, f"forward prediction[{index}]",
+        )
+        _strings(
+            record, _PREDICTION_STRINGS, f"forward prediction[{index}]",
         )
         fingerprint = normalized_fits.fingerprints[
             spec.fit.provenance_id

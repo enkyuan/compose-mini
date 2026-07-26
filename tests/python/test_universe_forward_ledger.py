@@ -35,6 +35,28 @@ MISSING = {
 ATTEMPT = FileBinding("experiments/forward-attempt.json", "f" * 64)
 
 
+class HostileText(str):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
+class AlwaysEqual:
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+class SourceSubclass(PassingScalingOutcome):
+    pass
+
+
 def raises(function: object, *args: object) -> None:
     try:
         function(*args)  # type: ignore[operator]
@@ -259,11 +281,28 @@ def test_fit_record_rejections() -> None:
     rows = fit_rows(value, "fold-1")
     invalid = (
         changed(rows, schema=True),
+        ({
+            HostileText(key) if key == "attempt_sha256" else key: item
+            for key, item in rows[0].items()
+        }, *rows[1:]),
         changed(rows, attempt_sha256=digest(1)),
+        changed(rows, attempt_sha256=HostileText(digest(1))),
         changed(rows, provenance_id=digest(2)),
+        changed(rows, provenance_id=HostileText(digest(2))),
         changed(rows, optimizer_updates=True),
         changed(rows, optimizer_updates=rows[0]["optimizer_updates"] + 1),
         changed(rows, model_fingerprint="F" * 64),
+        changed(
+            rows,
+            model_fingerprint=HostileText(rows[0]["model_fingerprint"]),
+        ),
+        (
+            rows[0],
+            rows[1] | {
+                "model_fingerprint": rows[0]["model_fingerprint"],
+            },
+            *rows[2:],
+        ),
         changed(rows, extra=None),
         rows[1:],
         (*rows, rows[0]),
@@ -330,11 +369,17 @@ def test_prediction_record_rejections() -> None:
     invalid = (
         changed(rows, schema=True),
         changed(rows, attempt_sha256=digest(1)),
+        changed(rows, attempt_sha256=HostileText(digest(1))),
         changed(rows, provenance_id=digest(2)),
+        changed(rows, provenance_id=HostileText(digest(2))),
         changed(rows, model_fingerprint=digest(3)),
+        changed(rows, model_fingerprint=HostileText(digest(3))),
         changed(rows, phase="calibration"),
+        changed(rows, phase=HostileText("calibration")),
         changed(rows, series="OTHER"),
+        changed(rows, series=HostileText("OTHER")),
         changed(rows, grid_sha256=digest(4)),
+        changed(rows, grid_sha256=HostileText(digest(4))),
         changed(rows, predictions=encode_f32le_base64((0.0,))),
         changed(rows, predictions={
             "encoding": "f32le-base64", "count": 1, "base64": nan,
@@ -421,6 +466,204 @@ def test_prediction_record_rejections() -> None:
     assert reads == len(rows) + 1
 
 
+def test_fit_closure_rejections() -> None:
+    value = source()
+    raw = fit_rows(value, "fold-1")
+    fits = ledger.validate_forward_fit_records(
+        raw, value, "fold-1", ATTEMPT,
+    )
+    rows = prediction_rows(value, "fold-1", raw)
+    first = fits.records[0]
+    hostile = (
+        replace(fits, attempt=AlwaysEqual()),
+        replace(
+            fits,
+            attempt=type("Binding", (FileBinding,), {})(
+                ATTEMPT.path, ATTEMPT.sha256,
+            ),
+        ),
+        replace(
+            fits,
+            attempt=FileBinding(
+                ATTEMPT.path, HostileText(ATTEMPT.sha256),
+            ),
+        ),
+        replace(fits, target_phase=HostileText("fold-1")),
+        replace(
+            fits,
+            records=(
+                replace(first, spec=AlwaysEqual()), *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            records=(
+                replace(
+                    first,
+                    model_fingerprint=HostileText(
+                        first.model_fingerprint,
+                    ),
+                ),
+                *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            records=(
+                replace(
+                    first,
+                    spec=replace(first.spec, selection=AlwaysEqual()),
+                ),
+                *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            records=(
+                replace(
+                    first,
+                    spec=replace(
+                        first.spec,
+                        selection=replace(
+                            first.spec.selection,
+                            target_phase=HostileText("fold-1"),
+                        ),
+                    ),
+                ),
+                *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            records=(
+                replace(
+                    first,
+                    spec=replace(first.spec, optimizer_updates=True),
+                ),
+                *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            records=(
+                replace(
+                    first,
+                    spec=replace(
+                        first.spec,
+                        selection=replace(
+                            first.spec.selection, seed=True,
+                        ),
+                    ),
+                ),
+                *fits.records[1:],
+            ),
+        ),
+        replace(
+            fits,
+            fingerprints=MappingProxyType({
+                key: HostileText(item)
+                for key, item in fits.fingerprints.items()
+            }),
+        ),
+    )
+    for closure in hostile:
+        raises(
+            ledger.validate_forward_prediction_records,
+            rows, value, "fold-1", ATTEMPT, closure,
+        )
+
+
+def test_source_closure_rejections() -> None:
+    value = source()
+    coverage = value.manifest.coverage
+    phase, selection = coverage.phases[0], value.selections[0]
+
+    def with_phase(changed: PhaseCoverage) -> PassingScalingOutcome:
+        manifest = SimpleNamespace(coverage=replace(
+            coverage, phases=(changed, *coverage.phases[1:]),
+        ))
+        return replace(value, manifest=manifest)
+
+    def with_series(**fields: object) -> PassingScalingOutcome:
+        changed = replace(phase.series[0], **fields)
+        return with_phase(replace(
+            phase, series=(changed, *phase.series[1:]),
+        ))
+
+    invalid = (
+        SourceSubclass(
+            value.run_id, value.outcome, value.attempt, value.fits,
+            value.predictions, value.summary, value.manifest,
+            value.selections,
+        ),
+        *(
+            replace(value, selections=(
+                replace(
+                    selection,
+                    **{field: HostileText(getattr(selection, field))},
+                ),
+                *value.selections[1:],
+            ))
+            for field in (
+                "target_phase", "source_phase", "provenance_id",
+                "model_fingerprint",
+            )
+        ),
+        replace(value, selections=(
+            replace(selection, seed=True), *value.selections[1:],
+        )),
+        replace(value, selections=(
+            replace(selection, checkpoint=True), *value.selections[1:],
+        )),
+        replace(
+            value,
+            outcome=type("Binding", (FileBinding,), {})(
+                value.outcome.path, value.outcome.sha256,
+            ),
+        ),
+        replace(
+            value,
+            outcome=FileBinding(
+                HostileText(value.outcome.path), value.outcome.sha256,
+            ),
+        ),
+        replace(
+            value,
+            outcome=FileBinding(
+                value.outcome.path, HostileText(value.outcome.sha256),
+            ),
+        ),
+        with_phase(replace(phase, phase=HostileText(phase.phase))),
+        with_series(series=HostileText(phase.series[0].series)),
+        with_series(
+            timestamp_sha256=HostileText(
+                phase.series[0].timestamp_sha256,
+            ),
+        ),
+        with_series(train_rows=True),
+        with_series(validation_rows=True),
+    )
+    rows = fit_rows(value, "fold-1")
+    for forged in invalid:
+        raises(
+            ledger.validate_forward_fit_records,
+            rows, forged, "fold-1", ATTEMPT,
+        )
+
+    raw_fits = fit_rows(value, "fold-1")
+    fits = ledger.validate_forward_fit_records(
+        raw_fits, value, "fold-1", ATTEMPT,
+    )
+    forged = with_series(series=HostileText(phase.series[0].series))
+    raises(
+        ledger.validate_forward_prediction_records,
+        changed(
+            prediction_rows(value, "fold-1", raw_fits), series="OTHER",
+        ),
+        forged, "fold-1", ATTEMPT, fits,
+    )
+
+
 def test_label_free_schema() -> None:
     banned = {"actual", "label", "price", "return", "truth"}
     assert type(ledger.FIT_FIELDS) is frozenset
@@ -454,6 +697,8 @@ def main() -> None:
     test_phase_scoped_ledgers()
     test_fit_record_rejections()
     test_prediction_record_rejections()
+    test_fit_closure_rejections()
+    test_source_closure_rejections()
     test_label_free_schema()
 
 
