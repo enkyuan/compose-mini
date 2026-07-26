@@ -13,8 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.universe_scaling import (
-    ForecastPoint, cohort_views, circular_block_interval, effective_count,
-    paired_comparison, stock_macro_metrics, unseen_view,
+    ForecastPoint, cohort_views, circular_block_interval,
+    circular_block_means, effective_count, paired_comparison,
+    stock_macro_metrics, unseen_view,
     validate_nested_cohorts,
 )
 from tools.universe_contract import universe_roles
@@ -124,6 +125,37 @@ def test_paired_comparison() -> None:
     )
 
 
+def reference_block_means(
+    blocks: dict[str, dict[str, tuple[float, ...]]],
+    width: int,
+    sample_days: int,
+    replicates: int,
+    seed: int,
+    session_dates: tuple[str, ...] | None = None,
+) -> tuple[float, ...]:
+    """Reproduce the original circular-block loop as a test oracle."""
+    dates = session_dates or tuple(next(iter(blocks.values())))
+    generator, samples = Random(seed), []
+    for _ in range(replicates):
+        selected = []
+        while len(selected) < sample_days:
+            start = generator.randrange(len(dates))
+            selected.extend(
+                (start + offset) % len(dates) for offset in range(width)
+            )
+        selected = selected[:sample_days]
+        samples.append(fmean(
+            sum(
+                sum(blocks[name].get(dates[index], ())) for index in selected
+            ) / sum(
+                len(blocks[name].get(dates[index], ()))
+                for index in selected
+            )
+            for name in sorted(blocks)
+        ))
+    return tuple(sorted(samples))
+
+
 def test_bootstrap_and_effective_count() -> None:
     blocks = {
         "A": {
@@ -138,31 +170,53 @@ def test_bootstrap_and_effective_count() -> None:
     dates = tuple(blocks["A"])
     for width in (5, 10, 20):
         observed = circular_block_interval(blocks, width, 200, 7)
-        generator, samples = Random(7), []
-        for _ in range(200):
-            selected = []
-            while len(selected) < len(dates):
-                start = generator.randrange(len(dates))
-                selected.extend(
-                    (start + offset) % len(dates) for offset in range(width)
-                )
-            selected = selected[:len(dates)]
-            samples.append(fmean(
-                sum(
-                    sum(blocks[name][dates[index]]) for index in selected
-                ) / sum(
-                    len(blocks[name][dates[index]]) for index in selected
-                )
-                for name in sorted(blocks)
-            ))
-        samples.sort()
+        samples = reference_block_means(
+            blocks, width, len(dates), 200, 7,
+        )
         assert observed == (
             samples[int(0.025 * 199)], samples[int(0.975 * 199)],
         )
         assert observed[0] < observed[1]
         assert observed == circular_block_interval(blocks, width, 200, 7)
+    extended = circular_block_means(
+        blocks, 5, sample_days=60, replicates=200, seed=7,
+    )
+    assert extended == reference_block_means(blocks, 5, 60, 200, 7)
+    masked = {
+        **blocks,
+        "B": {
+            day: values for index, (day, values) in enumerate(
+                blocks["B"].items(),
+            ) if not 5 <= index < 11
+        },
+    }
+    assert circular_block_means(
+        masked, 10, session_dates=dates, sample_days=60,
+        replicates=200, seed=7,
+    ) == reference_block_means(masked, 10, 60, 200, 7, dates)
+    raises(
+        circular_block_means, masked, 10, session_dates=dates[:-1],
+        sample_days=60, replicates=200, seed=7,
+    )
+    raises(
+        circular_block_means, masked, 5, session_dates=dates,
+        sample_days=60, replicates=200, seed=7,
+    )
+    complete = {
+        name: dict(tuple(values.items())[:20])
+        for name, values in blocks.items()
+    }
+    for width in (5, 10, 20):
+        samples = reference_block_means(complete, width, 20, 200, 7)
+        assert circular_block_interval(complete, width, 200, 7) == (
+            samples[int(0.025 * 199)], samples[int(0.975 * 199)],
+        )
     raises(circular_block_interval, blocks, 22, 10, 7)
     raises(circular_block_interval, {}, 1, 10, 7)
+    raises(
+        circular_block_means, blocks, 5,
+        sample_days=4, replicates=10, seed=7,
+    )
 
     hand = effective_count({
         "A": {"d1": 0.0, "d2": 1.0, "d3": 2.0},

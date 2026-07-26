@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from math import log
 from typing import TYPE_CHECKING
 
-from tools.arm_context_diagnostic import ContextLease
 from tools.context_diagnostic_contract import (
     MAX_HISTORY, ContextAttempt, ContextPhase, ContextScalerInput,
     context_phase_sha256,
@@ -19,7 +19,6 @@ from tools.context_diagnostic_inputs import (
     context_grid_sha256, timestamp_rows,
 )
 from tools.data_v1 import FEATURE_COUNT, read_timestamps_until
-from tools.fetch_universe import UniverseManifest
 from tools.files import FrozenInput, verify_frozen
 from tools.panel_contract import read_canonical_json
 from tools.relative_context_contract import (
@@ -36,6 +35,8 @@ from tools.universe_scaling_contract import timestamp_grid_sha256
 if TYPE_CHECKING:
     import torch
 
+    from tools.arm_context_diagnostic import ContextLease
+    from tools.fetch_universe import UniverseManifest
     from tools.relative_context import MarketContextForwardWindows
     from tools.train import TrainingData
     from tools.universe_forward_runner import ForwardFeatureWindows
@@ -135,6 +136,9 @@ class _PhaseRows:
 def _validate_inputs(
     context: ContextAttempt, lease: ContextLease, spy_csv: FrozenInput,
 ) -> tuple[Mapping[str, object], UniverseManifest, SessionCalendar]:
+    from tools.arm_context_diagnostic import ContextLease
+    from tools.fetch_universe import UniverseManifest
+
     if type(context) is not ContextAttempt or \
        type(lease) is not ContextLease or \
        type(spy_csv) is not FrozenInput or \
@@ -237,36 +241,61 @@ def _phase_binding(
     )
 
 
-def _collect_inputs(
-    context: ContextAttempt, lease: ContextLease, spy_csv: FrozenInput,
+def _collect_snapshot_inputs(
+    context: ContextAttempt,
+    config: Mapping[str, object],
+    start: date,
+    end: date,
+    interval_minutes: int,
+    calendar: SessionCalendar,
+    csv_inputs: tuple[tuple[str, FrozenInput], ...],
+    spy_csv: FrozenInput,
+    verify: Callable[[], None],
 ) -> tuple[_PhaseRows, ...]:
-    config, manifest, calendar = _validate_inputs(context, lease, spy_csv)
+    """Derive phase rows from frozen market data without execution authority."""
+    if type(context) is not ContextAttempt or \
+       not isinstance(config, Mapping) or type(start) is not date or \
+       type(end) is not date or type(interval_minutes) is not int or \
+       type(calendar) is not SessionCalendar or \
+       type(csv_inputs) is not tuple or \
+       tuple(series for series, _ in csv_inputs) != context.master or \
+       any(type(item) is not FrozenInput for _, item in csv_inputs) or \
+       type(spy_csv) is not FrozenInput or \
+       spy_csv.sha256 != RESIDUAL_BENCHMARK["spy_csv"].sha256 or \
+       not callable(verify) or any(
+           type(phase) is not ContextPhase for phase in context.phases
+       ) or tuple(phase.phase for phase in context.phases) != tuple(
+           name for name, _ in PHASE_BUDGETS
+       ):
+        raise ValueError("residual snapshot inputs are invalid")
+    verify()
+    verify_frozen((*tuple(item for _, item in csv_inputs), spy_csv))
     horizon = config["target_horizon_bars"]
     alignment = config["alignment_horizon_bars"]
     if type(horizon) is not int or type(alignment) is not int:
         raise ValueError("residual horizons are invalid")
     cutoff = context_cutoff_timestamp(
-        calendar, manifest.start, manifest.end, manifest.interval_minutes,
+        calendar, start, end, interval_minutes,
         horizon, alignment,
     )
     spy_timestamps = read_timestamps_until(spy_csv.snapshot, cutoff)
     spy_samples = session_samples(
-        spy_timestamps, manifest.interval_minutes, calendar,
-        manifest.start, manifest.end, MAX_HISTORY, horizon, alignment,
+        spy_timestamps, interval_minutes, calendar,
+        start, end, MAX_HISTORY, horizon, alignment,
     )
     by_phase = {phase.phase: [] for phase in context.phases}
-    for series, frozen in lease.snapshots.csv:
+    for series, frozen in csv_inputs:
         timestamps = read_timestamps_until(frozen.snapshot, cutoff)
         rows = dict(context_all_phase_rows(
-            timestamps, manifest.interval_minutes, calendar,
-            manifest.start, manifest.end, horizon, alignment,
+            timestamps, interval_minutes, calendar,
+            start, end, horizon, alignment,
         ))
         if tuple(rows) != tuple(by_phase):
             raise ValueError("residual source phase order changed")
         for phase in by_phase:
             by_phase[phase].append((series, timestamps, rows[phase]))
 
-    csv = dict(lease.snapshots.csv)
+    csv = dict(csv_inputs)
     result = []
     for source in context.phases:
         stock = tuple(by_phase[source.phase])
@@ -287,9 +316,20 @@ def _collect_inputs(
             ),
             stock, spy_timestamps, aligned,
         ))
-    lease()
-    verify_frozen((spy_csv,))
+    verify()
+    verify_frozen((*tuple(item for _, item in csv_inputs), spy_csv))
     return tuple(result)
+
+
+def _collect_inputs(
+    context: ContextAttempt, lease: ContextLease, spy_csv: FrozenInput,
+) -> tuple[_PhaseRows, ...]:
+    config, manifest, calendar = _validate_inputs(context, lease, spy_csv)
+    return _collect_snapshot_inputs(
+        context, config, manifest.start, manifest.end,
+        manifest.interval_minutes, calendar, lease.snapshots.csv,
+        spy_csv, lease,
+    )
 
 
 def derive_residual_phases(

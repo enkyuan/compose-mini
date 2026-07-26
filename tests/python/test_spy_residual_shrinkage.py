@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Verify zero-anchored residual scaling and its input boundary."""
+"""Verify authenticated SPY-residual development diagnostics."""
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from io import StringIO
 from math import isclose
 from pathlib import Path
+from random import Random
+from statistics import fmean
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -21,22 +24,32 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import tools.analyze_spy_residual_shrinkage as analyzer
+import tools.residual_calibration_evidence as calibration_evidence
+import tools.residual_phase_evidence as phase_evidence
 from tools.analyze_spy_residual_shrinkage import (
-    ANALYSIS_SOURCE_PATHS, _analyze_alignment, _analyze_phases,
-    _final_report, _fit_report, _phase_market_regimes, _publish,
+    ANALYSIS_SOURCE_PATHS, SENSITIVITY_SOURCE_PATHS,
+    _analyze_alignment, _analyze_phases, _analyze_sensitivity,
+    _execution_provenance, _final_report, _fit_report,
+    _phase_market_regimes, _publish, _sensitivity_report,
     _validate_analysis_commit, _validate_published,
-    alignment_diagnostic, evaluate_frozen_scale, fit_diagnostic,
-    fit_zero_anchored_scale, pooled_r2, scale_predictions,
-    zero_anchored_scale,
+    alignment_diagnostic, direction_gated_predictions,
+    evaluate_frozen_scale, fit_diagnostic, fit_zero_anchored_scale,
+    interval_sensitivity, pooled_r2, scale_predictions, zero_anchored_scale,
 )
 from tools.arm_spy_residual import ResidualLease
 from tools.files import FrozenInput
 from tools.panel_contract import FileBinding, _directory_identity
+from tools.residual_calibration_evidence import (
+    CalibrationSeries, CompletedCalibrationEvidence, ExecutionProvenance,
+)
 from tools.relative_context_contract import (
     MODELS, ResidualTruthRow, expected_residual_protocol,
 )
 from tools.session_samples import SampleRows
 from tools.spy_residual_controller import _PhaseRows
+from tools.spy_residual_forward_contract import (
+    FORWARD_CONFIG, expected_forward_protocol,
+)
 from tools.universe_contract import PackedRows
 
 REPORT_INPUTS = {
@@ -47,6 +60,13 @@ REPORT_INPUTS = {
     "attempt": {"path": "experiments/attempt.json", "sha256": "b" * 64},
     "outcome": {"path": "experiments/outcome.json", "sha256": "c" * 64},
     "phases": [],
+}
+SENSITIVITY_INPUTS = {
+    **REPORT_INPUTS,
+    "forward_config": {
+        "path": FORWARD_CONFIG.path,
+        "sha256": FORWARD_CONFIG.sha256,
+    },
 }
 
 
@@ -171,6 +191,187 @@ def test_scaling_preserves_shape_and_r2_uses_zero() -> None:
     }) == 0.0
 
 
+def test_direction_gate_uses_only_bound_regime_labels() -> None:
+    predictions = {"A": (1.0, -2.0), "B": (3.0, -4.0)}
+    regimes = {
+        "A": ("negative", "nonnegative"),
+        "B": ("nonnegative", "negative"),
+    }
+    observed = direction_gated_predictions(predictions, regimes)
+    assert observed == {
+        "A": (0.0, -2.0 * analyzer.SPY_DIRECTION_SCALE),
+        "B": (3.0 * analyzer.SPY_DIRECTION_SCALE, 0.0),
+    }
+    assert all(
+        observed[name] == analyzer.gate_mean_predictions(
+            predictions[name], regimes[name],
+        )
+        for name in predictions
+    )
+    rejects(
+        direction_gated_predictions, predictions,
+        {"A": ("negative",), "B": regimes["B"]},
+    )
+    rejects(
+        direction_gated_predictions, predictions,
+        {"B": regimes["B"], "A": regimes["A"]},
+    )
+
+
+def test_interval_sensitivity_uses_fixed_session_blocks() -> None:
+    gains = {
+        name: {
+            f"2026-01-{day:02d}": (float(day + index),)
+            for day in range(1, 22)
+        }
+        for index, name in enumerate(("A", "B"))
+    }
+    losses = {
+        name: {day: (100.0,) for day in values}
+        for name, values in gains.items()
+    }
+    observed = interval_sensitivity(
+        gains, losses, target_sessions=60, block_sessions=20,
+        replicates=200, seed=7,
+    )
+    dates, center = tuple(gains["A"]), 11.5
+    generator, samples = Random(7), []
+    for _ in range(200):
+        starts = tuple(generator.randrange(len(dates)) for _ in range(3))
+        selected = tuple(
+            (start + offset) % len(dates)
+            for start in starts for offset in range(20)
+        )
+        samples.append(fmean(
+            fmean(
+                gains[name][dates[index]][0] - center
+                for index in selected
+            )
+            for name in gains
+        ))
+    samples.sort()
+    critical = -samples[int(0.025 * 199)]
+    detectable = critical - samples[int(0.20 * 199)]
+    assert observed["source_session_count"] == 21
+    assert observed["target_session_count"] == 60
+    assert observed["block_sessions"] == 20
+    assert observed["replicates"] == 200
+    assert observed["seed"] == 7
+    assert observed["lower_tail_probability"] == 0.025
+    assert observed["marginal_power"] == 0.8
+    assert observed["reference_mean_squared_error"] == 100.0
+    assert observed["critical_mean_gain"] == critical
+    assert observed["minimum_detectable_mean_gain"] == detectable
+    assert observed["minimum_detectable_fraction_of_reference_mse"] == \
+        detectable / 100.0
+    shifted_gains = {
+        name: {
+            day: tuple(value + 100.0 for value in values)
+            for day, values in by_day.items()
+        }
+        for name, by_day in gains.items()
+    }
+    shifted = interval_sensitivity(
+        shifted_gains, losses, target_sessions=60, block_sessions=20,
+        replicates=200, seed=7,
+    )
+    assert isclose(
+        shifted["descriptive_development_mean_gain"],
+        observed["descriptive_development_mean_gain"] + 100.0,
+    )
+    for key in ("critical_mean_gain", "minimum_detectable_mean_gain"):
+        assert isclose(shifted[key], observed[key], abs_tol=1e-12)
+    missing = set(dates[5:11])
+    masked_gains = {
+        **gains,
+        "B": {
+            day: values for day, values in gains["B"].items()
+            if day not in missing
+        },
+    }
+    masked_losses = {
+        **losses,
+        "B": {
+            day: values for day, values in losses["B"].items()
+            if day not in missing
+        },
+    }
+    masked = interval_sensitivity(
+        masked_gains, masked_losses, target_sessions=60,
+        block_sessions=10, replicates=200, seed=7,
+    )
+    center = fmean(
+        fmean(value for values in by_day.values() for value in values)
+        for by_day in masked_gains.values()
+    )
+    generator, samples = Random(7), []
+    for _ in range(200):
+        starts = tuple(generator.randrange(len(dates)) for _ in range(6))
+        selected = tuple(
+            (start + offset) % len(dates)
+            for start in starts for offset in range(10)
+        )
+        samples.append(fmean(
+            fmean(
+                value - center
+                for index in selected
+                for value in masked_gains[name].get(dates[index], ())
+            )
+            for name in masked_gains
+        ))
+    samples.sort()
+    critical = -samples[int(0.025 * 199)]
+    detectable = critical - samples[int(0.20 * 199)]
+    assert masked["critical_mean_gain"] == critical
+    assert masked["minimum_detectable_mean_gain"] == detectable
+    assert masked["source_session_count"] == 21
+    assert masked["source_stock_count"] == 2
+    assert masked["source_missing_stock_session_count"] == 6
+    assert masked["source_observation_count"] == 36
+    assert masked["source_minimum_sessions_per_stock"] == 15
+    assert masked["source_maximum_sessions_per_stock"] == 21
+    assert masked["source_minimum_observations_per_stock"] == 15
+    assert masked["source_maximum_observations_per_stock"] == 21
+    rejects(
+        interval_sensitivity, gains, losses,
+        target_sessions=19, block_sessions=20, replicates=200, seed=7,
+    )
+    for changed_gains, changed_losses in (
+        (
+            masked_gains,
+            losses,
+        ),
+        (
+            masked_gains,
+            {**masked_losses, "B": {
+                **masked_losses["B"],
+                dates[-1]: (100.0, 100.0),
+            }},
+        ),
+        (
+            {**masked_gains, "B": dict(reversed(
+                tuple(masked_gains["B"].items()),
+            ))},
+            masked_losses,
+        ),
+        (
+            {**masked_gains, "B": {dates[0]: gains["B"][dates[0]]}},
+            {**masked_losses, "B": {dates[0]: losses["B"][dates[0]]}},
+        ),
+        (
+            {**masked_gains, "B": {
+                **masked_gains["B"], dates[-1]: (float("nan"),),
+            }},
+            masked_losses,
+        ),
+    ):
+        rejects(
+            interval_sensitivity, changed_gains, changed_losses,
+            target_sessions=60, block_sessions=20,
+            replicates=200, seed=7,
+        )
+
+
 def test_alignment_decomposition_reconciles_partitions() -> None:
     truth = {"A": rows(2.0, 2.0), "B": rows(-1.0, -1.0)}
     predictions = {"A": (1.0, 1.0), "B": (1.0, 1.0)}
@@ -266,7 +467,7 @@ def test_phase_market_regime_reads_exact_fold_prefix() -> None:
             return bars(*closes)
 
         with patch.object(
-            analyzer, "context_bar_prefix", side_effect=prefix,
+            phase_evidence, "context_bar_prefix", side_effect=prefix,
         ):
             result = _phase_market_regimes(state, lease)
 
@@ -287,8 +488,152 @@ def test_analysis_commit_binds_shared_gate() -> None:
     tree = validate.call_args.args[1]
     assert tuple(source.path for source in tree.files) == \
         ANALYSIS_SOURCE_PATHS
+    assert {
+        "tools/residual_phase_evidence.py",
+        "tools/spy_residual_forward_contract.py",
+        "tools/universe_cross_section.py",
+        "tools/universe_scaling.py",
+    }.issubset(ANALYSIS_SOURCE_PATHS)
+    assert not {
+        "tools/fetch_massive.py", "tools/fetch_universe.py",
+        "tools/residual_calibration_evidence.py",
+    } & set(ANALYSIS_SOURCE_PATHS)
     rejects(_validate_analysis_commit, "d" * 40, sources[:-1])
     rejects(_validate_analysis_commit, "d" * 40, tuple(reversed(sources)))
+
+    sensitivity = tuple(
+        FileBinding(path, hashlib.sha256(path.encode()).hexdigest())
+        for path in SENSITIVITY_SOURCE_PATHS
+    )
+    with patch.object(analyzer, "_validate_commit") as validate:
+        _validate_analysis_commit(
+            "d" * 40, sensitivity, SENSITIVITY_SOURCE_PATHS,
+        )
+    assert tuple(
+        source.path for source in validate.call_args.args[1].files
+    ) == SENSITIVITY_SOURCE_PATHS
+    loaded = tuple(sorted(
+        Path(module.__file__).resolve().relative_to(ROOT).as_posix()
+        for name, module in sys.modules.items()
+        if (name == "tools" or name.startswith("tools.")) and
+        getattr(module, "__file__", None)
+    ))
+    assert loaded == SENSITIVITY_SOURCE_PATHS
+    assert not {
+        "torch", "tools.backtest", "tools.train",
+        "tools.spy_residual_forward_inputs",
+    } & sys.modules.keys()
+
+
+def test_completed_evidence_exposes_no_execution_capability() -> None:
+    assert tuple(inspect.signature(
+        analyzer._authenticate_completed_calibration,
+    ).parameters) == ("attempt_path", "implementation_commit")
+    assert not hasattr(
+        calibration_evidence, "authenticate_completed_calibration",
+    )
+    attempt, context = analyzer.read_residual_attempt(
+        ROOT / analyzer.SOURCE_ATTEMPT.path,
+    )
+    source, binding = context.phases[1], attempt.phases[1]
+    row = rows(0.01)[0]
+    series = tuple(
+        CalibrationSeries(
+            name, (row,) * count, (0.0,) * count,
+            ("nonnegative",) * count,
+        )
+        for name, count, _ in source.evaluation_rows
+    )
+    provenance = ExecutionProvenance("d" * 40, attempt.source_tree)
+    calls = []
+    evidence = CompletedCalibrationEvidence(
+        source, binding, series,
+        provenance, provenance, provenance, provenance, provenance,
+        lambda: calls.append("verify"),
+    )
+    evidence.verify()
+    assert calls == ["verify"]
+    assert not callable(evidence)
+    assert {
+        field for field in evidence.__slots__
+        if any(word in field for word in (
+            "lease", "snapshot", "training", "forward_inputs", "runtime",
+            "benchmark", "reader",
+        ))
+    } == set()
+    assert _execution_provenance(evidence) == {
+        "current_analysis": {
+            "implementation_commit": "d" * 40,
+            "source_tree_sha256": attempt.source_tree.sha256,
+        },
+        "historical_execution": {
+            name: {
+                "implementation_commit": "d" * 40,
+                "source_tree_sha256": attempt.source_tree.sha256,
+            }
+            for name in (
+                "context", "residual", "scaling_finalizer",
+                "scaling_runner",
+            )
+        },
+    }
+    rejects(
+        CompletedCalibrationEvidence,
+        source, binding, tuple(reversed(series)),
+        provenance, provenance, provenance, provenance, provenance,
+        lambda: None,
+    )
+
+
+def test_sensitivity_route_never_uses_strict_execution() -> None:
+    """Keep calibration replay separate from the executable strict path."""
+    report = {"schema": 1}
+    checks = []
+    evidence = SimpleNamespace(verify=lambda: checks.append("verified"))
+    session = SimpleNamespace(
+        evidence=evidence, report_inputs_json="{}",
+        protocol_json="{}", run_dir=ROOT / "reports/source",
+    )
+
+    @contextmanager
+    def authenticated(*_args: object):
+        yield session
+
+    with tempfile.TemporaryDirectory() as directory:
+        descriptor = os.open(directory, os.O_RDONLY)
+        with patch.object(
+            analyzer, "_require_isolated_execution",
+        ), patch.object(
+            analyzer, "_require_exact_launch",
+        ), patch.object(
+            analyzer, "_require_package_alias",
+        ), patch.object(
+            analyzer, "_authenticate_completed_calibration", authenticated,
+        ), patch.object(
+            analyzer, "_analyze_completed_sensitivity",
+            return_value=report,
+        ) as analyze, patch.object(
+            analyzer, "_create_output_directory",
+            return_value=(descriptor, (1, 2)),
+        ) as create, patch.object(
+            analyzer, "_publish_completed_sensitivity",
+            return_value=report,
+        ) as publish, patch.object(
+            analyzer, "authenticate_residual_attempt",
+        ) as strict:
+            assert analyzer.analyze_residual_shrinkage(
+                Path("source.json"), "d" * 40, sensitivity=True,
+            ) == report
+
+    strict.assert_not_called()
+    analyze.assert_called_once_with(evidence, {}, {}, "d" * 40)
+    create.assert_called_once_with(ROOT / "reports/source-sensitivity")
+    assert publish.call_args.args[:4] == (
+        report, ROOT / "reports/source-sensitivity/sensitivity.json",
+        descriptor, (1, 2),
+    )
+    assert callable(publish.call_args.args[4])
+    assert checks == ["verified"]
 
 
 def test_invalid_alignment_inputs_are_rejected() -> None:
@@ -366,6 +711,52 @@ def test_reports_remain_residual_only_and_non_executable() -> None:
     assert "absolute_price" not in serialized
     assert result["evidence_role"] == \
         "development-post-hoc-not-forward-clean"
+
+
+def test_sensitivity_report_remains_planning_only() -> None:
+    comparisons = {
+        name: {
+            "minimum_detectable_mean_gain": float(index),
+        }
+        for index, name in enumerate(
+            ("zero", "unchanged-five-seed-mean"), 1,
+        )
+    }
+    report = _sensitivity_report(
+        SENSITIVITY_INPUTS, expected_forward_protocol(),
+        comparisons, "d" * 40,
+    )
+    assert report["evidence_role"] == "development-planning-only"
+    assert report["decision"] == {
+        "candidate_or_protocol_change_authorized": False,
+        "joint_test_power_estimated": False,
+        "output_role": "paired-mse-interval-sensitivity-only",
+    }
+    assert report["truth_phases_read"] == ["calibration"]
+    assert report["locks"] == expected_forward_protocol()["locks"]
+    assert all(value is False for value in report["locks"].values())
+    assert not {"prices", "returns", "trades", "backtest"} & report.keys()
+    rejects(
+        _sensitivity_report, REPORT_INPUTS, expected_forward_protocol(),
+        comparisons, "d" * 40,
+    )
+    changed = expected_forward_protocol()
+    changed["forward_window"]["target_session_count"] = 61
+    rejects(
+        _sensitivity_report, SENSITIVITY_INPUTS, changed,
+        comparisons, "d" * 40,
+    )
+    source = (
+        ROOT / "tools/analyze_spy_residual_shrinkage.py"
+    ).read_text(encoding="utf-8")
+    assert "torch" not in sys.modules
+    assert all(call not in source for call in (
+        "api_key(", "fetch_bars(", "fetch_universe(", "request_json(",
+        "urlopen(",
+    ))
+    assert all(name not in source for name in (
+        "tools.spy_residual_forward_inputs", "tools.backtest", "import torch",
+    ))
 
 
 def test_publication_is_exclusive_and_mode_bound() -> None:
@@ -555,15 +946,101 @@ def test_alignment_read_and_publication_order_is_fold_one_only() -> None:
         "development-post-hoc-not-forward-clean"
 
 
+def test_sensitivity_reads_calibration_only() -> None:
+    truth = {"A": rows(1.0, -1.0), "B": rows(2.0, -2.0)}
+    predictions = {"A": (0.5, -0.5), "B": (1.0, -1.0)}
+    state = SimpleNamespace(source=SimpleNamespace(phase="calibration"))
+    phase = SimpleNamespace(
+        source=state.source,
+        predictions={"panel_transformer": predictions},
+    )
+    events = []
+
+    with tempfile.TemporaryDirectory(
+        prefix="spy-residual-sensitivity-", dir=ROOT,
+    ) as directory:
+        output = Path(directory)
+        result_path = output / "sensitivity.json"
+        descriptor = os.open(directory, os.O_RDONLY)
+        real_publish = analyzer._publish
+
+        def regimes(observed: object, lease: object) -> object:
+            assert observed is state
+            events.append("regimes")
+            return {
+                "A": ("nonnegative", "negative"),
+                "B": ("negative", "nonnegative"),
+            }
+
+        def phase_truth(observed: object, lease: object) -> object:
+            assert observed is state
+            events.append("truth")
+            return truth, ()
+
+        def sensitivity(*args: object, **kwargs: object) -> object:
+            events.append("sensitivity")
+            assert kwargs == {
+                "target_sessions": 60,
+                "block_sessions": 20,
+                "replicates": 10_000,
+                "seed": 20_260_725,
+            }
+            return {"minimum_detectable_mean_gain": 1.0}
+
+        def publish(*args: object) -> None:
+            events.append("publish")
+            real_publish(*args)
+
+        try:
+            with patch.object(
+                analyzer, "_phase_market_regimes", side_effect=regimes,
+            ), patch.object(
+                analyzer, "_phase_truth", side_effect=phase_truth,
+            ), patch.object(
+                analyzer, "interval_sensitivity", side_effect=sensitivity,
+            ), patch.object(
+                analyzer, "_publish", side_effect=publish,
+            ):
+                result = _analyze_sensitivity(
+                    state, phase, object(), SENSITIVITY_INPUTS,
+                    expected_forward_protocol(), "d" * 40,
+                    result_path, descriptor, _directory_identity(output),
+                    lambda: events.append("verify"),
+                )
+        finally:
+            os.close(descriptor)
+
+    assert tuple(result["paired_squared_error"]) == (
+        "zero", "unchanged-five-seed-mean",
+    )
+    assert events.count("truth") == 1
+    assert events.count("sensitivity") == 2
+    assert events.index("regimes") < events.index("truth") < \
+        events.index("publish")
+
+
 def test_cli_summaries_are_mode_bound() -> None:
     parsed = tuple(analyzer.parse_args((
         "attempt.json", "--implementation-commit", "d" * 40, *flag,
-    )) for flag in ((), ("--alignment",)))
-    assert tuple(value.alignment for value in parsed) == (False, True)
+    )) for flag in ((), ("--alignment",), ("--sensitivity",)))
+    assert tuple(
+        (value.alignment, value.sensitivity) for value in parsed
+    ) == ((False, False), (True, False), (False, True))
+    with redirect_stderr(StringIO()):
+        try:
+            analyzer.parse_args((
+                "attempt.json", "--implementation-commit", "d" * 40,
+                "--alignment", "--sensitivity",
+            ))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("conflicting diagnostic modes were accepted")
     arguments = SimpleNamespace(
         attempt=Path("attempt.json"),
         implementation_commit="d" * 40,
         alignment=False,
+        sensitivity=False,
     )
     reports = (
         {
@@ -575,6 +1052,12 @@ def test_cli_summaries_are_mode_bound() -> None:
         {
             "diagnostic": {
                 "global": {"unclipped_scale": -0.5},
+            },
+        },
+        {
+            "paired_squared_error": {
+                "zero": {},
+                "unchanged-five-seed-mean": {},
             },
         },
     )
@@ -589,11 +1072,21 @@ def test_cli_summaries_are_mode_bound() -> None:
             "status": "analyzed",
             "unclipped_scale": -0.5,
         },
+        {
+            "comparisons": [
+                "unchanged-five-seed-mean",
+                "zero",
+            ],
+            "mode": "sensitivity",
+            "status": "analyzed",
+        },
     )
-    for alignment, report, summary in zip(
-        (False, True), reports, expected, strict=True,
+    for alignment, sensitivity, report, summary in zip(
+        (False, True, False), (False, False, True),
+        reports, expected, strict=True,
     ):
         arguments.alignment = alignment
+        arguments.sensitivity = sensitivity
         output = StringIO()
         with patch.object(
             analyzer, "parse_args", return_value=arguments,
@@ -604,7 +1097,7 @@ def test_cli_summaries_are_mode_bound() -> None:
         assert json.loads(output.getvalue()) == summary
         analyze.assert_called_once_with(
             arguments.attempt, arguments.implementation_commit,
-            alignment=alignment,
+            alignment=alignment, sensitivity=sensitivity,
         )
 
 
@@ -664,15 +1157,21 @@ def main() -> None:
     test_scale_is_global_and_leave_one_stock_out()
     test_common_rescaling_and_duplication_are_invariant()
     test_scaling_preserves_shape_and_r2_uses_zero()
+    test_direction_gate_uses_only_bound_regime_labels()
+    test_interval_sensitivity_uses_fixed_session_blocks()
     test_alignment_decomposition_reconciles_partitions()
     test_phase_market_regime_reads_exact_fold_prefix()
     test_analysis_commit_binds_shared_gate()
+    test_completed_evidence_exposes_no_execution_capability()
+    test_sensitivity_route_never_uses_strict_execution()
     test_invalid_alignment_inputs_are_rejected()
     test_diagnostics_use_one_frozen_global_scale()
     test_reports_remain_residual_only_and_non_executable()
+    test_sensitivity_report_remains_planning_only()
     test_publication_is_exclusive_and_mode_bound()
     test_fit_is_durable_before_calibration_truth()
     test_alignment_read_and_publication_order_is_fold_one_only()
+    test_sensitivity_reads_calibration_only()
     test_cli_summaries_are_mode_bound()
     test_imported_entrypoint_cannot_analyze()
     test_invalid_inputs_are_rejected()

@@ -6,7 +6,7 @@ from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 
-from tools.analyze_context_cross_section import ANALYSIS_SOURCE_PATHS
+from tools.context_cross_section import CONTEXT_ANALYSIS_SOURCE_PATHS
 from tools.context_diagnostic_contract import (
     CONTEXT_SOURCE_PATHS, ContextAttempt, ContextFit, ContextPhase,
     ContextPrediction, _fit_value, _json_sha256, _loss, _run_identity,
@@ -74,7 +74,7 @@ RESIDUAL_CALENDAR = FileBinding(
 )
 RESIDUAL_RUNNER = "tools/run_spy_residual.py"
 RESIDUAL_SOURCE_PATHS = tuple(sorted({
-    *ANALYSIS_SOURCE_PATHS,
+    *CONTEXT_ANALYSIS_SOURCE_PATHS,
     *CONTEXT_SOURCE_PATHS,
     "tools/arm_spy_residual.py",
     "tools/finalize_spy_residual.py",

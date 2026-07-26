@@ -19,6 +19,12 @@ from tools.universe_scaling import (
 )
 from tools.universe_scaling_contract import timestamp_grid_sha256
 
+CONTEXT_ANALYSIS_SOURCE_PATHS = (
+    "tools/analyze_context_cross_section.py",
+    "tools/context_cross_section.py",
+    "tools/universe_cross_section.py",
+)
+
 
 def _group(row: ContextTruthRow) -> tuple[str, str, str]:
     return row.as_of, row.entry_time, row.target_time

@@ -199,25 +199,36 @@ def _paired_daily(
     }
 
 
-def _common_dates(
+def _union_dates(
     values: Mapping[str, Mapping[str, Sequence[float]]],
 ) -> tuple[str, ...]:
     if not isinstance(values, Mapping) or not values or any(
         not isinstance(name, str) or not name or
-        not isinstance(by_date, Mapping) or not by_date
+        not isinstance(by_date, Mapping) or not by_date or any(
+            not isinstance(day, str) or not day or
+            isinstance(items, (str, bytes)) or
+            not isinstance(items, Sequence) or not items or any(
+                type(value) not in (int, float) or not isfinite(value)
+                for value in items
+            )
+            for day, items in by_date.items()
+        )
         for name, by_date in values.items()
     ):
         raise ValueError("daily values must be nonempty mappings")
-    dates = tuple(sorted(set.intersection(*(
+    return tuple(sorted(set().union(*(
         set(by_date) for by_date in values.values()
     ))))
-    if not dates or any(
-        not by_date[day] or any(
-            type(value) not in (int, float) or not isfinite(value)
-            for value in by_date[day]
-        )
-        for by_date in values.values() for day in dates
-    ):
+
+
+def _common_dates(
+    values: Mapping[str, Mapping[str, Sequence[float]]],
+) -> tuple[str, ...]:
+    _union_dates(values)
+    dates = tuple(sorted(set.intersection(*map(
+        set, values.values(),
+    ))))
+    if not dates:
         raise ValueError("daily values need finite common-date observations")
     return dates
 
@@ -227,41 +238,78 @@ def _macro(
     dates: Sequence[str],
 ) -> float:
     return fmean(
-        fmean(value for day in dates for value in values[name][day])
+        fmean(
+            value for day in dates if day in values[name]
+            for value in values[name][day]
+        )
         for name in sorted(values)
     )
 
 
-def circular_block_interval(
+def circular_block_means(
     values: Mapping[str, Mapping[str, Sequence[float]]],
     block_days: int,
+    *,
+    session_dates: Sequence[str] | None = None,
+    sample_days: int | None = None,
     replicates: int = BOOTSTRAP_REPLICATES,
     seed: int = BOOTSTRAP_SEED,
-) -> tuple[float, float]:
-    """Bootstrap one paired stock-macro mean over shared circular date blocks."""
-    dates = _common_dates(values)
-    if type(block_days) is not int or type(replicates) is not int or \
-       type(seed) is not int or not 1 <= block_days <= len(dates) or replicates < 2:
+) -> tuple[float, ...]:
+    """Resample one stock-macro mean over shared circular date blocks."""
+    observed = _union_dates(values)
+    if session_dates is None:
+        dates = _common_dates(values)
+    elif isinstance(session_dates, (str, bytes)) or \
+         not isinstance(session_dates, Sequence):
+        raise ValueError("bootstrap session grid is invalid")
+    else:
+        dates = tuple(session_dates)
+        if dates != observed or any(
+            tuple(by_date) != tuple(day for day in dates if day in by_date)
+            for by_date in values.values()
+        ):
+            raise ValueError("bootstrap session grid is invalid")
+    count = len(dates) if sample_days is None else sample_days
+    if type(block_days) is not int or type(count) is not int or \
+       type(replicates) is not int or type(seed) is not int or \
+       not 1 <= block_days <= min(len(dates), count) or replicates < 2:
         raise ValueError("bootstrap parameters are invalid")
     daily = tuple(
-        tuple((sum(values[name][day]), len(values[name][day])) for day in dates)
+        tuple(
+            (
+                (sum(values[name][day]), len(values[name][day]))
+                if day in values[name] else (0.0, 0)
+            )
+            for day in dates
+        )
         for name in sorted(values)
     )
-    full_blocks = len(dates) // block_days
-    remainder = len(dates) % block_days
+    full_blocks, remainder = divmod(count, block_days)
 
     def blocks(stock: Sequence[tuple[float, int]], width: int) -> tuple[
         tuple[float, int], ...
     ]:
         return tuple((
-            sum(stock[(start + offset) % len(dates)][0] for offset in range(width)),
-            sum(stock[(start + offset) % len(dates)][1] for offset in range(width)),
+            sum(
+                stock[(start + offset) % len(dates)][0]
+                for offset in range(width)
+            ),
+            sum(
+                stock[(start + offset) % len(dates)][1]
+                for offset in range(width)
+            ),
         ) for start in range(len(dates)))
 
     prepared = tuple((
         blocks(stock, block_days),
         blocks(stock, remainder) if remainder else (),
     ) for stock in daily)
+    if any(
+        any(count == 0 for _, count in full) or
+        any(count == 0 for _, count in partial)
+        for full, partial in prepared
+    ):
+        raise ValueError("bootstrap session coverage is invalid")
     generator, samples = Random(seed), []
     for _ in range(replicates):
         starts = tuple(
@@ -278,7 +326,19 @@ def circular_block_interval(
             )
             for full, partial in prepared
         ))
-    samples.sort()
+    return tuple(sorted(samples))
+
+
+def circular_block_interval(
+    values: Mapping[str, Mapping[str, Sequence[float]]],
+    block_days: int,
+    replicates: int = BOOTSTRAP_REPLICATES,
+    seed: int = BOOTSTRAP_SEED,
+) -> tuple[float, float]:
+    """Bootstrap one paired stock-macro mean over its observed date count."""
+    samples = circular_block_means(
+        values, block_days, replicates=replicates, seed=seed,
+    )
     return (
         samples[int(0.025 * (replicates - 1))],
         samples[int(0.975 * (replicates - 1))],

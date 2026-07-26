@@ -137,7 +137,9 @@ ROOT = Path(__file__).resolve().parents[1]
 from tools.arm_context_diagnostic import (
     ContextLease, authenticate_context_attempt,
 )
-from tools.context_cross_section import evaluate_context_cross_section
+from tools.context_cross_section import (
+    CONTEXT_ANALYSIS_SOURCE_PATHS, evaluate_context_cross_section,
+)
 from tools.context_diagnostic_contract import (
     HISTORY_LENGTHS, PRIMARY_MODEL, TARGET_PHASES, ContextAttempt,
     ContextPhase, ContextPredictionEvidence, ContextReceipt,
@@ -168,11 +170,7 @@ from tools.session_calendar import SessionCalendar
 from tools.universe_contract import PackedRows
 from tools.universe_scaling import BOOTSTRAP_BLOCK_DAYS
 
-ANALYSIS_SOURCE_PATHS = (
-    "tools/analyze_context_cross_section.py",
-    "tools/context_cross_section.py",
-    "tools/universe_cross_section.py",
-)
+ANALYSIS_SOURCE_PATHS = CONTEXT_ANALYSIS_SOURCE_PATHS
 EVIDENCE_ROLE = "development-post-hoc-not-forward-clean"
 SELECTED_HISTORY = HISTORY_LENGTHS[0]
 

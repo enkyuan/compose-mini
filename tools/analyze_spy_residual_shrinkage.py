@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze zero-anchored SPY-residual scaling and fold-1 alignment."""
+"""Analyze authenticated SPY-residual development diagnostics."""
 
 from __future__ import annotations
 
@@ -122,9 +122,10 @@ if __name__ == "__main__":
     _require_exact_launch(pristine=True)
     _bootstrap_main()
 
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from math import fsum, isclose, isfinite, log
+from math import fsum, isclose, isfinite
 from pathlib import Path
 from statistics import fmean
 import argparse
@@ -137,8 +138,6 @@ from tools.arm_spy_residual import (
     ResidualLease, _directory_members, authenticate_residual_attempt,
 )
 from tools.context_diagnostic_contract import ContextAttempt, ContextPhase
-from tools.context_diagnostic_inputs import context_bar_prefix
-from tools.data_v1 import FEATURE_COUNT
 from tools.files import (
     FrozenInput, freeze_inputs, verify_frozen, write_json_exclusive,
 )
@@ -146,7 +145,7 @@ from tools.finalize_spy_residual import (
     _binding_value, _day, _finite,
     _paired_metrics as _paired_mae_metrics,
     _pooled_r2 as _model_pooled_r2, _predictions, _secondary, _square_sum,
-    _truth, finalize_residual_run,
+    finalize_residual_run,
 )
 from tools.panel_contract import (
     FileBinding, SourceTree, _absent, _directory_identity, _exact_json,
@@ -155,6 +154,10 @@ from tools.panel_contract import (
 from tools.relative_context_contract import (
     HISTORY_BARS, MODELS, ResidualAttempt, ResidualPhaseInput,
     ResidualReceipt, ResidualTruthRow, expected_residual_protocol,
+)
+from tools.residual_phase_evidence import (
+    phase_market_regimes as _snapshot_market_regimes,
+    phase_truth as _snapshot_phase_truth,
 )
 from tools.run_context_diagnostic import (
     _binding as _file_binding, _frozen as _frozen_input, phase_artifacts,
@@ -166,17 +169,62 @@ from tools.run_spy_residual import (
 )
 from tools.spy_residual_controller import _PhaseRows, _collect_inputs
 from tools.spy_residual_gate import (
-    MARKET_REGIMES, market_regimes as _market_regimes,
+    MARKET_REGIMES, SPY_DIRECTION_SCALE, gate_mean_predictions,
+)
+from tools.spy_residual_forward_contract import (
+    FORWARD_CONFIG, expected_forward_protocol, validate_forward_protocol,
 )
 from tools.universe_cross_section import CROSS_SECTION_SEED
 from tools.universe_scaling import (
-    BOOTSTRAP_BLOCK_DAYS, BOOTSTRAP_REPLICATES, circular_block_interval,
+    BOOTSTRAP_BLOCK_DAYS, BOOTSTRAP_REPLICATES, _common_dates, _macro,
+    _union_dates,
+    circular_block_interval, circular_block_means,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 ANALYSIS_SOURCE_PATHS = (
     "tools/analyze_spy_residual_shrinkage.py",
+    "tools/residual_phase_evidence.py",
     "tools/spy_residual_gate.py",
+    "tools/spy_residual_forward_contract.py",
+    "tools/universe_cross_section.py",
+    "tools/universe_scaling.py",
+)
+SENSITIVITY_SOURCE_PATHS = (
+    "tools/__init__.py",
+    "tools/analyze_context_cross_section.py",
+    "tools/analyze_spy_residual_shrinkage.py",
+    "tools/arm_context_diagnostic.py",
+    "tools/arm_spy_residual.py",
+    "tools/chronology.py",
+    "tools/context_cross_section.py",
+    "tools/context_diagnostic_contract.py",
+    "tools/context_diagnostic_inputs.py",
+    "tools/data_v1.py",
+    "tools/fetch_massive.py",
+    "tools/fetch_universe.py",
+    "tools/files.py",
+    "tools/finalize_context_diagnostic.py",
+    "tools/finalize_spy_residual.py",
+    "tools/finalize_universe_scaling.py",
+    "tools/float32.py",
+    "tools/panel_contract.py",
+    "tools/relative_context_contract.py",
+    "tools/relative_context_inputs.py",
+    "tools/residual_calibration_evidence.py",
+    "tools/residual_phase_evidence.py",
+    "tools/run_context_diagnostic.py",
+    "tools/run_spy_residual.py",
+    "tools/run_universe_scaling.py",
+    "tools/session_calendar.py",
+    "tools/session_samples.py",
+    "tools/spy_residual_controller.py",
+    "tools/spy_residual_forward_contract.py",
+    "tools/spy_residual_gate.py",
+    "tools/universe_contract.py",
+    "tools/universe_cross_section.py",
+    "tools/universe_scaling.py",
+    "tools/universe_scaling_contract.py",
 )
 SOURCE_ATTEMPT = FileBinding(
     "experiments/h13-spy-residual-20260725-01-attempt.json",
@@ -191,6 +239,8 @@ CANDIDATE = "shrunk_transformer"
 MODEL = "panel_transformer"
 REFERENCES = ("zero", MODEL, "global_ridge", "global_mlp")
 EVIDENCE_ROLE = "development-post-hoc-not-forward-clean"
+
+
 @dataclass(frozen=True, slots=True)
 class ShrinkageFit:
     """Record the sufficient statistics for one zero-anchored fit."""
@@ -210,6 +260,16 @@ class AuthenticatedPhase:
     phase: ResidualPhaseInput
     predictions: Mapping[str, Mapping[str, tuple[float, ...]]]
     evaluation: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _SensitivitySession:
+    """Keep publication metadata separate from narrow calibration evidence."""
+
+    evidence: CompletedCalibrationEvidence
+    report_inputs_json: str
+    protocol_json: str
+    run_dir: Path
 
 
 def _completed_run(
@@ -319,55 +379,13 @@ def _phase_truth(
     if not isinstance(state, _PhaseRows) or \
        not isinstance(lease, ResidualLease):
         raise TypeError("residual truth inputs are invalid")
-    lease()
-    benchmark = dict(lease.benchmark)
     try:
-        spy_csv = benchmark["spy_csv"]
+        spy_csv = dict(lease.benchmark)["spy_csv"]
     except KeyError as error:
         raise ValueError("residual SPY snapshot is missing") from error
-    verify_frozen((spy_csv,))
-    csv = dict(lease.context.snapshots.csv)
-    stock = {
-        series: (timestamps, packed)
-        for series, timestamps, packed in state.stock
-    }
-    aligned = dict(state.spy)
-    truth = {}
-    for series, _, _ in state.source.evaluation_rows:
-        timestamps, packed = stock[series]
-        boundary = packed.counts[0]
-        samples = packed.rows[boundary:]
-        spy_samples = aligned[series].rows[boundary:]
-        if not samples or len(samples) != len(spy_samples):
-            raise ValueError(f"{series} residual truth grid changed")
-        stock_bars = context_bar_prefix(
-            csv[series].snapshot, timestamps,
-            timestamps[samples[-1].target],
-        )
-        spy_bars = context_bar_prefix(
-            spy_csv.snapshot, state.spy_timestamps,
-            state.spy_timestamps[spy_samples[-1].target],
-        )
-        truth[series] = tuple(
-            ResidualTruthRow(
-                timestamps[row.as_of],
-                timestamps[row.entry],
-                timestamps[row.target],
-                log(
-                    stock_bars[row.target * FEATURE_COUNT + 3] /
-                    stock_bars[row.entry * FEATURE_COUNT]
-                ) - log(
-                    spy_bars[spy_row.target * FEATURE_COUNT + 3] /
-                    spy_bars[spy_row.entry * FEATURE_COUNT]
-                ),
-            )
-            for row, spy_row in zip(
-                samples, spy_samples, strict=True,
-            )
-        )
-    lease()
-    verify_frozen((spy_csv,))
-    return _truth(state.source, state.binding, truth)
+    return _snapshot_phase_truth(
+        state, dict(lease.context.snapshots.csv), spy_csv, lease,
+    )
 
 
 def _phase_market_regimes(
@@ -378,41 +396,11 @@ def _phase_market_regimes(
     if not isinstance(state, _PhaseRows) or \
        not isinstance(lease, ResidualLease):
         raise TypeError("residual market regime inputs are invalid")
-    lease()
-    benchmark = dict(lease.benchmark)
     try:
-        spy_csv = benchmark["spy_csv"]
+        spy_csv = dict(lease.benchmark)["spy_csv"]
     except KeyError as error:
         raise ValueError("residual SPY snapshot is missing") from error
-    verify_frozen((spy_csv,))
-    aligned, indices = dict(state.spy), {}
-    for series, count, _ in state.source.evaluation_rows:
-        try:
-            packed = aligned[series]
-        except KeyError as error:
-            raise ValueError(f"{series} SPY rows are missing") from error
-        rows = packed.rows[packed.counts[0]:]
-        values = tuple(row.as_of for row in rows)
-        if len(values) != count:
-            raise ValueError(f"{series} SPY regime grid changed")
-        indices[series] = values
-    unique = tuple(sorted({
-        index for values in indices.values() for index in values
-    }))
-    if not unique:
-        raise ValueError("SPY regime grid is empty")
-    stop = state.spy_timestamps[unique[-1]]
-    bars = context_bar_prefix(
-        spy_csv.snapshot, state.spy_timestamps, stop,
-    )
-    labels = _market_regimes(bars, unique)
-    result = {
-        series: tuple(labels[index] for index in values)
-        for series, values in indices.items()
-    }
-    lease()
-    verify_frozen((spy_csv,))
-    return result
+    return _snapshot_market_regimes(state, spy_csv, lease)
 
 
 def _pairs(
@@ -624,6 +612,99 @@ def scale_predictions(
     return result
 
 
+def direction_gated_predictions(
+    predictions: Mapping[str, Sequence[float]],
+    regimes: Mapping[str, Sequence[str]],
+) -> dict[str, tuple[float, ...]]:
+    """Apply the frozen causal SPY-direction gate without refitting."""
+    if not isinstance(predictions, Mapping) or \
+       not isinstance(regimes, Mapping) or \
+       tuple(predictions) != tuple(regimes):
+        raise ValueError("direction-gate series order changed")
+    return {
+        series: gate_mean_predictions(values, regimes[series])
+        for series, values in predictions.items()
+    }
+
+
+def interval_sensitivity(
+    gains: Mapping[str, Mapping[str, Sequence[float]]],
+    reference_losses: Mapping[str, Mapping[str, Sequence[float]]],
+    *,
+    target_sessions: int,
+    block_sessions: int,
+    replicates: int,
+    seed: int,
+) -> dict[str, object]:
+    """Estimate one interval's detectable mean shift from centered history."""
+    dates = _union_dates(gains)
+    if not isinstance(reference_losses, Mapping) or \
+       dates != _union_dates(reference_losses) or \
+       tuple(gains) != tuple(reference_losses) or any(
+        tuple(gains[name]) != tuple(reference_losses[name])
+        for name in gains
+    ) or any(
+        tuple(by_day) != tuple(day for day in dates if day in by_day)
+        for by_day in gains.values()
+    ) or not any(
+        tuple(by_day) == dates for by_day in gains.values()
+    ) or any(
+        len(gains[name][day]) != len(reference_losses[name][day])
+        for name in gains for day in gains[name]
+    ) or any(
+        _day(day) != day for day in dates
+    ):
+        raise ValueError("sensitivity stock-session grid changed")
+    sessions = tuple(map(len, gains.values()))
+    observations = tuple(
+        sum(map(len, by_day.values())) for by_day in gains.values()
+    )
+    mean_gain = _finite(_macro(gains, dates), "development mean gain")
+    reference_mse = _finite(
+        _macro(reference_losses, dates), "reference residual MSE",
+    )
+    if reference_mse <= 0.0:
+        raise ValueError("sensitivity reference MSE must be positive")
+    centered = {
+        name: {
+            day: tuple(value - mean_gain for value in values)
+            for day, values in by_day.items()
+        }
+        for name, by_day in gains.items()
+    }
+    samples = circular_block_means(
+        centered, block_sessions, session_dates=dates,
+        sample_days=target_sessions, replicates=replicates, seed=seed,
+    )
+    critical = -samples[int(0.025 * (replicates - 1))]
+    detectable = critical - samples[int(0.20 * (replicates - 1))]
+    if not isfinite(detectable) or detectable <= 0.0:
+        raise ValueError("minimum detectable gain is invalid")
+    return {
+        "block_sessions": block_sessions,
+        "critical_mean_gain": critical,
+        "descriptive_development_mean_gain": mean_gain,
+        "lower_tail_probability": 0.025,
+        "marginal_power": 0.8,
+        "minimum_detectable_fraction_of_reference_mse":
+            detectable / reference_mse,
+        "minimum_detectable_mean_gain": detectable,
+        "reference_mean_squared_error": reference_mse,
+        "replicates": replicates,
+        "seed": seed,
+        "source_maximum_observations_per_stock": max(observations),
+        "source_maximum_sessions_per_stock": max(sessions),
+        "source_minimum_observations_per_stock": min(observations),
+        "source_minimum_sessions_per_stock": min(sessions),
+        "source_missing_stock_session_count":
+            len(gains) * len(dates) - sum(sessions),
+        "source_observation_count": sum(observations),
+        "source_session_count": len(dates),
+        "source_stock_count": len(gains),
+        "target_session_count": target_sessions,
+    }
+
+
 def pooled_r2(
     truth: Mapping[str, Sequence[ResidualTruthRow]],
     predictions: Mapping[str, Sequence[float]],
@@ -674,13 +755,16 @@ def fit_diagnostic(
     }
 
 
-def _paired_mse_metrics(
+def _paired_mse_days(
     truth: Mapping[str, Sequence[ResidualTruthRow]],
     predictions: Mapping[str, Mapping[str, Sequence[float]]],
     candidate: str,
     reference: str,
-) -> dict[str, object]:
-    """Compare squared errors over the existing common-date panel."""
+) -> tuple[
+    dict[str, dict[str, tuple[float, ...]]],
+    dict[str, dict[str, tuple[float, ...]]],
+]:
+    """Group paired MSE gains and reference losses by target date."""
     forecast = {
         **predictions,
         "zero": {
@@ -689,20 +773,43 @@ def _paired_mse_metrics(
     }
     if candidate not in forecast or reference not in forecast:
         raise ValueError("paired residual model is missing")
-    daily = {}
+    gains, losses = {}, {}
     for series, rows in truth.items():
-        by_day: dict[str, list[float]] = {}
+        gain_days: dict[str, list[float]] = {}
+        loss_days: dict[str, list[float]] = {}
         for row, left, right in zip(
             rows, forecast[candidate][series], forecast[reference][series],
             strict=True,
         ):
-            by_day.setdefault(_day(row.target), []).append(_finite(
-                (row.value - right) ** 2 - (row.value - left) ** 2,
+            day = _day(row.target)
+            candidate_loss = (row.value - left) ** 2
+            reference_loss = _finite(
+                (row.value - right) ** 2, "reference residual MSE",
+            )
+            gain_days.setdefault(day, []).append(_finite(
+                reference_loss - candidate_loss,
                 "paired residual MSE gain",
             ))
-        daily[series] = {
-            day: tuple(values) for day, values in by_day.items()
+            loss_days.setdefault(day, []).append(reference_loss)
+        gains[series] = {
+            day: tuple(values) for day, values in gain_days.items()
         }
+        losses[series] = {
+            day: tuple(values) for day, values in loss_days.items()
+        }
+    return gains, losses
+
+
+def _paired_mse_metrics(
+    truth: Mapping[str, Sequence[ResidualTruthRow]],
+    predictions: Mapping[str, Mapping[str, Sequence[float]]],
+    candidate: str,
+    reference: str,
+) -> dict[str, object]:
+    """Compare squared errors over the existing common-date panel."""
+    daily, _ = _paired_mse_days(
+        truth, predictions, candidate, reference,
+    )
     dates = tuple(sorted(set.intersection(*(
         set(values) for values in daily.values()
     ))))
@@ -910,6 +1017,42 @@ def _alignment_report(
     })
 
 
+def _sensitivity_report(
+    inputs: Mapping[str, object],
+    protocol: Mapping[str, object],
+    comparisons: Mapping[str, Mapping[str, object]],
+    implementation_commit: str,
+) -> dict[str, object]:
+    """Bind planning sensitivity without changing the forward contract."""
+    frozen = validate_forward_protocol(protocol)
+    references = tuple(frozen["metrics"]["references"])
+    if inputs.get("forward_config") != _binding_value(FORWARD_CONFIG):
+        raise ValueError("sensitivity forward config changed")
+    if tuple(comparisons) != references:
+        raise ValueError("sensitivity comparisons changed")
+    candidate = frozen["candidate"]
+    return _json_mapping({
+        "candidate": {
+            "gate": dict(candidate["gate"]),
+            "model": candidate["model"],
+            "name": candidate["name"],
+            "source_phase": "calibration",
+        },
+        "decision": {
+            "candidate_or_protocol_change_authorized": False,
+            "joint_test_power_estimated": False,
+            "output_role": "paired-mse-interval-sensitivity-only",
+        },
+        "evidence_role": "development-planning-only",
+        "inputs": dict(inputs),
+        "integrity": {"implementation_commit": implementation_commit},
+        "locks": dict(frozen["locks"]),
+        "paired_squared_error": dict(comparisons),
+        "schema": 1,
+        "truth_phases_read": ["calibration"],
+    })
+
+
 def _final_report(
     inputs: Mapping[str, object],
     fit_binding: FileBinding,
@@ -946,7 +1089,9 @@ def _final_report(
 
 
 def _validate_analysis_commit(
-    commit: str, sources: Sequence[FileBinding],
+    commit: str,
+    sources: Sequence[FileBinding],
+    paths: Sequence[str] = ANALYSIS_SOURCE_PATHS,
 ) -> None:
     if type(commit) is not str or len(commit) != 40 or any(
         byte not in "0123456789abcdef" for byte in commit
@@ -954,10 +1099,11 @@ def _validate_analysis_commit(
        not isinstance(sources, Sequence):
         raise ValueError("shrinkage implementation commit is invalid")
     files = tuple(sources)
+    expected = tuple(paths)
     if tuple(
         source.path if isinstance(source, FileBinding) else None
         for source in files
-    ) != ANALYSIS_SOURCE_PATHS:
+    ) != expected:
         raise ValueError("shrinkage implementation sources changed")
     _validate_commit(
         commit, SourceTree(
@@ -1121,18 +1267,309 @@ def _analyze_alignment(
     return result
 
 
+def _analyze_sensitivity(
+    state: _PhaseRows,
+    phase: AuthenticatedPhase,
+    lease: ResidualLease,
+    inputs: Mapping[str, object],
+    protocol: Mapping[str, object],
+    implementation_commit: str,
+    result_path: Path,
+    directory: int,
+    output_identity: tuple[int, int],
+    verify: Callable[[], None],
+) -> Mapping[str, object]:
+    """Publish future-label-blind sensitivity from calibration history."""
+    if state.source.phase != "calibration" or \
+       phase.source != state.source or not callable(verify):
+        raise ValueError("sensitivity phase inputs are invalid")
+    frozen = validate_forward_protocol(protocol)
+    verify()
+    regimes = _phase_market_regimes(state, lease)
+    truth, _ = _phase_truth(state, lease)
+    comparisons = _sensitivity_comparisons(
+        truth, phase.predictions[MODEL], regimes, frozen,
+    )
+    del truth
+    result = _sensitivity_report(
+        inputs, frozen, comparisons, implementation_commit,
+    )
+    _publish(result_path, result, directory, verify)
+    identities = _validate_published(result_path, result)
+    with freeze_inputs((result_path,)) as frozen:
+        if not _exact_json(
+            read_canonical_json(frozen[0].snapshot), result,
+        ):
+            raise ValueError("sensitivity result changed")
+        verify()
+        _verify_single_link_inputs(identities, "sensitivity result")
+        verify_frozen(frozen)
+        if _directory_members(
+            result_path.parent, (result_path.name,),
+        ) != output_identity:
+            raise ValueError("sensitivity result topology changed")
+    return result
+
+
+def _sensitivity_comparisons(
+    truth: Mapping[str, Sequence[ResidualTruthRow]],
+    unchanged: Mapping[str, Sequence[float]],
+    regimes: Mapping[str, Sequence[str]],
+    protocol: Mapping[str, object],
+) -> dict[str, object]:
+    """Compute the fixed paired-MSE sensitivity comparisons."""
+    frozen = validate_forward_protocol(protocol)
+    candidate = frozen["candidate"]["name"]
+    bootstrap = frozen["metrics"]["bootstrap"]
+    family = {
+        MODEL: unchanged,
+        candidate: direction_gated_predictions(unchanged, regimes),
+    }
+    comparisons = {}
+    for name, reference in zip(
+        frozen["metrics"]["references"], ("zero", MODEL), strict=True,
+    ):
+        gains, losses = _paired_mse_days(
+            truth, family, candidate, reference,
+        )
+        comparisons[name] = interval_sensitivity(
+            gains, losses,
+            target_sessions=frozen["forward_window"][
+                "target_session_count"
+            ],
+            block_sessions=bootstrap["decision_block_sessions"],
+            replicates=bootstrap["replicates"],
+            seed=bootstrap["seed"],
+        )
+    return comparisons
+
+
+def _execution_provenance(
+    evidence: CompletedCalibrationEvidence,
+) -> dict[str, object]:
+    """Serialize historical and current source provenance without raw data."""
+    from tools.residual_calibration_evidence import ExecutionProvenance
+
+    def value(provenance: ExecutionProvenance) -> dict[str, str]:
+        return {
+            "implementation_commit": provenance.implementation_commit,
+            "source_tree_sha256": provenance.source_tree.sha256,
+        }
+
+    return {
+        "current_analysis": value(evidence.current_interpretation),
+        "historical_execution": {
+            "context": value(evidence.context_execution),
+            "residual": value(evidence.residual_execution),
+            "scaling_finalizer": value(evidence.scaling_finalizer),
+            "scaling_runner": value(evidence.scaling_execution),
+        },
+    }
+
+
+def _analyze_completed_sensitivity(
+    evidence: CompletedCalibrationEvidence,
+    inputs: Mapping[str, object],
+    protocol: Mapping[str, object],
+    implementation_commit: str,
+) -> Mapping[str, object]:
+    """Build sensitivity JSON from immutable completed calibration evidence."""
+    from tools.residual_calibration_evidence import (
+        CompletedCalibrationEvidence,
+    )
+
+    if not isinstance(evidence, CompletedCalibrationEvidence) or \
+       evidence.current_interpretation.implementation_commit != \
+            implementation_commit:
+        raise ValueError("completed sensitivity inputs are invalid")
+    evidence.verify()
+    truth = {item.name: item.truth for item in evidence.series}
+    comparisons = _sensitivity_comparisons(
+        truth,
+        {item.name: item.transformer_mean for item in evidence.series},
+        {item.name: item.regimes for item in evidence.series},
+        protocol,
+    )
+    del truth
+    return _json_mapping({
+        **_sensitivity_report(
+            inputs, validate_forward_protocol(protocol), comparisons,
+            implementation_commit,
+        ),
+        "integrity": _execution_provenance(evidence),
+    })
+
+
+def _publish_completed_sensitivity(
+    result: Mapping[str, object],
+    result_path: Path,
+    directory: int,
+    output_identity: tuple[int, int],
+    verify: Callable[[], None],
+) -> Mapping[str, object]:
+    """Publish one fully computed sensitivity result exclusively."""
+    if not isinstance(result, Mapping) or not callable(verify):
+        raise ValueError("completed sensitivity publication is invalid")
+    _publish(result_path, result, directory, verify)
+    identities = _validate_published(result_path, result)
+    with freeze_inputs((result_path,)) as frozen:
+        if not _exact_json(
+            read_canonical_json(frozen[0].snapshot), result,
+        ):
+            raise ValueError("sensitivity result changed")
+        verify()
+        _verify_single_link_inputs(identities, "sensitivity result")
+        verify_frozen(frozen)
+        if _directory_members(
+            result_path.parent, (result_path.name,),
+        ) != output_identity:
+            raise ValueError("sensitivity result topology changed")
+    return result
+
+
+@contextmanager
+def _authenticate_completed_calibration(
+    attempt_path: Path,
+    implementation_commit: str,
+) -> Iterator[_SensitivitySession]:
+    """Authenticate the canonical completed calibration from its own path."""
+    from tools.residual_calibration_evidence import (
+        ExecutionProvenance, _bind_completed_calibration,
+    )
+
+    _require_isolated_execution(bootstrapped=True)
+    _require_exact_launch()
+    _require_package_alias()
+    live, context = read_residual_attempt(attempt_path)
+    live.primary_python.validate_live("sensitivity primary Python")
+    if Path(sys.executable).resolve(strict=True) != Path(
+        live.primary_python.path,
+    ).resolve(strict=True):
+        raise ValueError("sensitivity requires the bound primary Python")
+    absolute, logical = _attempt_path(attempt_path)
+    if logical.as_posix() != SOURCE_ATTEMPT.path:
+        raise ValueError("sensitivity requires the frozen source attempt")
+    run = ROOT / live.run_dir
+    outcome = _outcome_path(absolute)
+    artifacts = tuple(
+        path
+        for source in context.phases
+        for path in phase_artifacts(ROOT, absolute, source)
+    )
+    sources = tuple(ROOT / path for path in SENSITIVITY_SOURCE_PATHS)
+    config = ROOT / FORWARD_CONFIG.path
+    paths = (absolute, outcome, *artifacts, *sources, config)
+    identities = _single_link_inputs(paths, "sensitivity inputs")
+    run_names = tuple(path.name for path in artifacts)
+    run_identity = _directory_members(run, run_names)
+    output = run.with_name(f"{run.name}-sensitivity")
+    _absent(output, "residual diagnostic output directory")
+
+    with freeze_inputs(paths) as snapshots:
+        frozen = {item.source: item for item in snapshots}
+        attempt, phases, inputs = _completed_run(
+            absolute, logical, frozen, run_identity, context,
+        )
+        if attempt != live:
+            raise ValueError("residual attempt changed")
+        binding = _file_binding(ROOT, frozen[config])
+        if binding != FORWARD_CONFIG:
+            raise ValueError("sensitivity forward config changed")
+        protocol = validate_forward_protocol(
+            read_canonical_json(frozen[config].snapshot),
+        )
+        source_bindings = tuple(
+            _file_binding(ROOT, frozen[ROOT / path])
+            for path in SENSITIVITY_SOURCE_PATHS
+        )
+        inputs = {
+            **inputs,
+            "analysis_sources": [
+                _binding_value(source) for source in source_bindings
+            ],
+            "forward_config": _binding_value(binding),
+        }
+        _validate_analysis_commit(
+            implementation_commit, source_bindings,
+            SENSITIVITY_SOURCE_PATHS,
+        )
+        current = ExecutionProvenance(
+            implementation_commit,
+            SourceTree(
+                str(ROOT.resolve(strict=True)), source_bindings,
+                _tree_digest(source_bindings),
+            ),
+        )
+
+        def verify_inputs() -> None:
+            _verify_single_link_inputs(identities, "sensitivity inputs")
+            verify_frozen(snapshots)
+            if _directory_members(run, run_names) != run_identity:
+                raise ValueError("residual run directory changed")
+
+        verify_inputs()
+        with _bind_completed_calibration(
+            attempt, context, phases, current, verify_inputs,
+        ) as evidence:
+            yield _SensitivitySession(
+                evidence,
+                json.dumps(
+                    inputs, allow_nan=False, separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    protocol, allow_nan=False, separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                run,
+            )
+
+
 def analyze_residual_shrinkage(
     attempt_path: Path,
     implementation_commit: str,
     *,
     alignment: bool = False,
+    sensitivity: bool = False,
 ) -> Mapping[str, object]:
-    """Run one authenticated shrinkage or fold-1 attribution diagnostic."""
-    if type(alignment) is not bool:
+    """Run one authenticated residual-development diagnostic."""
+    if type(alignment) is not bool or type(sensitivity) is not bool or \
+       alignment and sensitivity:
         raise TypeError("residual diagnostic mode is invalid")
     _require_isolated_execution(bootstrapped=True)
     _require_exact_launch()
     _require_package_alias()
+    if sensitivity:
+        with _authenticate_completed_calibration(
+            attempt_path, implementation_commit,
+        ) as session:
+            evidence = session.evidence
+            result = _analyze_completed_sensitivity(
+                evidence, json.loads(session.report_inputs_json),
+                json.loads(session.protocol_json),
+                implementation_commit,
+            )
+            evidence.verify()
+            output = session.run_dir.with_name(
+                f"{session.run_dir.name}-sensitivity",
+            )
+            result_path = output / "sensitivity.json"
+            directory, output_identity = _create_output_directory(output)
+            try:
+                def verify_evidence() -> None:
+                    evidence.verify()
+                    if _directory_identity(output) != output_identity:
+                        raise ValueError(
+                            "residual diagnostic output directory changed",
+                        )
+
+                return _publish_completed_sensitivity(
+                    result, result_path, directory, output_identity,
+                    verify_evidence,
+                )
+            finally:
+                os.close(directory)
+
     live, context = read_residual_attempt(attempt_path)
     live.primary_python.validate_live("shrinkage primary Python")
     if Path(sys.executable).resolve(strict=True) != Path(
@@ -1162,16 +1599,19 @@ def analyze_residual_shrinkage(
         )
         if attempt != live:
             raise ValueError("residual attempt changed")
-        raw_sources = inputs["analysis_sources"]
-        if not isinstance(raw_sources, list):
-            raise ValueError("shrinkage analysis sources changed")
         source_bindings = tuple(
-            FileBinding.parse(
-                source, f"shrinkage analysis source[{index}]",
-            )
-            for index, source in enumerate(raw_sources)
+            _file_binding(ROOT, frozen[ROOT / path])
+            for path in ANALYSIS_SOURCE_PATHS
         )
-        _validate_analysis_commit(implementation_commit, source_bindings)
+        inputs = {
+            **inputs,
+            "analysis_sources": [
+                _binding_value(source) for source in source_bindings
+            ],
+        }
+        _validate_analysis_commit(
+            implementation_commit, source_bindings,
+        )
 
         def verify_inputs() -> None:
             _verify_single_link_inputs(identities, "shrinkage inputs")
@@ -1232,7 +1672,9 @@ def parse_args(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("attempt", type=Path)
     parser.add_argument("--implementation-commit", required=True)
-    parser.add_argument("--alignment", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--alignment", action="store_true")
+    mode.add_argument("--sensitivity", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1242,6 +1684,7 @@ def main() -> None:
         report = analyze_residual_shrinkage(
             arguments.attempt, arguments.implementation_commit,
             alignment=arguments.alignment,
+            sensitivity=arguments.sensitivity,
         )
     except (
         IndexError, KeyError, OSError, OverflowError, TypeError,
@@ -1250,18 +1693,24 @@ def main() -> None:
         print(f"integrity error: {error}", file=sys.stderr)
         raise SystemExit(2) from error
     summary = {
-        "mode": "alignment",
+        "comparisons": sorted(report["paired_squared_error"]),
+        "mode": "sensitivity",
         "status": "analyzed",
-        "unclipped_scale":
-            report["diagnostic"]["global"]["unclipped_scale"],
-    } if arguments.alignment else {
-        "later_residual_holdout_preregistration_warranted":
-            report["decision"][
-                "later_residual_holdout_preregistration_warranted"
-            ],
-        "scale": report["fit"]["scale"],
-        "status": "analyzed",
-    }
+    } if arguments.sensitivity else (
+        {
+            "mode": "alignment",
+            "status": "analyzed",
+            "unclipped_scale":
+                report["diagnostic"]["global"]["unclipped_scale"],
+        } if arguments.alignment else {
+            "later_residual_holdout_preregistration_warranted":
+                report["decision"][
+                    "later_residual_holdout_preregistration_warranted"
+                ],
+            "scale": report["fit"]["scale"],
+            "status": "analyzed",
+        }
+    )
     print(json.dumps(summary, sort_keys=True))
 
 
