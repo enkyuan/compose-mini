@@ -23,9 +23,12 @@ from tools.relative_context_contract import (
     RESIDUAL_BENCHMARK, RESIDUAL_CALENDAR, RESIDUAL_CONFIG,
     RESIDUAL_SOURCE, SPY_RESIDUAL_TARGET, ResidualPhaseInput,
     ResidualScalerInput, ResidualTruthRow, expected_residual_fits,
-    expected_residual_protocol, expected_source_context_outcome,
-    expected_spy_fetch_report, parse_residual_phases,
-    residual_scaler_inputs_sha256, validate_residual_protocol,
+    expected_residual_predictions, expected_residual_protocol,
+    expected_source_context_outcome, expected_spy_fetch_report,
+    parse_residual_phases, residual_fit_provenance_id,
+    residual_fit_record, residual_prediction_record,
+    residual_scaler_inputs_sha256, validate_residual_fit_records,
+    validate_residual_prediction_records, validate_residual_protocol,
     validate_source_context_outcome, validate_spy_fetch_report,
     validate_spy_session_audit,
 )
@@ -412,6 +415,115 @@ def verify_phase_closure() -> None:
     raises(parse_residual_phases, invalid, sources)
 
 
+def verify_evidence_ledgers() -> None:
+    source = source_phase()
+    binding = ResidualPhaseInput.parse(
+        phase_value(
+            source,
+            residual_scaler_inputs_sha256(
+                MASTER, scaler_inputs(source.phase),
+            ),
+        ),
+        source,
+    )
+    fits = [
+        residual_fit_record(
+            fit, source, binding, MASTER, digest(f"{fit}-state"), index / 10,
+        )
+        for index, fit in enumerate(expected_residual_fits(MASTER, source))
+    ]
+    evidence = validate_residual_fit_records(
+        fits, MASTER, source, binding,
+    )
+    assert len(evidence) == 11
+    assert tuple(item.fit for item in evidence) == \
+        expected_residual_fits(MASTER, source)
+    assert residual_fit_provenance_id(
+        evidence[0].fit, source, binding, MASTER,
+    ) == evidence[0].provenance_id
+
+    changed = replace(binding, scaler_inputs_sha256=digest("other-scalers"))
+    assert residual_fit_provenance_id(
+        evidence[0].fit, source, changed, MASTER,
+    ) != evidence[0].provenance_id
+    for invalid in (
+        fits[:-1],
+        [fits[1], fits[0], *fits[2:]],
+        [*fits, fits[0]],
+    ):
+        raises(
+            validate_residual_fit_records,
+            invalid, MASTER, source, binding,
+        )
+    for field, value in (
+        ("schema", True),
+        ("provenance_id", digest("wrong-provenance")),
+        ("state_fingerprint", "invalid"),
+        ("training_loss", -1.0),
+        ("training_loss", math.nan),
+    ):
+        invalid = deepcopy(fits)
+        invalid[0][field] = value
+        raises(
+            validate_residual_fit_records,
+            invalid, MASTER, source, binding,
+        )
+    invalid = deepcopy(fits)
+    invalid[0]["extra"] = True
+    raises(
+        validate_residual_fit_records,
+        invalid, MASTER, source, binding,
+    )
+
+    fit_by_axis = {item.fit: item for item in evidence}
+    predictions = [
+        residual_prediction_record(
+            prediction, fit_by_axis[prediction.fit],
+            (index / 10_000,) * prediction.prediction_count,
+        )
+        for index, prediction in enumerate(
+            expected_residual_predictions(MASTER, source)
+        )
+    ]
+    decoded = validate_residual_prediction_records(
+        predictions, MASTER, source, binding, fits,
+    )
+    assert len(decoded) == 121
+    assert tuple(item.prediction for item in decoded) == \
+        expected_residual_predictions(MASTER, source)
+    assert decoded[0].values == tuple(
+        predictions[0]["predictions"]["count"] * [0.0]
+    )
+    for invalid in (
+        predictions[:-1],
+        [predictions[1], predictions[0], *predictions[2:]],
+        [*predictions, predictions[0]],
+    ):
+        raises(
+            validate_residual_prediction_records,
+            invalid, MASTER, source, binding, fits,
+        )
+    for field, value in (
+        ("schema", True),
+        ("grid_sha256", digest("wrong-grid")),
+        ("prediction_count", True),
+        ("fit_provenance_id", digest("wrong-provenance")),
+        ("state_fingerprint", digest("wrong-state")),
+    ):
+        invalid = deepcopy(predictions)
+        invalid[0][field] = value
+        raises(
+            validate_residual_prediction_records,
+            invalid, MASTER, source, binding, fits,
+        )
+    invalid = deepcopy(predictions)
+    invalid[0]["predictions"]["count"] += 1
+    raises(
+        validate_residual_prediction_records,
+        invalid, MASTER, source, binding, fits,
+    )
+
+
 def verify_spy_audit() -> None:
     expected = spy_audit()
     assert validate_spy_session_audit(expected) == expected
@@ -445,6 +557,7 @@ def main() -> None:
     verify_truth_rows()
     verify_controller_import()
     verify_phase_closure()
+    verify_evidence_ledgers()
     verify_spy_audit()
     print("relative-context contract tests passed")
 

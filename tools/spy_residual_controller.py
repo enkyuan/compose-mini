@@ -34,6 +34,8 @@ from tools.universe_contract import PackedRows
 from tools.universe_scaling_contract import timestamp_grid_sha256
 
 if TYPE_CHECKING:
+    import torch
+
     from tools.relative_context import MarketContextForwardWindows
     from tools.train import TrainingData
     from tools.universe_forward_runner import ForwardFeatureWindows
@@ -47,11 +49,16 @@ class ResidualForwardSeries:
     stock: ForwardFeatureWindows
     market: MarketContextForwardWindows
     samples: tuple[SampleRows, ...]
+    spy_feature_mean: torch.Tensor
+    spy_feature_scale: torch.Tensor
 
     def __post_init__(self) -> None:
+        import torch
+
         from tools.relative_context import MarketContextForwardWindows
         from tools.universe_forward_runner import ForwardFeatureWindows
 
+        scalers = (self.spy_feature_mean, self.spy_feature_scale)
         if type(self.series) is not str or not self.series or \
            type(self.stock) is not ForwardFeatureWindows or \
            type(self.market) is not MarketContextForwardWindows or \
@@ -60,6 +67,18 @@ class ResidualForwardSeries:
            len(self.samples) != len(self.stock) or \
            len(self.samples) != len(self.market) or any(
                type(row) is not SampleRows for row in self.samples
+           ) or any(
+               not isinstance(value, torch.Tensor) or
+               value.shape != (FEATURE_COUNT,) or
+               value.dtype != torch.float32 or
+               value.device.type != "cpu" or
+               not torch.isfinite(value).all()
+               for value in scalers
+           ) or not torch.all(self.spy_feature_scale > 0) or \
+           not torch.equal(
+               self.market.spy.feature_mean, self.spy_feature_mean,
+           ) or not torch.equal(
+               self.market.spy.feature_scale, self.spy_feature_scale,
            ):
             raise ValueError("residual forward series is invalid")
 
@@ -357,9 +376,14 @@ def prepare_residual_phase(
                 spy.feature_mean, spy.feature_scale,
             )
             forward.append(ResidualForwardSeries(
-                series, stock_forward,
-                MarketContextForwardWindows(stock_forward, spy_forward),
-                samples,
+                series=series,
+                stock=stock_forward,
+                market=MarketContextForwardWindows(
+                    stock_forward, spy_forward,
+                ),
+                samples=samples,
+                spy_feature_mean=spy.feature_mean,
+                spy_feature_scale=spy.feature_scale,
             ))
 
     result = ResidualPreparedPhase(

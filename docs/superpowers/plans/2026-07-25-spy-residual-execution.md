@@ -201,26 +201,26 @@ $TORCH_PYTHON tests/python/test_spy_residual_controller.py
 - Add exact record serializers and validators for the 11 fit records and
   `11 × 11` ordered evaluation prediction records in each phase.
 
-- [ ] Reuse the existing ridge, MLP, stock-balanced loader, optimizer-update,
+- [x] Reuse the existing ridge, MLP, stock-balanced loader, optimizer-update,
   loss, and fingerprint primitives without modifying their source files.
-- [ ] Fit the ridge once per phase and each neural model once for each frozen
+- [x] Fit the ridge once per phase and each neural model once for each frozen
   seed `7/19/31/43/61`.
-- [ ] Reuse the selected history-17 checkpoint counts from the authenticated
+- [x] Reuse the selected history-17 checkpoint counts from the authenticated
   source phase; do not reselect epochs on calibration labels.
-- [ ] Feed stock-only residual windows to ridge and MLP. Feed
+- [x] Feed stock-only residual windows to ridge and MLP. Feed
   `MarketContextWindows` only to `MarketContextTransformer`.
-- [ ] Models train in each stock's training-standardized residual units.
+- [x] Models train in each stock's training-standardized residual units.
   Before float32 prediction encoding, convert each evaluation stock back to
   raw residual returns with
   `raw = scaled * target_scale + target_mean`. Bind that stock's training-only
   scaler digest into prediction provenance; Task 4 consumes raw units only.
-- [ ] Require every prediction vector to match the source evaluation grid,
+- [x] Require every prediction vector to match the source evaluation grid,
   series order, observation count, model/seed axes, and finite float32
   encoding.
-- [ ] Test fit order, update counts, deterministic seeds, model input
+- [x] Test fit order, update counts, deterministic seeds, model input
   asymmetry, a tiny synthetic learnable residual, and inverse scaling with a
   nonzero target mean and nonunit target scale.
-- [ ] Run:
+- [x] Run:
 
 ```sh
 $TORCH_PYTHON tests/python/test_relative_context.py

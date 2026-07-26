@@ -1,15 +1,16 @@
 """Freeze one development-only SPY-residual calibration protocol."""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 
 from tools.context_diagnostic_contract import (
-    ContextFit, ContextPhase, _json_sha256, context_phase_sha256,
-    expected_context_fits,
+    ContextFit, ContextPhase, ContextPrediction, _fit_value, _json_sha256,
+    _loss, context_phase_sha256, expected_context_fits,
 )
+from tools.float32 import decode_f32le_base64, encode_f32le_base64
 from tools.panel_contract import (
     FileBinding, _exact_json, _integer, _object, _sha256, _string,
 )
@@ -362,6 +363,22 @@ class ResidualTruthRow:
             raise ValueError("residual truth row is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class ResidualFitEvidence:
+    fit: ContextFit
+    provenance_id: str
+    state_fingerprint: str
+    training_loss: float
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualPredictionEvidence:
+    prediction: ContextPrediction
+    fit_provenance_id: str
+    state_fingerprint: str
+    values: tuple[float, ...]
+
+
 def residual_scaler_inputs_sha256(
     master: Sequence[str],
     values: Sequence[ResidualScalerInput],
@@ -494,11 +511,196 @@ def expected_residual_fits(
             for model in MODELS[1:] for seed in SEEDS
         ),
     )
-    if tuple(
+    if len(fits) != 11 or tuple(
         (fit.phase, fit.model, fit.history, fit.seed) for fit in fits
     ) != expected:
         raise ValueError("residual fit closure changed")
     return fits
+
+
+def _phase_value(phase: ResidualPhaseInput) -> dict[str, str]:
+    if not isinstance(phase, ResidualPhaseInput):
+        raise ValueError("residual phase is invalid")
+    return asdict(phase)
+
+
+def _validated_phase(
+    master: Sequence[str], source: ContextPhase, phase: ResidualPhaseInput,
+) -> tuple[ContextFit, ...]:
+    fits = expected_residual_fits(master, source)
+    if ResidualPhaseInput.parse(_phase_value(phase), source) != phase:
+        raise ValueError("residual phase changed")
+    return fits
+
+
+def residual_phase_sha256(phase: ResidualPhaseInput) -> str:
+    """Hash one immutable residual input binding."""
+    return _json_sha256(_phase_value(phase))
+
+
+def expected_residual_predictions(
+    master: Sequence[str], phase: ContextPhase,
+) -> tuple[ContextPrediction, ...]:
+    """Return the ordered 11-fit by 11-stock residual prediction grid."""
+    predictions = tuple(
+        ContextPrediction(fit, series, count, grid)
+        for fit in expected_residual_fits(master, phase)
+        for series, count, grid in phase.evaluation_rows
+    )
+    if len(predictions) != 121:
+        raise ValueError("residual prediction closure changed")
+    return predictions
+
+
+def residual_fit_provenance_id(
+    fit: ContextFit, source: ContextPhase, phase: ResidualPhaseInput,
+    master: Sequence[str],
+) -> str:
+    """Bind one fit to the source phase and every residual scaler input."""
+    if fit not in _validated_phase(master, source, phase):
+        raise ValueError("residual fit is outside the frozen family")
+    return _json_sha256({
+        "config_sha256": RESIDUAL_CONFIG.sha256,
+        "fit": _fit_value(fit),
+        "phase": _phase_value(phase),
+        "role": "spy-residual-fit",
+        "schema": 1,
+        "target_kind": SPY_RESIDUAL_TARGET,
+    })
+
+
+def residual_fit_record(
+    fit: ContextFit, source: ContextPhase, phase: ResidualPhaseInput,
+    master: Sequence[str], state_fingerprint: str, training_loss: float,
+) -> dict[str, object]:
+    """Serialize one residual fitted state on its immutable input binding."""
+    return {
+        "fit": _fit_value(fit),
+        "provenance_id": residual_fit_provenance_id(
+            fit, source, phase, master,
+        ),
+        "schema": 1,
+        "state_fingerprint": _sha256(
+            state_fingerprint, "residual state fingerprint",
+        ),
+        "training_loss": _loss(training_loss),
+    }
+
+
+def validate_residual_fit_records(
+    value: object, master: Sequence[str], source: ContextPhase,
+    phase: ResidualPhaseInput,
+) -> tuple[ResidualFitEvidence, ...]:
+    """Require the complete ordered 11-fit residual ledger."""
+    expected = _validated_phase(master, source, phase)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or \
+       len(value) != len(expected):
+        raise ValueError("residual fit ledger has the wrong closure")
+    records = []
+    for index, (raw, fit) in enumerate(zip(value, expected, strict=True)):
+        item = _object(raw, {
+            "fit", "provenance_id", "schema", "state_fingerprint",
+            "training_loss",
+        }, f"residual fit[{index}]")
+        provenance = residual_fit_provenance_id(
+            fit, source, phase, master,
+        )
+        if _integer(item["schema"], "residual fit schema") != 1 or \
+           not _exact_json(item["fit"], _fit_value(fit)) or \
+           _sha256(
+               item["provenance_id"], "residual fit provenance",
+           ) != provenance:
+            raise ValueError("residual fit ledger order or provenance changed")
+        records.append(ResidualFitEvidence(
+            fit, provenance,
+            _sha256(
+                item["state_fingerprint"], "residual state fingerprint",
+            ),
+            _loss(item["training_loss"]),
+        ))
+    return tuple(records)
+
+
+def residual_prediction_record(
+    prediction: ContextPrediction, fit: ResidualFitEvidence,
+    values: Sequence[float],
+) -> dict[str, object]:
+    """Serialize one label-free raw-residual prediction vector."""
+    if not isinstance(prediction, ContextPrediction) or \
+       not isinstance(fit, ResidualFitEvidence) or prediction.fit != fit.fit:
+        raise ValueError("residual prediction fit is invalid")
+    payload = encode_f32le_base64(values)
+    if payload["count"] != prediction.prediction_count:
+        raise ValueError("residual prediction count changed")
+    return {
+        "fit_provenance_id": fit.provenance_id,
+        "grid_sha256": prediction.grid_sha256,
+        "history": prediction.fit.history,
+        "model": prediction.fit.model,
+        "phase": prediction.fit.phase,
+        "prediction_count": prediction.prediction_count,
+        "predictions": payload,
+        "schema": 1,
+        "seed": prediction.fit.seed,
+        "series": prediction.series,
+        "state_fingerprint": fit.state_fingerprint,
+    }
+
+
+def validate_residual_prediction_records(
+    value: object, master: Sequence[str], source: ContextPhase,
+    phase: ResidualPhaseInput, fit_records: object,
+) -> tuple[ResidualPredictionEvidence, ...]:
+    """Require the complete ordered 121-vector residual ledger."""
+    expected = expected_residual_predictions(master, source)
+    fitted = validate_residual_fit_records(
+        fit_records, master, source, phase,
+    )
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or \
+       len(value) != len(expected):
+        raise ValueError("residual prediction ledger has the wrong closure")
+    by_fit = {item.fit: item for item in fitted}
+    fields = {
+        "fit_provenance_id", "grid_sha256", "history", "model", "phase",
+        "prediction_count", "predictions", "schema", "seed", "series",
+        "state_fingerprint",
+    }
+    records = []
+    for index, (raw, prediction) in enumerate(zip(
+        value, expected, strict=True,
+    )):
+        item = _object(raw, fields, f"residual prediction[{index}]")
+        fit = by_fit[prediction.fit]
+        axes = (
+            item["phase"], item["model"], item["history"], item["seed"],
+            item["series"], item["prediction_count"],
+        )
+        expected_axes = (
+            prediction.fit.phase, prediction.fit.model,
+            prediction.fit.history, prediction.fit.seed,
+            prediction.series, prediction.prediction_count,
+        )
+        if _integer(item["schema"], "residual prediction schema") != 1 or \
+           not _exact_json(list(axes), list(expected_axes)) or \
+           _sha256(
+               item["grid_sha256"], "residual prediction grid",
+           ) != prediction.grid_sha256 or \
+           _sha256(
+               item["fit_provenance_id"],
+               "residual prediction provenance",
+           ) != fit.provenance_id or \
+           _sha256(
+               item["state_fingerprint"], "residual prediction state",
+           ) != fit.state_fingerprint:
+            raise ValueError("residual prediction closure changed")
+        records.append(ResidualPredictionEvidence(
+            prediction, fit.provenance_id, fit.state_fingerprint,
+            decode_f32le_base64(
+                item["predictions"],
+                expected_count=prediction.prediction_count,
+            ),
+        ))
+    return tuple(records)
 
 
 def validate_spy_session_audit(
