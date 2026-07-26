@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test whether one global scale rescues SPY-residual forecasts."""
+"""Analyze zero-anchored SPY-residual scaling and fold-1 alignment."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ if __name__ == "__main__":
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from math import fsum, isfinite, log
+from math import fsum, isclose, isfinite, log
 from pathlib import Path
 from statistics import fmean
 import argparse
@@ -153,8 +153,8 @@ from tools.panel_contract import (
     _open_directory, _tree_digest, mkdir_nofollow, read_canonical_json,
 )
 from tools.relative_context_contract import (
-    MODELS, ResidualAttempt, ResidualPhaseInput, ResidualReceipt,
-    ResidualTruthRow, expected_residual_protocol,
+    HISTORY_BARS, MODELS, ResidualAttempt, ResidualPhaseInput,
+    ResidualReceipt, ResidualTruthRow, expected_residual_protocol,
 )
 from tools.run_context_diagnostic import (
     _binding as _file_binding, _frozen as _frozen_input, phase_artifacts,
@@ -185,6 +185,7 @@ CANDIDATE = "shrunk_transformer"
 MODEL = "panel_transformer"
 REFERENCES = ("zero", MODEL, "global_ridge", "global_mlp")
 EVIDENCE_ROLE = "development-post-hoc-not-forward-clean"
+MARKET_REGIMES = ("negative", "nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +366,91 @@ def _phase_truth(
     return _truth(state.source, state.binding, truth)
 
 
+def _market_regimes(
+    bars: Sequence[float],
+    as_of: Sequence[int],
+) -> dict[int, str]:
+    """Classify exact completed SPY windows by close direction."""
+    if isinstance(bars, (str, bytes)) or not isinstance(bars, Sequence) or \
+       isinstance(as_of, (str, bytes)) or not isinstance(as_of, Sequence):
+        raise TypeError("market regime inputs are invalid")
+    values, indices = tuple(bars), tuple(as_of)
+    rows = len(values) // FEATURE_COUNT
+    lookback = HISTORY_BARS - 1
+    if not values or len(values) % FEATURE_COUNT or not indices or \
+       any(type(index) is not int for index in indices) or \
+       len(indices) != len(set(indices)) or \
+       indices != tuple(sorted(indices)) or min(indices) < lookback or \
+       max(indices) != rows - 1:
+        raise ValueError("market regime window changed")
+    needed = tuple(sorted({
+        row
+        for index in indices
+        for row in range(index - lookback, index + 1)
+    }))
+    closes = {
+        row: _finite(
+            values[row * FEATURE_COUNT + 3], "SPY regime close",
+        )
+        for row in needed
+    }
+    if min(closes.values()) <= 0.0:
+        raise ValueError("market regime closes must be positive")
+    return {
+        index: (
+            "negative"
+            if closes[index] < closes[index - lookback]
+            else "nonnegative"
+        )
+        for index in indices
+    }
+
+
+def _phase_market_regimes(
+    state: _PhaseRows,
+    lease: ResidualLease,
+) -> Mapping[str, tuple[str, ...]]:
+    """Derive fold labels from SPY values available at each completed as-of."""
+    if not isinstance(state, _PhaseRows) or \
+       not isinstance(lease, ResidualLease):
+        raise TypeError("residual market regime inputs are invalid")
+    lease()
+    benchmark = dict(lease.benchmark)
+    try:
+        spy_csv = benchmark["spy_csv"]
+    except KeyError as error:
+        raise ValueError("residual SPY snapshot is missing") from error
+    verify_frozen((spy_csv,))
+    aligned, indices = dict(state.spy), {}
+    for series, count, _ in state.source.evaluation_rows:
+        try:
+            packed = aligned[series]
+        except KeyError as error:
+            raise ValueError(f"{series} SPY rows are missing") from error
+        rows = packed.rows[packed.counts[0]:]
+        values = tuple(row.as_of for row in rows)
+        if len(values) != count:
+            raise ValueError(f"{series} SPY regime grid changed")
+        indices[series] = values
+    unique = tuple(sorted({
+        index for values in indices.values() for index in values
+    }))
+    if not unique:
+        raise ValueError("SPY regime grid is empty")
+    stop = state.spy_timestamps[unique[-1]]
+    bars = context_bar_prefix(
+        spy_csv.snapshot, state.spy_timestamps, stop,
+    )
+    labels = _market_regimes(bars, unique)
+    result = {
+        series: tuple(labels[index] for index in values)
+        for series, values in indices.items()
+    }
+    lease()
+    verify_frozen((spy_csv,))
+    return result
+
+
 def _pairs(
     truth: Mapping[str, Sequence[ResidualTruthRow]],
     predictions: Mapping[str, Sequence[float]],
@@ -410,17 +496,19 @@ def _pairs(
     return tuple(result)
 
 
-def fit_zero_anchored_scale(
-    truth: Mapping[str, Sequence[ResidualTruthRow]],
-    predictions: Mapping[str, Sequence[float]],
-    excluded: Collection[str] = (),
+def _fit_pairs(
+    pairs: Sequence[tuple[float, float]],
 ) -> ShrinkageFit:
-    """Fit the clipped least-squares scale against the zero forecast."""
-    pairs = _pairs(truth, predictions, excluded)
-    forecast = tuple(predicted for _, predicted in pairs)
-    denominator = _square_sum(forecast, "shrinkage denominator")
+    """Fit one zero-anchored scale from already grouped observations."""
+    values = tuple(pairs)
+    denominator = _square_sum(
+        tuple(predicted for _, predicted in values),
+        "shrinkage denominator",
+    )
     try:
-        numerator = fsum(actual * predicted for actual, predicted in pairs)
+        numerator = fsum(
+            actual * predicted for actual, predicted in values
+        )
     except OverflowError:
         raise ValueError("shrinkage numerator is non-finite") from None
     if not isfinite(numerator):
@@ -430,8 +518,116 @@ def fit_zero_anchored_scale(
         raise ValueError("unclipped shrinkage scale is non-finite")
     return ShrinkageFit(
         0.0 if unclipped is None else min(1.0, max(0.0, unclipped)),
-        unclipped, numerator, denominator, len(pairs),
+        unclipped, numerator, denominator, len(values),
     )
+
+
+def fit_zero_anchored_scale(
+    truth: Mapping[str, Sequence[ResidualTruthRow]],
+    predictions: Mapping[str, Sequence[float]],
+    excluded: Collection[str] = (),
+) -> ShrinkageFit:
+    """Fit the clipped least-squares scale against the zero forecast."""
+    return _fit_pairs(_pairs(truth, predictions, excluded))
+
+
+def _alignment_segment(
+    pairs: Sequence[tuple[float, float]],
+) -> dict[str, object]:
+    """Expose one partition's sufficient statistics without selecting it."""
+    values = tuple(pairs)
+    fit = _fit_pairs(values)
+    return {
+        "observation_count": fit.observation_count,
+        "numerator": fit.numerator,
+        "prediction_square_sum": fit.denominator,
+        "scale": None if fit.unclipped_scale is None else fit.scale,
+        "selection_eligible": False,
+        "truth_square_sum": _square_sum(
+            tuple(actual for actual, _ in values),
+            "alignment truth denominator",
+        ),
+        "unclipped_scale": fit.unclipped_scale,
+    }
+
+
+def _reconciles(
+    expected: Mapping[str, object],
+    cells: Sequence[Mapping[str, object]],
+) -> bool:
+    """Check a regrouping without changing any reported statistic."""
+    if sum(cell["observation_count"] for cell in cells) != \
+       expected["observation_count"]:
+        return False
+    return all(isclose(
+        fsum(float(cell[key]) for cell in cells),
+        float(expected[key]), rel_tol=1e-12, abs_tol=1e-15,
+    ) for key in (
+        "numerator", "prediction_square_sum", "truth_square_sum",
+    ))
+
+
+def alignment_diagnostic(
+    truth: Mapping[str, Sequence[ResidualTruthRow]],
+    predictions: Mapping[str, Sequence[float]],
+    regimes: Mapping[str, Sequence[str]],
+) -> dict[str, object]:
+    """Partition the original pooled fit by stock and causal market state."""
+    if not isinstance(regimes, Mapping) or tuple(regimes) != tuple(truth):
+        raise ValueError("alignment regime order changed")
+    pairs, cursor = _pairs(truth, predictions), 0
+    by_stock, by_regime = {}, {name: [] for name in MARKET_REGIMES}
+    joint = {
+        series: {name: [] for name in MARKET_REGIMES} for series in truth
+    }
+    for series, rows in truth.items():
+        labels = regimes[series]
+        if isinstance(labels, (str, bytes)) or \
+           not isinstance(labels, Sequence) or len(labels) != len(rows) or \
+           any(label not in MARKET_REGIMES for label in labels):
+            raise ValueError(f"{series} market regimes changed")
+        values = pairs[cursor:cursor + len(rows)]
+        cursor += len(rows)
+        by_stock[series] = values
+        for pair, label in zip(values, labels, strict=True):
+            by_regime[label].append(pair)
+            joint[series][label].append(pair)
+    if cursor != len(pairs):
+        raise ValueError("alignment partition changed")
+
+    global_ = _alignment_segment(pairs)
+    stocks = {
+        series: _alignment_segment(values)
+        for series, values in by_stock.items()
+    }
+    market = {
+        name: _alignment_segment(values)
+        for name, values in by_regime.items()
+    }
+    stock_market = {
+        series: {
+            name: _alignment_segment(values)
+            for name, values in groups.items()
+        }
+        for series, groups in joint.items()
+    }
+    partitions = (
+        tuple(stocks.values()),
+        tuple(market.values()),
+        tuple(
+            cell
+            for groups in stock_market.values()
+            for cell in groups.values()
+        ),
+    )
+    if not all(_reconciles(global_, cells) for cells in partitions):
+        raise ValueError("alignment partitions do not reconcile")
+    return {
+        "global": global_,
+        "by_stock": stocks,
+        "by_market_regime": market,
+        "by_stock_and_market_regime": stock_market,
+    }
 
 
 def zero_anchored_scale(
@@ -709,6 +905,47 @@ def _fit_report(
     })
 
 
+def _alignment_report(
+    inputs: Mapping[str, object],
+    diagnostic: Mapping[str, object],
+    implementation_commit: str,
+) -> dict[str, object]:
+    """Bind descriptive fold-1 attribution without creating a candidate."""
+    return _json_mapping({
+        "subject": {
+            "model": MODEL,
+            "seed_aggregation": "arithmetic-mean",
+        },
+        "decision": {
+            "model_change_authorized": False,
+            "output_role": "descriptive-residual-alignment-only",
+        },
+        "diagnostic": {
+            "phase": "fold-1",
+            **dict(diagnostic),
+        },
+        "evidence_role": EVIDENCE_ROLE,
+        "inputs": dict(inputs),
+        "integrity": {
+            "implementation_commit": implementation_commit,
+        },
+        "locks": dict(expected_residual_protocol()["locks"]),
+        "market_regime": {
+            "feature":
+                "log(spy.close[as_of] / "
+                f"spy.close[as_of - {HISTORY_BARS - 1}])",
+            "history_bars": HISTORY_BARS,
+            "labels": {
+                "negative": "feature < 0",
+                "nonnegative": "feature >= 0",
+            },
+            "timing": "completed-as-of-bars-only",
+        },
+        "schema": 1,
+        "truth_phases_read": ["fold-1"],
+    })
+
+
 def _final_report(
     inputs: Mapping[str, object],
     fit_binding: FileBinding,
@@ -760,12 +997,12 @@ def _validate_analysis_commit(
 
 
 def _create_output_directory(path: Path) -> tuple[int, tuple[int, int]]:
-    _absent(path, "shrinkage output directory")
+    _absent(path, "residual diagnostic output directory")
     identity = mkdir_nofollow(path)
     descriptor, opened = _open_directory(path)
     if opened != identity or os.listdir(descriptor):
         os.close(descriptor)
-        raise ValueError("shrinkage output directory changed")
+        raise ValueError("residual diagnostic output directory changed")
     os.fsync(descriptor)
     return descriptor, identity
 
@@ -773,12 +1010,12 @@ def _create_output_directory(path: Path) -> tuple[int, tuple[int, int]]:
 def _validate_published(
     path: Path, expected: Mapping[str, object],
 ) -> tuple[tuple[Path, tuple[int, int]], ...]:
-    identities = _single_link_inputs((path,), "shrinkage output")
+    identities = _single_link_inputs((path,), "residual diagnostic output")
     metadata = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or \
        stat.S_IMODE(metadata.st_mode) != 0o600 or \
        not _exact_json(read_canonical_json(path), expected):
-        raise ValueError("shrinkage output changed")
+        raise ValueError("residual diagnostic output changed")
     return identities
 
 
@@ -873,10 +1110,56 @@ def _analyze_phases(
         return result
 
 
-def analyze_residual_shrinkage(
-    attempt_path: Path, implementation_commit: str,
+def _analyze_alignment(
+    state: _PhaseRows,
+    phase: AuthenticatedPhase,
+    lease: ResidualLease,
+    inputs: Mapping[str, object],
+    implementation_commit: str,
+    result_path: Path,
+    directory: int,
+    output_identity: tuple[int, int],
+    verify: Callable[[], None],
 ) -> Mapping[str, object]:
-    """Fit on fold-1, seal the fit, then inspect calibration once."""
+    """Publish one fold-1 attribution without reading calibration truth."""
+    if state.source.phase != "fold-1" or phase.source != state.source or \
+       not callable(verify):
+        raise ValueError("alignment phase inputs are invalid")
+    verify()
+    regimes = _phase_market_regimes(state, lease)
+    truth, _ = _phase_truth(state, lease)
+    result = _alignment_report(
+        inputs,
+        alignment_diagnostic(truth, phase.predictions[MODEL], regimes),
+        implementation_commit,
+    )
+    del truth
+    _publish(result_path, result, directory, verify)
+    identities = _validate_published(result_path, result)
+    with freeze_inputs((result_path,)) as frozen:
+        if not _exact_json(
+            read_canonical_json(frozen[0].snapshot), result,
+        ):
+            raise ValueError("alignment result changed")
+        verify()
+        _verify_single_link_inputs(identities, "alignment result")
+        verify_frozen(frozen)
+        if _directory_members(
+            result_path.parent, (result_path.name,),
+        ) != output_identity:
+            raise ValueError("alignment result topology changed")
+    return result
+
+
+def analyze_residual_shrinkage(
+    attempt_path: Path,
+    implementation_commit: str,
+    *,
+    alignment: bool = False,
+) -> Mapping[str, object]:
+    """Run one authenticated shrinkage or fold-1 attribution diagnostic."""
+    if type(alignment) is not bool:
+        raise TypeError("residual diagnostic mode is invalid")
     _require_isolated_execution(bootstrapped=True)
     _require_exact_launch()
     _require_package_alias()
@@ -933,13 +1216,15 @@ def analyze_residual_shrinkage(
                 (phase.source, phase.phase) for phase in phases
             ):
                 raise ValueError("shrinkage phase binding changed")
-            output = run.with_name(f"{run.name}-shrinkage")
-            fit_path, result_path = (
-                output / "shrinkage-fit.json",
-                output / "shrinkage.json",
-            )
-            _absent(fit_path, "shrinkage fit")
-            _absent(result_path, "shrinkage result")
+            suffix = "alignment" if alignment else "shrinkage"
+            output = run.with_name(f"{run.name}-{suffix}")
+            if alignment:
+                result_path = output / "alignment.json"
+            else:
+                fit_path, result_path = (
+                    output / "shrinkage-fit.json",
+                    output / "shrinkage.json",
+                )
             directory, output_identity = _create_output_directory(output)
             try:
                 def verify() -> None:
@@ -947,9 +1232,15 @@ def analyze_residual_shrinkage(
                     verify_inputs()
                     if _directory_identity(output) != output_identity:
                         raise ValueError(
-                            "shrinkage output directory changed",
+                            "residual diagnostic output directory changed",
                         )
 
+                if alignment:
+                    return _analyze_alignment(
+                        states[0], phases[0], lease, inputs,
+                        implementation_commit, result_path, directory,
+                        output_identity, verify,
+                    )
                 return _analyze_phases(
                     states, phases, lease, inputs,
                     implementation_commit, fit_path, result_path,
@@ -965,6 +1256,7 @@ def parse_args(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("attempt", type=Path)
     parser.add_argument("--implementation-commit", required=True)
+    parser.add_argument("--alignment", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -973,6 +1265,7 @@ def main() -> None:
     try:
         report = analyze_residual_shrinkage(
             arguments.attempt, arguments.implementation_commit,
+            alignment=arguments.alignment,
         )
     except (
         IndexError, KeyError, OSError, OverflowError, TypeError,
@@ -980,14 +1273,20 @@ def main() -> None:
     ) as error:
         print(f"integrity error: {error}", file=sys.stderr)
         raise SystemExit(2) from error
-    print(json.dumps({
+    summary = {
+        "mode": "alignment",
+        "status": "analyzed",
+        "unclipped_scale":
+            report["diagnostic"]["global"]["unclipped_scale"],
+    } if arguments.alignment else {
         "later_residual_holdout_preregistration_warranted":
             report["decision"][
                 "later_residual_holdout_preregistration_warranted"
             ],
         "scale": report["fit"]["scale"],
         "status": "analyzed",
-    }, sort_keys=True))
+    }
+    print(json.dumps(summary, sort_keys=True))
 
 
 if __name__ == "__main__":
