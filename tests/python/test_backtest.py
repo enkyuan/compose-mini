@@ -15,12 +15,30 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.backtest import (
-    Costs, Forecast, _aggregate_seeds, experiment_fingerprint, load_bars,
-    main as backtest_main, policy_disagreement_lambda, read_forecasts,
-    run_backtests, select_trial, validate_policy, validate_test_experiment,
+    Costs, Forecast, _aggregate_seeds, execute_long, experiment_fingerprint,
+    load_bars, main as backtest_main, policy_disagreement_lambda,
+    read_forecasts, run_backtests, select_trial, validate_policy,
+    validate_test_experiment,
 )
 from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
 from tools.files import require_disjoint, write_json
+
+
+class NumericSubclass(float):
+    pass
+
+
+class MutableCosts:
+    def __init__(self) -> None:
+        self.impacts = iter((0.0, 0.5, 0.9))
+
+    @property
+    def impact(self) -> float:
+        return next(self.impacts)
+
+    @property
+    def fee(self) -> float:
+        return 0.0
 
 
 def write_csv(path: Path, rows: tuple[tuple[str, float, float], ...]) -> None:
@@ -223,6 +241,77 @@ def verify_costs(directory: Path) -> None:
             "trade_count"
         ] == count
         assert result["protocol"]["target_kind"] == EXECUTABLE_RETURN_TARGET
+
+    try:
+        Costs(NumericSubclass(0.0), 0.0, 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("numeric cost subclass was accepted")
+
+
+def verify_long_execution() -> None:
+    costs = Costs(2.0, 3.0, 5.0)
+    execution = execute_long(100.0, 50.0, 55.0, costs)
+    entry, exit_ = 50.0 * (1.0 + costs.impact), 55.0 * (1.0 - costs.impact)
+    shares = 100.0 / (entry * (1.0 + costs.fee))
+    for actual, expected in (
+        (execution.shares, shares),
+        (execution.entry_execution_price, entry),
+        (execution.exit_execution_price, exit_),
+        (execution.entry_notional, shares * entry),
+        (execution.exit_notional, shares * 55.0 * (1.0 - costs.impact)),
+        (
+            execution.cash_after,
+            shares * 55.0 * (1.0 - costs.impact) * (1.0 - costs.fee),
+        ),
+    ):
+        close(actual, expected)
+    rounding = execute_long(
+        100.0, 3066.126885137925, 1.32797250278406, costs,
+    )
+    assert rounding.exit_notional == \
+        rounding.shares * 1.32797250278406 * (1.0 - costs.impact)
+    for field in range(3):
+        for invalid in (0.0, -1.0, math.nan, math.inf, True):
+            values = [100.0, 50.0, 55.0]
+            values[field] = invalid
+            try:
+                execute_long(*values, costs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid execution input was accepted")
+    for values in (
+        (100.0, sys.float_info.max, 1.0),
+        (sys.float_info.max, sys.float_info.min, 1.0),
+    ):
+        try:
+            execute_long(*values, costs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-finite execution result was accepted")
+    try:
+        execute_long(100.0, 10.0, 10.0, MutableCosts())  # type: ignore[arg-type]
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mutable cost contract was accepted")
+    corrupted = Costs(0.0, 0.0, 0.0)
+    object.__setattr__(corrupted, "spread_bps", NumericSubclass(0.0))
+    try:
+        execute_long(100.0, 10.0, 10.0, corrupted)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("corrupted cost fields were accepted")
+    try:
+        execute_long(NumericSubclass(100.0), 10.0, 10.0, Costs(0, 0, 0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("numeric execution subclass was accepted")
 
 
 def verify_validation(bars: object, predictions: object) -> None:
@@ -803,6 +892,7 @@ def main() -> None:
         root = Path(directory)
         bars, predictions, report = verify_policy(root)
         verify_costs(root)
+        verify_long_execution()
         verify_validation(bars, predictions)
         verify_ensemble(bars, predictions)
         verify_policy_schemas()

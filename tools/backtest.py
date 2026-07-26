@@ -67,7 +67,7 @@ def _name(value: object, field: str) -> str:
 
 
 def _finite(value: object, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         raise ValueError(f"{field} must be finite")
     try:
         result = float(value)
@@ -176,12 +176,19 @@ class Costs:
     fee_bps: float
 
     def __post_init__(self) -> None:
-        for field in ("spread_bps", "slippage_bps", "fee_bps"):
-            value = _finite(getattr(self, field), field)
+        raw = tuple(getattr(self, field) for field in POLICY_COST_FIELDS)
+        values = tuple(
+            _finite(value, field)
+            for field, value in zip(POLICY_COST_FIELDS, raw, strict=True)
+        )
+        for field, value in zip(POLICY_COST_FIELDS, values, strict=True):
             if not 0.0 <= value < 10_000.0:
                 raise ValueError(f"{field} must be in [0, 10000)")
-        if self.impact >= 1.0:
+        impact = values[0] / 20_000.0 + values[1] / 10_000.0
+        if impact >= 1.0:
             raise ValueError("spread and slippage make the exit price nonpositive")
+        for field, value in zip(POLICY_COST_FIELDS, values, strict=True):
+            object.__setattr__(self, field, value)
 
     @property
     def impact(self) -> float:
@@ -199,6 +206,53 @@ class Costs:
             (1.0 + self.impact) * (1.0 + self.fee) /
             ((1.0 - self.impact) * (1.0 - self.fee))
         )
+
+
+def _validated_costs(value: object) -> Costs:
+    if type(value) is not Costs:
+        raise ValueError("costs must use the validated Costs contract")
+    raw = tuple(getattr(value, field) for field in POLICY_COST_FIELDS)
+    if any(type(item) is not float for item in raw):
+        raise ValueError("costs contain corrupted fields")
+    return Costs(*raw)
+
+
+@dataclass(frozen=True, slots=True)
+class LongExecution:
+    shares: float
+    entry_execution_price: float
+    exit_execution_price: float
+    entry_notional: float
+    exit_notional: float
+    cash_after: float
+
+
+def execute_long(cash: float, reference_price: float, outcome_price: float,
+                 costs: Costs) -> LongExecution:
+    """Execute one all-cash fractional long under the shared cost contract."""
+    snapshot = _validated_costs(costs)
+    impact, fee = snapshot.impact, snapshot.fee
+    cash, reference_price, outcome_price = (
+        _finite(value, name) for name, value in (
+            ("cash", cash), ("reference_price", reference_price),
+            ("outcome_price", outcome_price),
+        )
+    )
+    if min(cash, reference_price, outcome_price) <= 0.0:
+        raise ValueError("execution inputs must be positive")
+    entry = reference_price * (1.0 + impact)
+    exit_ = outcome_price * (1.0 - impact)
+    shares = cash / (entry * (1.0 + fee))
+    entry_notional = shares * entry
+    # Preserve the legacy left-to-right rounding of the realized cash path.
+    exit_notional = shares * outcome_price * (1.0 - impact)
+    values = (
+        shares, entry, exit_, entry_notional, exit_notional,
+        exit_notional * (1.0 - fee),
+    )
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError("execution result is outside finite positive range")
+    return LongExecution(*values)
 
 
 def policy_trial_disagreement_lambda(trial: Mapping[str, object]) -> float:
@@ -626,11 +680,11 @@ def _align(forecasts: Sequence[Forecast], bars: Bars,
 
 def _execute(cash: float, entry: int, exit_: int,
              bars: Bars, costs: Costs, signal: float | None = None) -> Trade:
-    entry_price = bars.opens[entry] * (1.0 + costs.impact)
-    shares = cash / (entry_price * (1.0 + costs.fee))
-    exit_notional = shares * bars.closes[exit_] * (1.0 - costs.impact)
-    return Trade(entry, exit_, shares, shares * entry_price, exit_notional,
-                 cash, exit_notional * (1.0 - costs.fee), signal)
+    execution = execute_long(cash, bars.opens[entry], bars.closes[exit_], costs)
+    return Trade(
+        entry, exit_, execution.shares, execution.entry_notional,
+        execution.exit_notional, cash, execution.cash_after, signal,
+    )
 
 
 def _schedule(aligned: Sequence[tuple[Forecast, int, int]], bars: Bars,
