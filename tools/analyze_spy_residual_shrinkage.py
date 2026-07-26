@@ -165,13 +165,19 @@ from tools.run_spy_residual import (
     residual_access_value, validate_residual_ledgers,
 )
 from tools.spy_residual_controller import _PhaseRows, _collect_inputs
+from tools.spy_residual_gate import (
+    MARKET_REGIMES, market_regimes as _market_regimes,
+)
 from tools.universe_cross_section import CROSS_SECTION_SEED
 from tools.universe_scaling import (
     BOOTSTRAP_BLOCK_DAYS, BOOTSTRAP_REPLICATES, circular_block_interval,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-ANALYSIS_SOURCE_PATHS = ("tools/analyze_spy_residual_shrinkage.py",)
+ANALYSIS_SOURCE_PATHS = (
+    "tools/analyze_spy_residual_shrinkage.py",
+    "tools/spy_residual_gate.py",
+)
 SOURCE_ATTEMPT = FileBinding(
     "experiments/h13-spy-residual-20260725-01-attempt.json",
     "0fb90623c90b418dfff93d35dde1bb49024c25d3b2b27b799ce752b8deed9ea3",
@@ -185,9 +191,6 @@ CANDIDATE = "shrunk_transformer"
 MODEL = "panel_transformer"
 REFERENCES = ("zero", MODEL, "global_ridge", "global_mlp")
 EVIDENCE_ROLE = "development-post-hoc-not-forward-clean"
-MARKET_REGIMES = ("negative", "nonnegative")
-
-
 @dataclass(frozen=True, slots=True)
 class ShrinkageFit:
     """Record the sufficient statistics for one zero-anchored fit."""
@@ -293,11 +296,12 @@ def _completed_run(
         expected,
     ):
         raise ValueError("residual terminal outcome changed")
-    source = _file_binding(
-        ROOT, _frozen_input(frozen, ROOT / ANALYSIS_SOURCE_PATHS[0]),
+    sources = tuple(
+        _file_binding(ROOT, _frozen_input(frozen, ROOT / path))
+        for path in ANALYSIS_SOURCE_PATHS
     )
     return attempt, tuple(phases), {
-        "analysis_source": _binding_value(source),
+        "analysis_sources": [_binding_value(source) for source in sources],
         "attempt": _binding_value(attempt_binding),
         "outcome": _binding_value(outcome_binding),
         "phases": phase_inputs,
@@ -364,46 +368,6 @@ def _phase_truth(
     lease()
     verify_frozen((spy_csv,))
     return _truth(state.source, state.binding, truth)
-
-
-def _market_regimes(
-    bars: Sequence[float],
-    as_of: Sequence[int],
-) -> dict[int, str]:
-    """Classify exact completed SPY windows by close direction."""
-    if isinstance(bars, (str, bytes)) or not isinstance(bars, Sequence) or \
-       isinstance(as_of, (str, bytes)) or not isinstance(as_of, Sequence):
-        raise TypeError("market regime inputs are invalid")
-    values, indices = tuple(bars), tuple(as_of)
-    rows = len(values) // FEATURE_COUNT
-    lookback = HISTORY_BARS - 1
-    if not values or len(values) % FEATURE_COUNT or not indices or \
-       any(type(index) is not int for index in indices) or \
-       len(indices) != len(set(indices)) or \
-       indices != tuple(sorted(indices)) or min(indices) < lookback or \
-       max(indices) != rows - 1:
-        raise ValueError("market regime window changed")
-    needed = tuple(sorted({
-        row
-        for index in indices
-        for row in range(index - lookback, index + 1)
-    }))
-    closes = {
-        row: _finite(
-            values[row * FEATURE_COUNT + 3], "SPY regime close",
-        )
-        for row in needed
-    }
-    if min(closes.values()) <= 0.0:
-        raise ValueError("market regime closes must be positive")
-    return {
-        index: (
-            "negative"
-            if closes[index] < closes[index - lookback]
-            else "nonnegative"
-        )
-        for index in indices
-    }
 
 
 def _phase_market_regimes(
@@ -982,13 +946,19 @@ def _final_report(
 
 
 def _validate_analysis_commit(
-    commit: str, source: FileBinding,
+    commit: str, sources: Sequence[FileBinding],
 ) -> None:
     if type(commit) is not str or len(commit) != 40 or any(
         byte not in "0123456789abcdef" for byte in commit
-    ) or source.path != ANALYSIS_SOURCE_PATHS[0]:
+    ) or isinstance(sources, (str, bytes)) or \
+       not isinstance(sources, Sequence):
         raise ValueError("shrinkage implementation commit is invalid")
-    files = (source,)
+    files = tuple(sources)
+    if tuple(
+        source.path if isinstance(source, FileBinding) else None
+        for source in files
+    ) != ANALYSIS_SOURCE_PATHS:
+        raise ValueError("shrinkage implementation sources changed")
     _validate_commit(
         commit, SourceTree(
             str(ROOT.resolve(strict=True)), files, _tree_digest(files),
@@ -1179,8 +1149,8 @@ def analyze_residual_shrinkage(
         for source in context.phases
         for path in phase_artifacts(ROOT, absolute, source)
     )
-    source = ROOT / ANALYSIS_SOURCE_PATHS[0]
-    paths = (absolute, outcome, *artifacts, source)
+    sources = tuple(ROOT / path for path in ANALYSIS_SOURCE_PATHS)
+    paths = (absolute, outcome, *artifacts, *sources)
     identities = _single_link_inputs(paths, "shrinkage inputs")
     run_names = tuple(path.name for path in artifacts)
     run_identity = _directory_members(run, run_names)
@@ -1192,10 +1162,16 @@ def analyze_residual_shrinkage(
         )
         if attempt != live:
             raise ValueError("residual attempt changed")
-        source_binding = FileBinding.parse(
-            inputs["analysis_source"], "shrinkage analysis source",
+        raw_sources = inputs["analysis_sources"]
+        if not isinstance(raw_sources, list):
+            raise ValueError("shrinkage analysis sources changed")
+        source_bindings = tuple(
+            FileBinding.parse(
+                source, f"shrinkage analysis source[{index}]",
+            )
+            for index, source in enumerate(raw_sources)
         )
-        _validate_analysis_commit(implementation_commit, source_binding)
+        _validate_analysis_commit(implementation_commit, source_bindings)
 
         def verify_inputs() -> None:
             _verify_single_link_inputs(identities, "shrinkage inputs")

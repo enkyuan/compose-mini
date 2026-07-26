@@ -22,14 +22,14 @@ sys.path.insert(0, str(ROOT))
 
 import tools.analyze_spy_residual_shrinkage as analyzer
 from tools.analyze_spy_residual_shrinkage import (
-    _analyze_alignment, _analyze_phases, _final_report, _fit_report,
-    _market_regimes, _phase_market_regimes, _publish, _validate_published,
+    ANALYSIS_SOURCE_PATHS, _analyze_alignment, _analyze_phases,
+    _final_report, _fit_report, _phase_market_regimes, _publish,
+    _validate_analysis_commit, _validate_published,
     alignment_diagnostic, evaluate_frozen_scale, fit_diagnostic,
     fit_zero_anchored_scale, pooled_r2, scale_predictions,
     zero_anchored_scale,
 )
 from tools.arm_spy_residual import ResidualLease
-from tools.data_v1 import FEATURE_COUNT
 from tools.files import FrozenInput
 from tools.panel_contract import FileBinding, _directory_identity
 from tools.relative_context_contract import (
@@ -40,10 +40,10 @@ from tools.spy_residual_controller import _PhaseRows
 from tools.universe_contract import PackedRows
 
 REPORT_INPUTS = {
-    "analysis_source": {
-        "path": "tools/analyze_spy_residual_shrinkage.py",
-        "sha256": "a" * 64,
-    },
+    "analysis_sources": [
+        {"path": path, "sha256": f"{index + 1:x}" * 64}
+        for index, path in enumerate(ANALYSIS_SOURCE_PATHS)
+    ],
     "attempt": {"path": "experiments/attempt.json", "sha256": "b" * 64},
     "outcome": {"path": "experiments/outcome.json", "sha256": "c" * 64},
     "phases": [],
@@ -213,26 +213,6 @@ def test_alignment_decomposition_reconciles_partitions() -> None:
     assert empty["scale"] is None
 
 
-def test_market_regime_uses_only_completed_spy_window() -> None:
-    increasing = bars(*(100.0 + index for index in range(17)))
-    decreasing = bars(*(116.0 - index for index in range(17)))
-    assert len(increasing) == 17 * FEATURE_COUNT
-    assert _market_regimes(increasing, (16,)) == {16: "nonnegative"}
-    assert _market_regimes(decreasing, (16,)) == {16: "negative"}
-    rejects(_market_regimes, increasing + bars(117.0), (16,))
-    rejects(_market_regimes, bars(*range(1, 17)), (15,))
-    rejects(_market_regimes, bars(*([1.0] * 16), 0.0), (16,))
-    rejects(
-        _market_regimes,
-        bars(*([1.0] * 16), float("nan")),
-        (16,),
-    )
-    invalid_interior = [1.0] * 17
-    invalid_interior[8] = float("nan")
-    rejects(_market_regimes, bars(*invalid_interior), (16,))
-    rejects(_market_regimes, increasing, (16, 16))
-
-
 def test_phase_market_regime_reads_exact_fold_prefix() -> None:
     timestamps = tuple(
         f"2026-01-02T14:{index:02d}:00Z" for index in range(20)
@@ -295,6 +275,20 @@ def test_phase_market_regime_reads_exact_fold_prefix() -> None:
         "B": ("nonnegative", "negative"),
     }
     assert events == ["lease", "prefix", "lease"]
+
+
+def test_analysis_commit_binds_shared_gate() -> None:
+    sources = tuple(
+        FileBinding(path, f"{index + 1:x}" * 64)
+        for index, path in enumerate(ANALYSIS_SOURCE_PATHS)
+    )
+    with patch.object(analyzer, "_validate_commit") as validate:
+        _validate_analysis_commit("d" * 40, sources)
+    tree = validate.call_args.args[1]
+    assert tuple(source.path for source in tree.files) == \
+        ANALYSIS_SOURCE_PATHS
+    rejects(_validate_analysis_commit, "d" * 40, sources[:-1])
+    rejects(_validate_analysis_commit, "d" * 40, tuple(reversed(sources)))
 
 
 def test_invalid_alignment_inputs_are_rejected() -> None:
@@ -447,7 +441,7 @@ def test_fit_is_durable_before_calibration_truth() -> None:
             ):
                 _analyze_phases(
                     states, phases, object(), {
-                        "analysis_source": {},
+                        "analysis_sources": [],
                         "attempt": {},
                         "outcome": {},
                         "phases": [],
@@ -671,8 +665,8 @@ def main() -> None:
     test_common_rescaling_and_duplication_are_invariant()
     test_scaling_preserves_shape_and_r2_uses_zero()
     test_alignment_decomposition_reconciles_partitions()
-    test_market_regime_uses_only_completed_spy_window()
     test_phase_market_regime_reads_exact_fold_prefix()
+    test_analysis_commit_binds_shared_gate()
     test_invalid_alignment_inputs_are_rejected()
     test_diagnostics_use_one_frozen_global_scale()
     test_reports_remain_residual_only_and_non_executable()
