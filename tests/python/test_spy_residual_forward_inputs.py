@@ -21,14 +21,19 @@ sys.path.insert(0, str(ROOT))
 from tools.data_v1 import CSV_HEADER
 from tools.files import freeze_inputs
 from tools.float32 import f32
-from tools.panel_contract import read_canonical_json, read_canonical_json_lines
+from tools.panel_contract import (
+    _directory_identity, read_canonical_json, read_canonical_json_lines,
+)
 from tools.relative_context_contract import SEEDS
 from tools.session_calendar import (
     SessionBin, SessionCalendar, expected_bins,
 )
-from tools.spy_residual_forward_contract import FORWARD_UNIVERSE
+from tools.spy_residual_forward_contract import (
+    FORWARD_UNIVERSE, STATE_FINGERPRINTS,
+)
 from tools.spy_residual_forward_inputs import (
-    ForwardPredictionSession, ForwardSeriesFiles, PredictionDraft,
+    CandidateLedger, ForwardPredictionSession, ForwardRunBinding,
+    ForwardSeriesFiles, ForwardSeriesPrediction, SeedPrediction,
     SpyResidualForwardInputs, _prepare_forward_inputs, derive_forward_grid,
 )
 from tools import spy_residual_forward_inputs as forward_inputs
@@ -191,22 +196,41 @@ def frozen_files(
         yield stocks, spy, lambda: None
 
 
-def raw_predictions(index: int) -> dict[str, tuple[float, ...]]:
-    return {
-        series: tuple(
-            (index + 1) * (member + 1) * (seed_index + 1) / 1_000_000
-            for seed_index, _ in enumerate(SEEDS)
+def predictions(index: int) -> tuple[ForwardSeriesPrediction, ...]:
+    return tuple(
+        ForwardSeriesPrediction(
+            series,
+            tuple(
+                SeedPrediction(
+                    seed, fingerprint,
+                    (index + 1) * (member + 1) *
+                    (seed_index + 1) / 1_000_000,
+                )
+                for seed_index, (seed, fingerprint) in enumerate(zip(
+                    SEEDS, STATE_FINGERPRINTS, strict=True,
+                ))
+            ),
         )
         for member, series in enumerate(FORWARD_UNIVERSE)
-    }
+    )
 
 
-def publish(session: ForwardPredictionSession) -> PredictionDraft:
-    result: SpyResidualForwardInputs | PredictionDraft = \
+def test_binding() -> ForwardRunBinding:
+    return ForwardRunBinding(
+        lambda current: predictions(current.index),
+        lambda _grid, rows: {
+            "prediction_rows": len(rows),
+            "test": "forward-input-session",
+        },
+    )
+
+
+def publish(session: ForwardPredictionSession) -> CandidateLedger:
+    result: SpyResidualForwardInputs | CandidateLedger = \
         session.current()
     while isinstance(result, SpyResidualForwardInputs):
         assert result.index < 780
-        result = session.submit(result, raw_predictions(result.index))
+        result = session.submit(result)
     return result
 
 
@@ -215,13 +239,15 @@ def prepare(
     stocks: Sequence[ForwardSeriesFiles],
     spy: ForwardSeriesFiles,
     verify: Callable[[], None],
+    run: ForwardRunBinding | None = None,
 ) -> tuple[ForwardPredictionSession, Callable[..., Mapping[str, object]]]:
     grid = derive_forward_grid(
         value.source_calendar, value.future_calendar, value.boundary,
     )
     return _prepare_forward_inputs(
         grid, value.source_calendar, value.future_calendar,
-        stocks, spy, value.ledger, value.receipt, verify,
+        stocks, spy, value.ledger, value.receipt,
+        run or test_binding(), verify, _directory_identity(value.ledger.parent),
     )
 
 
@@ -286,13 +312,20 @@ def test_requires_complete_unique_ordered_common_grid() -> None:
             assert len(current.spy.values) == 17 * 5
             rejects(
                 _prepare_forward_inputs, grid, value.source_calendar,
+                value.future_calendar, stocks, spy, value.ledger,
+                value.receipt, test_binding(), verify, (0, 0),
+            )
+            rejects(
+                _prepare_forward_inputs, grid, value.source_calendar,
                 value.future_calendar, stocks[::-1], spy, value.ledger,
-                value.receipt, verify,
+                value.receipt, test_binding(), verify,
+                _directory_identity(value.ledger.parent),
             )
             rejects(
                 _prepare_forward_inputs, grid, value.source_calendar,
                 value.future_calendar, stocks[:-1], spy, value.ledger,
-                value.receipt, verify,
+                value.receipt, test_binding(), verify,
+                _directory_identity(value.ledger.parent),
             )
             aliased = (
                 stocks[0],
@@ -304,7 +337,8 @@ def test_requires_complete_unique_ordered_common_grid() -> None:
             rejects(
                 _prepare_forward_inputs, grid, value.source_calendar,
                 value.future_calendar, aliased, spy, value.ledger,
-                value.receipt, verify,
+                value.receipt, test_binding(), verify,
+                _directory_identity(value.ledger.parent),
             )
 
         missing = grid.triples[-1][2]
@@ -346,11 +380,9 @@ def test_rejects_links_and_replacements() -> None:
             os.replace(substitute, source)
             for _ in range(779):
                 current = session.current()
-                session.submit(current, raw_predictions(current.index))
+                session.submit(current)
             current = session.current()
-            rejects(
-                session.submit, current, raw_predictions(current.index),
-            )
+            rejects(session.submit, current)
 
 
 def test_decodes_only_the_current_as_of_window() -> None:
@@ -375,10 +407,7 @@ def test_decodes_only_the_current_as_of_window() -> None:
                     for series in (*current.stocks, current.spy)
                 ))
                 if item is poisoned:
-                    rejects(
-                        session.submit, current,
-                        raw_predictions(current.index),
-                    )
+                    rejects(session.submit, current)
         assert observed[0] == observed[1]
 
 
@@ -390,13 +419,9 @@ def test_rejects_a_stale_batch_token() -> None:
         with frozen_files(value) as (stocks, spy, verify):
             session, _ = prepare(value, stocks, spy, verify)
             first = session.current()
-            second = session.submit(
-                first, raw_predictions(first.index),
-            )
+            second = session.submit(first)
             assert isinstance(second, SpyResidualForwardInputs)
-            rejects(
-                session.submit, first, raw_predictions(first.index),
-            )
+            rejects(session.submit, first)
 
 
 def test_ignores_the_uninspected_source_tail() -> None:
@@ -450,11 +475,16 @@ def test_truth_requires_the_complete_exclusive_ledger() -> None:
             assert claim.records == len(grid.triples) * len(FORWARD_UNIVERSE)
             assert len(rows) == claim.records + 1
             assert rows[0] == {
+                "batches": len(grid.triples),
+                "closure": {
+                    "prediction_rows": claim.records,
+                    "test": "forward-input-session",
+                },
+                "evidence_role": "label-free-forward-candidate",
                 "grid_sha256": rows[0]["grid_sha256"],
-                "provenance": "unbound-task-3-draft",
                 "records": claim.records,
                 "schema": 1,
-                "type": "spy-residual-forward-prediction-draft",
+                "type": "spy-residual-forward-candidate",
             }
             first = rows[1]
             assert first["series"] == FORWARD_UNIVERSE[0]
@@ -468,7 +498,10 @@ def test_truth_requires_the_complete_exclusive_ledger() -> None:
             truth = read_truth(claim)
             receipt = read_canonical_json(value.receipt)
             assert receipt == {
-                "draft": {
+                "candidate": {
+                    "directory_identity": list(
+                        claim.directory_identity,
+                    ),
                     "identity": list(claim.identity),
                     "path": str(claim.path),
                     "records": claim.records,

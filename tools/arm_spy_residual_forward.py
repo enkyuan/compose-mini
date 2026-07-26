@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 from threading import Lock
 import os
+import stat
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,29 +31,143 @@ from tools.context_diagnostic_inputs import (
 from tools.data_v1 import read_timestamps, read_timestamps_until
 from tools.files import FrozenInput, freeze_inputs, verify_frozen
 from tools.panel_contract import (
-    _exact_json, _verify_identities, read_canonical_json,
-    read_canonical_json_lines,
+    FileBinding, SourceTree, _directory_identity, _exact_json,
+    _verify_identities, read_canonical_json, read_canonical_json_lines,
+    selected_source_tree, source_tree,
 )
 from tools.relative_context_contract import (
     HORIZON_BARS, INTERVAL_MINUTES, RESIDUAL_SOURCE, SEEDS, SPY_END,
-    SPY_START, ResidualAttempt, validate_residual_fit_records,
+    SPY_START, ResidualAttempt, ResidualFitEvidence,
+    residual_phase_sha256, validate_residual_fit_records,
 )
 from tools.run_spy_residual import phase_artifacts
 from tools.session_calendar import SessionCalendar, expected_bins
 from tools.spy_residual_forward_contract import (
-    FORWARD_CALENDAR, FORWARD_SOURCES, FORWARD_UNIVERSE,
-    STATE_FINGERPRINTS,
+    FORWARD_CALENDAR, FORWARD_CONFIG, FORWARD_RUN_ID, FORWARD_SOURCE_PATHS,
+    FORWARD_SOURCES, FORWARD_UNIVERSE, STATE_FINGERPRINTS,
 )
 from tools.spy_residual_forward_inputs import (
-    ForwardGrid, ForwardPredictionSession, ForwardSeriesFiles, TruthReader,
-    _prepare_forward_inputs, derive_forward_grid,
+    ForwardGrid, ForwardPredictionSession, ForwardRunBinding,
+    ForwardSeriesFiles, TruthReader, _prepare_forward_inputs,
+    derive_forward_grid,
 )
 
 Verify = Callable[[], None]
 PURPOSE = "Authenticate the fixed SPY-residual forward holdout."
-FORWARD_RUN_DIR = ROOT / "reports/h13-spy-direction-forward-20260726-01"
-FORWARD_DRAFT = FORWARD_RUN_DIR / "prediction-draft.jsonl"
+FORWARD_RUN_DIR = ROOT / "reports" / FORWARD_RUN_ID
+FORWARD_CANDIDATE = FORWARD_RUN_DIR / "candidate.jsonl"
 FORWARD_TRUTH_RECEIPT = FORWARD_RUN_DIR / "truth-access.json"
+
+
+def _unavailable_calibration() -> ForwardCalibration:
+    raise ValueError("forward calibration is unavailable")
+
+
+def _closed_source_tree(path: Path) -> SourceTree:
+    """Hash a package only when every descendant is a stable file or directory."""
+    def entries() -> tuple[tuple[str, str, int, int], ...]:
+        result = []
+        for item in sorted(path.rglob("*")):
+            metadata = item.stat(follow_symlinks=False)
+            kind = (
+                "file" if stat.S_ISREG(metadata.st_mode) else
+                "directory" if stat.S_ISDIR(metadata.st_mode) else None
+            )
+            if kind is None:
+                raise ValueError("forward Torch package entry is invalid")
+            result.append((
+                item.relative_to(path).as_posix(), kind,
+                metadata.st_dev, metadata.st_ino,
+            ))
+        return tuple(result)
+
+    before = entries()
+    tree = source_tree(path)
+    if entries() != before or tuple(
+        item.path for item in tree.files
+    ) != tuple(item[0] for item in before if item[1] == "file"):
+        raise ValueError("forward Torch package tree changed")
+    return tree
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardCalibration:
+    """Carry authenticated calibration inputs into the Torch runtime."""
+
+    prepared: object
+    fits: tuple[ResidualFitEvidence, ...]
+    runtime_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardRunContext:
+    """Bind one fixed run directory to one implementation tree."""
+
+    implementation_tree: SourceTree
+    run_id: str
+    directory_identity: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        if type(self.implementation_tree) is not SourceTree or \
+           type(self.run_id) is not str or not self.run_id or \
+           type(self.directory_identity) is not tuple or \
+           len(self.directory_identity) != 2 or any(
+               type(value) is not int or value < 0
+               for value in self.directory_identity
+           ):
+            raise ValueError("forward run context is invalid")
+
+
+def _binding(name: str) -> FileBinding:
+    try:
+        _, path, sha256 = next(
+            item for item in (*FORWARD_SOURCES, FORWARD_CALENDAR)
+            if item[0] == name
+        )
+    except StopIteration as error:
+        raise ValueError("forward source binding is missing") from error
+    return FileBinding(path, sha256)
+
+
+def _provenance(
+    context: ForwardRunContext, calibration: ForwardCalibration,
+    bundle_report: FileBinding,
+) -> dict[str, object]:
+    prepared = calibration.prepared
+    source, phase = prepared.source, prepared.binding
+    return {
+        "historical": {
+            "attempt": asdict(_binding("residual_attempt")),
+            "calibration_fits": asdict(_binding("calibration_fits")),
+            "evaluation_grid_sha256": source.evaluation_grid_sha256,
+            "residual_phase_sha256": residual_phase_sha256(phase),
+            "runtime_source_tree_sha256": calibration.runtime_sha256,
+            "scaler_inputs_sha256": phase.scaler_inputs_sha256,
+            "source_phase_sha256": phase.source_phase_sha256,
+            "training_grid_sha256": source.training_grid_sha256,
+        },
+        "implementation_tree": asdict(context.implementation_tree),
+        "protocol": asdict(FORWARD_CONFIG),
+        "run": {
+            "directory_identity": list(context.directory_identity),
+            "id": context.run_id,
+        },
+        "sources": {
+            "forward_calendar": asdict(_binding("forward_calendar")),
+            "future_bundle_report": asdict(bundle_report),
+        },
+    }
+
+
+def _forward_runtime(calibration: ForwardCalibration) -> object:
+    """Reproduce the sole runtime inside the authenticated lease."""
+    from tools.spy_residual_forward_runtime import SpyResidualForwardRuntime
+    import torch
+
+    return SpyResidualForwardRuntime.reproduce(
+        calibration.prepared, torch.device("cpu"),
+        calibration.runtime_sha256, calibration.fits,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +175,10 @@ class ForwardLease:
     """Hold Task 4's authenticated, one-use internal input handoff."""
 
     grid: ForwardGrid
+    bundle_report: FileBinding
     _open: Callable[
-        [], tuple[ForwardPredictionSession, TruthReader],
+        [ForwardRunContext],
+        tuple[ForwardPredictionSession, TruthReader],
     ] = field(repr=False, compare=False)
     _verify: Verify = field(repr=False, compare=False)
 
@@ -69,11 +186,11 @@ class ForwardLease:
         self._verify()
 
     def _prepare(
-        self,
+        self, context: ForwardRunContext,
     ) -> tuple[ForwardPredictionSession, TruthReader]:
         """Hand the fixed one-shot session to the authenticated runner."""
         self()
-        return self._open()
+        return self._open(context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +200,10 @@ class _Historical:
     stocks: tuple[tuple[str, FrozenInput], ...]
     spy: FrozenInput
     verify: Verify = field(repr=False, compare=False)
+    calibrate: Callable[[], ForwardCalibration] = field(
+        default=_unavailable_calibration,
+        repr=False, compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +212,7 @@ class _Future:
     stocks: tuple[tuple[str, FrozenInput], ...]
     spy: FrozenInput
     verify: Verify = field(repr=False, compare=False)
+    report: FileBinding
 
 
 def _source_context(snapshot: FrozenInput) -> ContextAttempt:
@@ -184,7 +306,7 @@ def _validate_alignment(value: object) -> None:
 
 def _validate_fits(
     path: Path, context: ContextAttempt, attempt: ResidualAttempt,
-) -> None:
+) -> tuple[ResidualFitEvidence, ...]:
     source = next(
         item for item in context.phases if item.phase == "calibration"
     )
@@ -200,6 +322,7 @@ def _validate_fits(
     )
     if observed != tuple(zip(SEEDS, STATE_FINGERPRINTS, strict=True)):
         raise ValueError("forward transformer states changed")
+    return records
 
 
 @contextmanager
@@ -264,7 +387,7 @@ def _bound_historical() -> Iterator[_Historical]:
         _validate_alignment(read_canonical_json(
             frozen[source_paths["alignment_report"]].snapshot,
         ))
-        _validate_fits(
+        fits = _validate_fits(
             frozen[source_paths["calibration_fits"]].snapshot,
             context, attempt,
         )
@@ -279,6 +402,40 @@ def _bound_historical() -> Iterator[_Historical]:
             spy = dict(lease.benchmark)["spy_csv"]
             boundary = _source_boundary(context, lease, calendar)
 
+            def calibrate() -> ForwardCalibration:
+                from tools.run_universe_scaling import \
+                    _expose_torch_package
+                from tools.spy_residual_controller import \
+                    prepare_residual_phase
+
+                python = Path(attempt.torch_probe.python.path)
+                package = Path(attempt.torch_probe.package_tree.root)
+                if Path(sys.executable).resolve(strict=True) != \
+                        python.resolve(strict=True):
+                    raise ValueError("forward Torch Python changed")
+                attempt.torch_probe.python.validate_live(
+                    "forward Torch Python",
+                )
+                if _closed_source_tree(package) != \
+                        attempt.torch_probe.package_tree:
+                    raise ValueError("forward Torch package changed")
+                _expose_torch_package(package)
+                source = next(
+                    item for item in context.phases
+                    if item.phase == "calibration"
+                )
+                phase = next(
+                    item for item in attempt.phases
+                    if item.phase == "calibration"
+                )
+                prepared, _ = prepare_residual_phase(
+                    context, source, phase, lease.context,
+                    dict(lease.benchmark)["spy_csv"],
+                )
+                return ForwardCalibration(
+                    prepared, fits, attempt.source_tree.sha256,
+                )
+
             def verify() -> None:
                 lease()
                 if _directory_members(
@@ -292,7 +449,9 @@ def _bound_historical() -> Iterator[_Historical]:
                 verify_frozen(snapshots)
 
             verify()
-            yield _Historical(calendar, boundary, stocks, spy, verify)
+            yield _Historical(
+                calendar, boundary, stocks, spy, verify, calibrate,
+            )
             verify()
     _verify_identities(initial_identities)
 
@@ -411,6 +570,7 @@ def _bound_future(
         verify()
         yield _Future(
             calendar, future[:-1], future[-1][1], verify,
+            FileBinding(str(report_input.source), report_input.sha256),
         )
         verify()
 
@@ -446,18 +606,49 @@ def arm_forward_inputs(
 
             lock, opened = Lock(), False
 
-            def prepare() -> tuple[ForwardPredictionSession, TruthReader]:
+            def prepare(
+                context: ForwardRunContext,
+            ) -> tuple[ForwardPredictionSession, TruthReader]:
                 nonlocal opened
                 with lock:
-                    if opened:
+                    if opened or type(context) is not ForwardRunContext:
                         raise ValueError("forward input lease was already used")
                     opened = True
                 verify()
+                if context.run_id != FORWARD_RUN_ID or \
+                   context.directory_identity != _directory_identity(
+                       FORWARD_CANDIDATE.parent,
+                   ) or context.implementation_tree != selected_source_tree(
+                       ROOT, FORWARD_SOURCE_PATHS,
+                   ):
+                    raise ValueError("forward run context changed")
+
+                def verify_run() -> None:
+                    verify()
+                    if context.implementation_tree != selected_source_tree(
+                        ROOT, FORWARD_SOURCE_PATHS,
+                    ):
+                        raise ValueError("forward implementation tree changed")
+
+                calibration = source.calibrate()
+                verify_run()
+                if type(calibration) is not ForwardCalibration:
+                    raise ValueError("forward calibration changed")
+                runtime = _forward_runtime(calibration)
+                run = runtime.bind(_provenance(
+                    context, calibration, future.report,
+                ))
+                if type(run) is not ForwardRunBinding:
+                    raise ValueError("forward runtime binding changed")
+                verify_run()
                 return _prepare_forward_inputs(
                     grid, source.calendar, future.calendar, stocks, spy,
-                    FORWARD_DRAFT, FORWARD_TRUTH_RECEIPT, verify,
+                    FORWARD_CANDIDATE, FORWARD_TRUTH_RECEIPT, run, verify_run,
+                    context.directory_identity,
                 )
 
             verify()
-            yield ForwardLease(grid, prepare, verify)
+            yield ForwardLease(
+                grid, future.report, prepare, verify,
+            )
             verify()

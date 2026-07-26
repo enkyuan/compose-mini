@@ -37,14 +37,15 @@ from tools.session_calendar import (
     SessionBin, SessionCalendar, expected_bins,
 )
 from tools.session_samples import SampleRows, SessionSamples, session_samples
-from tools.spy_residual_forward_contract import FORWARD_UNIVERSE
+from tools.spy_residual_forward_contract import (
+    FORWARD_UNIVERSE, STATE_FINGERPRINTS,
+)
 from tools.spy_residual_gate import gate_mean_predictions, market_regimes
 from tools.universe_contract import PackedRows
 
 TARGET_SESSIONS = 60
 TimestampTriple = tuple[str, str, str]
 Verify = Callable[[], None]
-RawPredictions = Mapping[str, Sequence[float]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +128,64 @@ class SpyResidualForwardInputs:
 
 
 @dataclass(frozen=True, slots=True)
-class PredictionDraft:
-    """Bind one provenance-unbound draft to its published inode."""
+class SeedPrediction:
+    """Bind one raw prediction to its authenticated fitted state."""
+
+    seed: int
+    state_fingerprint: str
+    prediction: float
+
+    def __post_init__(self) -> None:
+        expected = dict(zip(SEEDS, STATE_FINGERPRINTS, strict=True))
+        if expected.get(self.seed) != self.state_fingerprint or \
+           type(self.prediction) is not float or \
+           not isfinite(self.prediction):
+            raise ValueError("forward seed prediction is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardSeriesPrediction:
+    """Hold the five ordered authenticated predictions for one stock."""
+
+    series: str
+    values: tuple[SeedPrediction, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.series) is not str or not self.series or \
+           type(self.values) is not tuple or \
+           tuple(item.seed for item in self.values) != SEEDS or any(
+               type(item) is not SeedPrediction for item in self.values
+           ):
+            raise ValueError("forward series prediction is invalid")
+
+
+ForwardPredictions = tuple[ForwardSeriesPrediction, ...]
+CandidateEvidence = Callable[
+    [ForwardGrid, Sequence[Mapping[str, object]]], Mapping[str, object],
+]
+Predict = Callable[[SpyResidualForwardInputs], ForwardPredictions]
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardRunBinding:
+    """Join one verified predictor to its final provenance closure."""
+
+    predict: Predict
+    evidence: CandidateEvidence
+
+    def __post_init__(self) -> None:
+        if not callable(self.predict) or not callable(self.evidence):
+            raise ValueError("forward run binding is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateLedger:
+    """Bind one final label-free candidate to its published inode."""
 
     path: Path
     sha256: str
     identity: tuple[int, int]
+    directory_identity: tuple[int, int]
     records: int
 
 
@@ -142,8 +195,8 @@ class ForwardPredictionSession:
 
     _current: Callable[[], SpyResidualForwardInputs]
     _submit: Callable[
-        [SpyResidualForwardInputs, RawPredictions],
-        SpyResidualForwardInputs | PredictionDraft,
+        [SpyResidualForwardInputs],
+        SpyResidualForwardInputs | CandidateLedger,
     ]
 
     def current(self) -> SpyResidualForwardInputs:
@@ -151,14 +204,14 @@ class ForwardPredictionSession:
         return self._current()
 
     def submit(
-        self, batch: SpyResidualForwardInputs, predictions: RawPredictions,
-    ) -> SpyResidualForwardInputs | PredictionDraft:
+        self, batch: SpyResidualForwardInputs,
+    ) -> SpyResidualForwardInputs | CandidateLedger:
         """Retain one cross-section before authorizing the next cutoff."""
-        return self._submit(batch, predictions)
+        return self._submit(batch)
 
 
 TruthReader = Callable[
-    [PredictionDraft],
+    [CandidateLedger],
     Mapping[str, tuple[ResidualTruthRow, ...]],
 ]
 
@@ -429,27 +482,35 @@ def _grid_sha256(grid: ForwardGrid) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _header(grid: ForwardGrid) -> dict[str, object]:
+def _json_line(value: Mapping[str, object]) -> str:
+    return json.dumps(value, allow_nan=False, sort_keys=True) + "\n"
+
+
+def _header(
+    run: ForwardRunBinding, grid: ForwardGrid,
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    evidence = run.evidence(grid, records)
+    if not isinstance(evidence, Mapping) or not evidence:
+        raise ValueError("forward candidate evidence is invalid")
     return {
+        "batches": len(grid.triples),
+        "closure": dict(evidence),
+        "evidence_role": "label-free-forward-candidate",
         "grid_sha256": _grid_sha256(grid),
-        "provenance": "unbound-task-3-draft",
         "records": len(grid.triples) * len(FORWARD_UNIVERSE),
         "schema": 1,
-        "type": "spy-residual-forward-prediction-draft",
+        "type": "spy-residual-forward-candidate",
     }
 
 
 def _prediction_record(
-    series: str, triple: TimestampTriple, values: Sequence[float],
+    value: ForwardSeriesPrediction, triple: TimestampTriple,
     regime: str,
 ) -> dict[str, object]:
-    raw = tuple(values)
-    if len(raw) != len(SEEDS) or any(
-        type(value) not in (int, float) or not isfinite(value)
-        for value in raw
-    ):
-        raise ValueError("forward raw predictions are invalid")
-    predictions = tuple(map(float, raw))
+    if type(value) is not ForwardSeriesPrediction:
+        raise ValueError("forward prediction is invalid")
+    predictions = tuple(item.prediction for item in value.values)
     mean = fsum(predictions) / len(predictions)
     gated = gate_mean_predictions((mean,), (regime,))[0]
     return {
@@ -459,22 +520,26 @@ def _prediction_record(
         "gated_prediction": gated,
         "mean_prediction": mean,
         "raw_predictions": [
-            {"prediction": prediction, "seed": seed}
-            for seed, prediction in zip(SEEDS, predictions, strict=True)
+            {
+                "prediction": item.prediction,
+                "seed": item.seed,
+                "state_fingerprint": item.state_fingerprint,
+            }
+            for item in value.values
         ],
         "regime": regime,
         "schema": 1,
-        "series": series,
+        "series": value.series,
         "target": triple[2],
     }
 
 
 def _validate_ledger(
-    path: Path, grid: ForwardGrid,
+    path: Path, grid: ForwardGrid, run: ForwardRunBinding,
 ) -> tuple[Mapping[str, object], ...]:
     observed = read_canonical_json_lines(path)
     header, rows = observed[0], observed[1:]
-    if not _exact_json(header, _header(grid)) or \
+    if not _exact_json(header, _header(run, grid, rows)) or \
        len(rows) != len(grid.triples) * len(FORWARD_UNIVERSE):
         raise ValueError("forward prediction ledger closure changed")
     expected = (
@@ -488,17 +553,23 @@ def _validate_ledger(
             raise ValueError("forward prediction ledger row changed")
         try:
             values = tuple(
-                item["prediction"] for item in raw
-                if isinstance(item, Mapping)
+                SeedPrediction(
+                    item["seed"], item["state_fingerprint"],
+                    item["prediction"],
+                )
+                for item in raw if isinstance(item, Mapping)
             )
             regime = row["regime"]
-        except (KeyError, TypeError) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise ValueError("forward prediction ledger row changed") \
                 from error
         if len(values) != len(SEEDS) or \
            not isinstance(regime, str) or \
            not _exact_json(
-               row, _prediction_record(series, triple, values, regime),
+               row, _prediction_record(
+                   ForwardSeriesPrediction(series, values),
+                   triple, regime,
+               ),
            ):
             raise ValueError("forward prediction ledger row changed")
     return observed
@@ -553,13 +624,13 @@ def _exclusive_output(
 
 def _publish(
     path: Path, grid: ForwardGrid,
-    records: Sequence[Mapping[str, object]], verify: Verify,
+    records: Sequence[Mapping[str, object]], run: ForwardRunBinding,
+    verify: Verify,
     directory_identity: tuple[int, int],
-) -> PredictionDraft:
+) -> CandidateLedger:
     def write(file: TextIO) -> None:
-        for record in chain((_header(grid),), records):
-            json.dump(record, file, allow_nan=False, sort_keys=True)
-            file.write("\n")
+        for record in chain((_header(run, grid, records),), records):
+            file.write(_json_line(record))
 
     identity = _exclusive_output(
         path, write, verify, directory_identity,
@@ -567,23 +638,25 @@ def _publish(
     with freeze_inputs((path,)) as frozen:
         verify()
         verify_frozen(frozen)
-        _validate_ledger(frozen[0].snapshot, grid)
+        _validate_ledger(frozen[0].snapshot, grid, run)
         if _private_identity(path) != identity:
             raise ValueError("prediction ledger changed after publication")
-        return PredictionDraft(
-            path, frozen[0].sha256, identity, len(records),
+        return CandidateLedger(
+            path, frozen[0].sha256, identity, directory_identity,
+            len(records),
         )
 
 
 def _receipt(
-    draft: PredictionDraft, grid: ForwardGrid,
+    candidate: CandidateLedger, grid: ForwardGrid,
 ) -> dict[str, object]:
     return {
-        "draft": {
-            "identity": list(draft.identity),
-            "path": str(draft.path),
-            "records": draft.records,
-            "sha256": draft.sha256,
+        "candidate": {
+            "directory_identity": list(candidate.directory_identity),
+            "identity": list(candidate.identity),
+            "path": str(candidate.path),
+            "records": candidate.records,
+            "sha256": candidate.sha256,
         },
         "grid_sha256": _grid_sha256(grid),
         "schema": 1,
@@ -592,10 +665,11 @@ def _receipt(
 
 
 def _publish_receipt(
-    path: Path, draft: PredictionDraft, grid: ForwardGrid, verify: Verify,
+    path: Path, candidate: CandidateLedger, grid: ForwardGrid,
+    verify: Verify,
     directory_identity: tuple[int, int],
 ) -> tuple[tuple[int, int], str]:
-    expected = _receipt(draft, grid)
+    expected = _receipt(candidate, grid)
 
     def write(file: TextIO) -> None:
         json.dump(
@@ -676,9 +750,11 @@ def _prepare_forward_inputs(
     spy: ForwardSeriesFiles,
     prediction_ledger_path: Path,
     truth_receipt_path: Path,
+    run: ForwardRunBinding,
     verify_inputs: Verify,
+    expected_directory_identity: tuple[int, int],
 ) -> tuple[ForwardPredictionSession, TruthReader]:
-    """Build Task 4's internal chronological draft and one-shot truth gate."""
+    """Build one runtime-bound candidate stream and deferred truth gate."""
     stock_files = tuple(stocks)
     outputs = (prediction_ledger_path, truth_receipt_path)
     if type(grid) is not ForwardGrid or \
@@ -694,11 +770,19 @@ def _prepare_forward_inputs(
            for path in outputs
        ) or len(set(outputs)) != len(outputs) or \
        len({path.parent for path in outputs}) != 1 or \
-       not callable(verify_inputs):
+       type(run) is not ForwardRunBinding or \
+       not callable(verify_inputs) or \
+       type(expected_directory_identity) is not tuple or \
+       len(expected_directory_identity) != 2 or any(
+           type(value) is not int or value < 0
+           for value in expected_directory_identity
+       ):
         raise ValueError("forward preparation inputs are invalid")
     _absent(prediction_ledger_path, "prediction ledger")
     _absent(truth_receipt_path, "truth access receipt")
     directory_identity = _directory_identity(prediction_ledger_path.parent)
+    if directory_identity != expected_directory_identity:
+        raise ValueError("forward output directory changed")
     frozen = tuple(
         item for files in (*stock_files, spy)
         for item in (files.source, files.future)
@@ -734,7 +818,7 @@ def _prepare_forward_inputs(
     streams = (*stock_streams, spy_stream)
     lock, state, index = Lock(), "ready", 0
     records: list[Mapping[str, object]] = []
-    publication: PredictionDraft | None = None
+    publication: CandidateLedger | None = None
     current = _batch(index, stock_streams, spy_stream)
 
     def fail() -> None:
@@ -749,34 +833,38 @@ def _prepare_forward_inputs(
 
     def submit(
         batch: SpyResidualForwardInputs,
-        predictions: RawPredictions,
-    ) -> SpyResidualForwardInputs | PredictionDraft:
+    ) -> SpyResidualForwardInputs | CandidateLedger:
         nonlocal state, index, current, publication
         with lock:
             if state != "ready" or batch is not current:
                 raise ValueError("forward prediction session is not ready")
             state = "busy"
         try:
-            if not isinstance(predictions, Mapping) or \
-               tuple(predictions) != FORWARD_UNIVERSE:
+            predictions = run.predict(batch)
+            if type(predictions) is not tuple or \
+               tuple(item.series for item in predictions) != \
+                    FORWARD_UNIVERSE or any(
+                        type(item) is not ForwardSeriesPrediction
+                        for item in predictions
+                    ):
                 raise ValueError("forward prediction order changed")
             triple, regime = grid.triples[index], current.regime
             records.extend(
                 _prediction_record(
-                    series, triple, predictions[series], regime,
+                    prediction, triple, regime,
                 )
-                for series in FORWARD_UNIVERSE
+                for prediction in predictions
             )
             index += 1
             if index < len(grid.triples):
                 current = _batch(index, stock_streams, spy_stream)
-                result: SpyResidualForwardInputs | PredictionDraft = \
+                result: SpyResidualForwardInputs | CandidateLedger = \
                     current
                 next_state = "ready"
             else:
                 verify()
                 publication = _publish(
-                    prediction_ledger_path, grid, records, verify,
+                    prediction_ledger_path, grid, records, run, verify,
                     directory_identity,
                 )
                 result, next_state = publication, "published"
@@ -790,7 +878,7 @@ def _prepare_forward_inputs(
         return result
 
     def read_truth(
-        claim: PredictionDraft,
+        claim: CandidateLedger,
     ) -> Mapping[str, tuple[ResidualTruthRow, ...]]:
         nonlocal state
         with lock:
@@ -798,17 +886,21 @@ def _prepare_forward_inputs(
                 raise ValueError("forward truth is not authorized")
             state = "consumed"
         try:
-            if _private_identity(claim.path) != claim.identity or \
+            if _directory_identity(claim.path.parent) != \
+                    claim.directory_identity or \
+               _private_identity(claim.path) != claim.identity or \
                file_sha256(claim.path) != claim.sha256:
                 raise ValueError("prediction ledger changed")
             with freeze_inputs((claim.path,)) as frozen_ledger:
                 verify()
                 verify_frozen(frozen_ledger)
                 rows = _validate_ledger(
-                    frozen_ledger[0].snapshot, grid,
+                    frozen_ledger[0].snapshot, grid, run,
                 )
                 if len(rows) - 1 != claim.records or \
                    frozen_ledger[0].sha256 != claim.sha256 or \
+                   _directory_identity(claim.path.parent) != \
+                        claim.directory_identity or \
                    _private_identity(claim.path) != claim.identity:
                     raise ValueError("prediction publication changed")
                 receipt_identity, receipt_sha256 = _publish_receipt(
@@ -832,6 +924,8 @@ def _prepare_forward_inputs(
                     verify()
                     verify_frozen((*frozen_ledger, *frozen_receipt))
                     if _private_identity(claim.path) != claim.identity or \
+                       _directory_identity(claim.path.parent) != \
+                            claim.directory_identity or \
                        _private_identity(truth_receipt_path) != \
                             receipt_identity:
                         raise ValueError(

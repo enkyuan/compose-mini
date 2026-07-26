@@ -19,10 +19,14 @@ sys.path.insert(0, str(ROOT))
 from tools import arm_spy_residual_forward as armer
 from tools.data_v1 import CSV_HEADER
 from tools.files import file_sha256, freeze_inputs, write_json
+from tools.panel_contract import _directory_identity, selected_source_tree
 from tools.session_calendar import (
     SessionBin, SessionCalendar, expected_bins,
 )
-from tools.spy_residual_forward_contract import FORWARD_UNIVERSE
+from tools.spy_residual_forward_contract import (
+    FORWARD_RUN_ID, FORWARD_SOURCE_PATHS, FORWARD_UNIVERSE,
+)
+from tools.spy_residual_forward_inputs import ForwardRunBinding
 
 
 def rejects(function: Callable[..., object], *args: object) -> BaseException:
@@ -153,6 +157,9 @@ def historical(
             value, bins[-1].timestamp,
             tuple(zip(FORWARD_UNIVERSE, frozen[:-1], strict=True)),
             frozen[-1], lambda: None,
+            lambda: armer.ForwardCalibration(
+                object(), (), "a" * 64,
+            ),
         )
 
 
@@ -213,6 +220,17 @@ def test_rejects_report_and_grid_changes() -> None:
         rejects(enter_future, calendar_path, bundle)
 
 
+def test_rejects_nonregular_torch_package_entries() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="spy-forward-torch-tree-", dir=ROOT,
+    ) as directory:
+        package = Path(directory)
+        source = package / "__init__.py"
+        source.write_text("", encoding="ascii")
+        os.symlink(source, package / "alias.py")
+        rejects(armer._closed_source_tree, package)
+
+
 def test_public_lease_binds_the_calendar_first_grid() -> None:
     with tempfile.TemporaryDirectory(
         prefix="spy-forward-armer-public-", dir=ROOT,
@@ -234,26 +252,47 @@ def test_public_lease_binds_the_calendar_first_grid() -> None:
                 )
                 outputs = {
                     "FORWARD_CALENDAR": binding,
-                    "FORWARD_DRAFT": run / "prediction-draft.jsonl",
+                    "FORWARD_CANDIDATE": run / "candidate.jsonl",
                     "FORWARD_TRUTH_RECEIPT": run / "truth-access.json",
                 }
-                with patch.multiple(armer, **outputs):
+                class Runtime:
+                    def bind(self, provenance: object) -> ForwardRunBinding:
+                        assert provenance == {"test": True}
+                        return ForwardRunBinding(
+                            lambda _batch: (),
+                            lambda _grid, _rows: {"test": True},
+                        )
+
+                with patch.multiple(armer, **outputs), patch.object(
+                    armer, "_forward_runtime", return_value=Runtime(),
+                ), patch.object(
+                    armer, "_provenance", return_value={"test": True},
+                ):
                     with armer.arm_forward_inputs(bundle) as lease:
                         lease()
                         assert not hasattr(lease, "prepare")
+                        assert not hasattr(lease, "_calibration")
                         assert len(lease.grid.target_sessions) == 60
                         assert len(lease.grid.triples) == 780
                         assert lease.grid.target_sessions[0] == \
                             date(2026, 2, 24)
-                        session, _ = lease._prepare()
-                        current = session.current()
                         rejects(lease._prepare)
-                        rejects(session.submit, current, {})
+                        context = armer.ForwardRunContext(
+                            selected_source_tree(ROOT, FORWARD_SOURCE_PATHS),
+                            FORWARD_RUN_ID, _directory_identity(run),
+                        )
+                        session, _ = lease._prepare(
+                            context,
+                        )
+                        current = session.current()
+                        rejects(lease._prepare, context)
+                        rejects(session.submit, current)
 
 
 def main() -> None:
     test_requires_one_exact_massive_bundle()
     test_rejects_report_and_grid_changes()
+    test_rejects_nonregular_torch_package_entries()
     test_public_lease_binds_the_calendar_first_grid()
     print("SPY residual forward armer tests passed")
 

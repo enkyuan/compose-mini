@@ -24,7 +24,7 @@ except ModuleNotFoundError as error:
 
 from test_relative_context_contract import MASTER, source_phase
 from tools.context_diagnostic_contract import (
-    ContextFit, context_phase_sha256,
+    ContextFit, ContextPhase, _phase_value, context_phase_sha256,
 )
 from tools.experiment import stock_macro_linear_model
 from tools.relative_context import (
@@ -135,13 +135,27 @@ def forward_data(
     )
 
 
-def prepared_phase() -> ResidualPreparedPhase:
-    source = source_phase()
+def prepared_phase(
+    name: str = "fold-1",
+    evaluation: tuple[str, ...] | None = None,
+) -> ResidualPreparedPhase:
+    source = source_phase(name)
+    master = MASTER
+    if evaluation is not None:
+        if len(evaluation) != len(source.evaluation_rows):
+            raise ValueError("synthetic evaluation universe changed")
+        master = (*MASTER[:-len(evaluation)], *evaluation)
+        value = _phase_value(source)
+        for row, series in zip(
+            value["evaluation_rows"], evaluation, strict=True,
+        ):
+            row["series"] = series
+        source = ContextPhase.parse(value, master)
     count = source.training_rows[0][1]
     paired = paired_training(count)
     training = tuple(
         (series, training_data(index, paired))
-        for index, series in enumerate(MASTER)
+        for index, series in enumerate(master)
     )
     forward = []
     for index, (series, size, _) in enumerate(source.evaluation_rows):
@@ -177,12 +191,22 @@ class StockProbe(torch.nn.Module):
 class MarketProbe(torch.nn.Module):
     def __init__(self, _config: object, value: float = 1.25) -> None:
         super().__init__()
+        self.config = _config
+        self.num_heads = _config.num_heads
+        self.head_dim = _config.model_dim // _config.num_heads
         self.value = torch.nn.Parameter(torch.tensor(value))
+        self.register_buffer(
+            "position", torch.tensor(0.0), persistent=False,
+        )
 
     def forward(
         self, stock: torch.Tensor, spy: torch.Tensor,
     ) -> torch.Tensor:
-        return self.value.expand(len(stock))
+        expected = self.config.num_heads / (
+            self.config.model_dim // self.config.num_heads
+        )
+        scale = (self.num_heads / self.head_dim) / expected
+        return ((self.value + self.position) * scale).expand(len(stock))
 
 
 @dataclass
@@ -257,7 +281,8 @@ def fit_all(
     runtime: ResidualRuntime, prepared: ResidualPreparedPhase,
 ) -> tuple[dict[ContextFit, str], dict[ContextFit, object]]:
     fingerprints, tokens = {}, {}
-    for fit in expected_residual_fits(MASTER, prepared.source):
+    master = tuple(series for series, _ in prepared.training)
+    for fit in expected_residual_fits(master, prepared.source):
         fingerprint, loss, token = runtime.fit_one(fit)
         assert len(fingerprint) == 64 and math.isfinite(loss)
         fingerprints[fit], tokens[fit] = fingerprint, token

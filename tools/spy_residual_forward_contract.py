@@ -2,10 +2,10 @@
 
 from collections.abc import Mapping
 
-from tools.panel_contract import _exact_json
+from tools.panel_contract import FileBinding, _exact_json
 from tools.relative_context_contract import (
     HISTORY_BARS, HORIZON_BARS, INTERVAL_MINUTES, SEEDS,
-    SPY_RESIDUAL_TARGET,
+    RESIDUAL_SOURCE_PATHS, SPY_RESIDUAL_TARGET,
 )
 from tools.spy_residual_gate import SPY_DIRECTION_SCALE
 from tools.universe_cross_section import CROSS_SECTION_SEED
@@ -13,6 +13,20 @@ from tools.universe_scaling import (
     BOOTSTRAP_BLOCK_DAYS, BOOTSTRAP_REPLICATES,
 )
 
+FORWARD_RUN_ID = "h13-spy-direction-forward-20260726-01"
+FORWARD_CONFIG = FileBinding(
+    "experiments/executable-h13-spy-direction-forward.example.json",
+    "7714ac740f45c940a110eb52f7fa1a0d86706b4d1ba91184ff57cab8fbd23510",
+)
+FORWARD_SOURCE_PATHS = tuple(sorted({
+    *RESIDUAL_SOURCE_PATHS,
+    "tools/arm_spy_residual_forward.py",
+    "tools/run_spy_residual_forward.py",
+    "tools/spy_residual_forward_contract.py",
+    "tools/spy_residual_forward_inputs.py",
+    "tools/spy_residual_forward_runtime.py",
+    "tools/spy_residual_gate.py",
+}))
 FORWARD_SOURCES = (
     (
         "residual_attempt",
