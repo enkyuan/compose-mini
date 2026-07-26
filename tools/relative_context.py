@@ -17,6 +17,7 @@ from tools.data_v1 import EXECUTABLE_RETURN_TARGET
 from tools.relative_context_contract import SPY_RESIDUAL_TARGET
 from tools.session_samples import SampleRows
 from tools.train import ForecastTransformer, TrainingData, Windows
+from tools.universe_forward_runner import ForwardFeatureWindows
 
 _SHARED_WINDOW_DATA = ("features", "targets", "references", "outcomes")
 
@@ -108,6 +109,30 @@ class MarketContextWindows(Dataset):
     def __getitem__(self, index: int) -> tuple[object, ...]:
         stock, target, *_ = self.stock[index]
         return (stock, self.spy[index][0]), target
+
+
+class MarketContextForwardWindows(Dataset):
+    """Pair label-free stock and SPY windows after timestamp authentication."""
+
+    def __init__(
+        self, stock: ForwardFeatureWindows, spy: ForwardFeatureWindows,
+    ) -> None:
+        windows = (stock, spy)
+        if any(type(value) is not ForwardFeatureWindows for value in windows) \
+           or not len(stock) or len(stock) != len(spy) or \
+           stock.seq_len != spy.seq_len or \
+           stock.feature_set != spy.feature_set or any(
+               not _prepared(value.features) or value.features.ndim != 2
+               for value in windows
+           ) or stock.features.shape[1] != spy.features.shape[1]:
+            raise ValueError("stock and SPY forward windows are incompatible")
+        self.stock, self.spy = windows
+
+    def __len__(self) -> int:
+        return len(self.stock)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.stock[index], self.spy[index]
 
 
 class MarketContextTransformer(nn.Module):

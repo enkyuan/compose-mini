@@ -98,7 +98,7 @@ helpers, GitButler.
 $PYTHON tests/python/test_relative_context_contract.py
 ```
 
-- [ ] Create a signed local checkpoint:
+- [x] Create a signed local checkpoint:
 
 ```text
 feat(training): bind residual calibration inputs
@@ -141,30 +141,30 @@ Do not arm an attempt in this task.
 - Add
   `prepare_residual_phase(context: ContextAttempt, source_phase: ContextPhase, phase: ResidualPhaseInput, lease: ContextLease, spy_csv: FrozenInput) -> tuple[ResidualPreparedPhase, Callable[[], Mapping[str, tuple[ResidualTruthRow, ...]]]]`.
 
-- [ ] Reuse `context_all_phase_rows()` for stocks and build one canonical SPY
+- [x] Reuse `context_all_phase_rows()` for stocks and build one canonical SPY
   `SessionSamples` sequence.
-- [ ] Reuse `align_spy_rows()` for every stock and phase. Require full equality
+- [x] Reuse `align_spy_rows()` for every stock and phase. Require full equality
   of `(as_of, entry, target)` triples; never split SPY independently.
-- [ ] Recompute aggregate training and evaluation grid digests and require
+- [x] Recompute aggregate training and evaluation grid digests and require
   equality with the authenticated source `ContextPhase`.
-- [ ] Hash each stock and aligned SPY prefix only through the last training
+- [x] Hash each stock and aligned SPY prefix only through the last training
   target. Build all 55 ordered `ResidualScalerInput` records per phase.
-- [ ] Prove evaluation-label changes do not alter the scaler-input digest,
+- [x] Prove evaluation-label changes do not alter the scaler-input digest,
   while any training-prefix, row-count, order, or grid change does.
-- [ ] Keep arming label-free: timestamp and byte-prefix hashing is allowed;
+- [x] Keep arming label-free: timestamp and byte-prefix hashing is allowed;
   numeric bar parsing, tensor preparation, training, prior prediction reads,
   and backtesting are not.
-- [ ] Build each stock and SPY forward window from bytes ending at the final
+- [x] Build each stock and SPY forward window from bytes ending at the final
   `as_of` row. Neither `entry` nor `target` bytes may enter a forward dataset.
 - [ ] Call the returned truth reader only after the run claim, fit ledger,
   prediction ledger, and prediction receipt are durable, frozen, and
-  revalidated.
-- [ ] Add a per-prediction metamorphic test: for each evaluation sample,
+  revalidated. Task 6 owns this runner-level gate; Task 2 only defers the read.
+- [x] Add a per-prediction metamorphic test: for each evaluation sample,
   change rows strictly after that sample's own `as_of` and compare only that
   sample's stock input, SPY-conditioned input, and encoded prediction. Each
   must remain byte-identical; later overlapping samples may legitimately use
   a row after the earlier sample's `as_of`.
-- [ ] Run:
+- [x] Run:
 
 ```sh
 $PYTHON tests/python/test_relative_context_inputs.py

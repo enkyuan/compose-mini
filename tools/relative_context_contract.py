@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 
@@ -342,6 +343,23 @@ class ResidualScalerInput:
     spy_training_prefix_sha256: str
     training_rows: int
     training_grid_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualTruthRow:
+    """Bind one residual prediction cell to its development-only truth."""
+
+    as_of: str
+    entry: str
+    target: str
+    value: float
+
+    def __post_init__(self) -> None:
+        times = (self.as_of, self.entry, self.target)
+        if any(type(value) is not str or not value for value in times) or \
+           not self.as_of < self.entry <= self.target or \
+           type(self.value) not in (int, float) or not isfinite(self.value):
+            raise ValueError("residual truth row is invalid")
 
 
 def residual_scaler_inputs_sha256(

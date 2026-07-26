@@ -5,6 +5,8 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import hashlib
+import math
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,7 +22,7 @@ from tools.relative_context_contract import (
     HISTORY_BARS, HORIZON_BARS, MODELS, PHASE_BUDGETS,
     RESIDUAL_BENCHMARK, RESIDUAL_CALENDAR, RESIDUAL_CONFIG,
     RESIDUAL_SOURCE, SPY_RESIDUAL_TARGET, ResidualPhaseInput,
-    ResidualScalerInput, expected_residual_fits,
+    ResidualScalerInput, ResidualTruthRow, expected_residual_fits,
     expected_residual_protocol, expected_source_context_outcome,
     expected_spy_fetch_report, parse_residual_phases,
     residual_scaler_inputs_sha256, validate_residual_protocol,
@@ -301,6 +303,37 @@ def verify_scaler_closure() -> None:
     raises(residual_scaler_inputs_sha256, MASTER[:-1], inputs[:-1])
 
 
+def verify_truth_rows() -> None:
+    row = ResidualTruthRow(
+        "2026-01-02T14:30:00Z", "2026-01-02T15:00:00Z",
+        "2026-01-02T21:00:00Z", 0.01,
+    )
+    assert row.value == 0.01
+    raises(setattr, row, "value", 0.02)
+    for values in (
+        ("", row.entry, row.target, row.value),
+        (row.entry, row.as_of, row.target, row.value),
+        (row.as_of, row.target, row.entry, row.value),
+        (row.as_of, row.entry, row.target, True),
+        (row.as_of, row.entry, row.target, math.nan),
+        (row.as_of, row.entry, row.target, math.inf),
+    ):
+        raises(ResidualTruthRow, *values)
+
+
+def verify_controller_import() -> None:
+    code = (
+        "import sys;"
+        f"sys.path.insert(0,{str(ROOT)!r});"
+        "import tools.spy_residual_controller;"
+        "assert 'torch' not in sys.modules"
+    )
+    subprocess.run(
+        (sys.executable, "-I", "-B", "-c", code),
+        check=True, cwd=ROOT,
+    )
+
+
 def verify_phase_closure() -> None:
     sources = (source_phase(), source_phase("calibration"))
     scalers = tuple(
@@ -409,6 +442,8 @@ def main() -> None:
     verify_exact_protocol()
     verify_rejections()
     verify_scaler_closure()
+    verify_truth_rows()
+    verify_controller_import()
     verify_phase_closure()
     verify_spy_audit()
     print("relative-context contract tests passed")

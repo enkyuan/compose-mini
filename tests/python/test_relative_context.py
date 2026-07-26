@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Verify leakage-safe SPY-relative targets and completed market context."""
 
+from array import array
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 import math
+import struct
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,13 +22,14 @@ from torch.utils.data import DataLoader
 from tools.artifact_v1 import Config
 from tools.data_v1 import CLOSE_RETURN_TARGET, EXECUTABLE_RETURN_TARGET
 from tools.relative_context import (
-    MarketContextTransformer, MarketContextWindows, SPY_RESIDUAL_TARGET,
-    spy_residual_data,
+    MarketContextForwardWindows, MarketContextTransformer,
+    MarketContextWindows, SPY_RESIDUAL_TARGET, spy_residual_data,
 )
 from tools.session_samples import SampleRows
 from tools.train import (
     TrainingData, Windows, evaluate, mean_loss, train_epoch,
 )
+from tools.universe_forward_runner import ForwardFeatureWindows
 
 
 def training_data(
@@ -162,6 +165,84 @@ def verify_causal_windows() -> None:
     assert not hasattr(residual.train, "references")
 
 
+def forward_windows(
+    offset: float = 0.0, *,
+    samples: tuple[SampleRows, ...] = (
+        SampleRows(2, 3, 4, 10), SampleRows(3, 4, 5, 11),
+    ),
+) -> ForwardFeatureWindows:
+    rows = torch.arange(20, dtype=torch.float32).add_(offset).tolist()
+    return ForwardFeatureWindows(
+        array("f", rows), samples, 2, "ohlcv",
+        torch.zeros(5), torch.ones(5),
+    )
+
+
+def verify_forward_windows() -> None:
+    stock = forward_windows()
+    spy = forward_windows(100.0)
+    paired = MarketContextForwardWindows(stock, spy)
+    assert len(paired) == 2
+    assert paired.stock is stock and paired.spy is spy
+    assert len(paired[0]) == 2
+    torch.testing.assert_close(paired[0][0], stock[0])
+    torch.testing.assert_close(paired[0][1], spy[0])
+    assert not hasattr(paired, "targets")
+    sparse = forward_windows(100.0)
+    sparse.starts = (0, 2)
+    assert MarketContextForwardWindows(stock, sparse).spy.starts != \
+        stock.starts
+
+    for index, sample in enumerate((
+        SampleRows(2, 3, 4, 10), SampleRows(3, 4, 5, 11),
+    )):
+        original = MarketContextForwardWindows(
+            forward_windows(), forward_windows(100.0),
+        )
+        changed = MarketContextForwardWindows(
+            forward_windows(), forward_windows(100.0),
+        )
+        prediction = struct.pack(
+            "<f", float(
+                original[index][0].sum() +
+                original[index][1][-1].sum()
+            ),
+        )
+        changed.stock.features[sample.as_of + 1:] += 1_000.0
+        changed.spy.features[sample.as_of + 1:] -= 1_000.0
+        torch.testing.assert_close(changed[index][0], original[index][0])
+        torch.testing.assert_close(changed[index][1], original[index][1])
+        assert struct.pack(
+            "<f", float(
+                changed[index][0].sum() + changed[index][1][-1].sum()
+            ),
+        ) == prediction
+        if index + 1 < len(changed):
+            assert not torch.equal(
+                changed[index + 1][0], original[index + 1][0],
+            )
+            assert not torch.equal(
+                changed[index + 1][1], original[index + 1][1],
+            )
+
+    rejects(lambda: MarketContextForwardWindows(stock, object()))
+    rejects(lambda: MarketContextForwardWindows(
+        stock, forward_windows(samples=(SampleRows(2, 3, 4, 10),)),
+    ))
+    different = forward_windows()
+    different.seq_len = 1
+    rejects(lambda: MarketContextForwardWindows(stock, different))
+    different.seq_len, different.feature_set = 2, "stationary-v1"
+    rejects(lambda: MarketContextForwardWindows(stock, different))
+    for features in (
+        different.features[:, :-1],
+        different.features.double(),
+        torch.full_like(different.features, math.nan),
+    ):
+        different.feature_set, different.features = "ohlcv", features
+        rejects(lambda: MarketContextForwardWindows(stock, different))
+
+
 def verify_context_model() -> None:
     torch.manual_seed(17)
     config = Config(
@@ -208,6 +289,7 @@ def main() -> None:
     verify_residual_targets()
     verify_alignment_guards()
     verify_causal_windows()
+    verify_forward_windows()
     verify_context_model()
     print("relative-context tests passed")
 
