@@ -1,0 +1,136 @@
+{
+  "candidate": {
+    "gate": {
+      "active_output": "scale-times-mean-prediction",
+      "comparison": "greater-than-or-equal",
+      "feature": "log(spy.close[as_of]/spy.close[as_of-16])",
+      "inactive_output": 0.0,
+      "scale": 0.4029492434939931,
+      "threshold": 0.0
+    },
+    "history_bars": 17,
+    "model": "panel_transformer",
+    "name": "spy-direction-gated-five-seed-mean",
+    "seed_aggregation": "arithmetic-mean-before-gate",
+    "target_horizon_bars": 13,
+    "target_kind": "spy-residual-executable-return-v1"
+  },
+  "evidence_role": "preregistered-forward-test-not-yet-executed",
+  "forward_window": {
+    "coverage": "complete-universe-and-spy-grids-or-fail",
+    "entry_boundary": "strictly-after-final-inspected-calibration-target",
+    "first_target_session": "earliest-full-target-session",
+    "interval_minutes": 30,
+    "missing_coverage": "fail-without-changing-window",
+    "optional_stopping": false,
+    "sample_selection": "all-canonical-triples-with-target-in-fixed-session-set",
+    "sampling": "session_samples-identical-canonical-triples",
+    "session": "regular",
+    "target_session_count": 60,
+    "target_session_sequence": "first-plus-next-calendar-sessions",
+    "window_derivation": "bound-calendar-before-market-data"
+  },
+  "gates": {
+    "decision_paired_mse_gain_lower_bound_vs_unchanged_five_seed_mean_min_exclusive": 0.0,
+    "decision_paired_mse_gain_lower_bound_vs_zero_min_exclusive": 0.0,
+    "minimum_leave_one_stock_out_raw_residual_r2_vs_zero_exclusive": 0.0,
+    "minimum_stocks_with_positive_mse_gain_vs_zero": 6,
+    "policy": "all-required",
+    "pooled_raw_residual_r2_vs_zero_min_exclusive": 0.0
+  },
+  "locks": {
+    "absolute_forecast_authorized": false,
+    "backtest_run": false,
+    "candidate_search_authorized": false,
+    "forward_data_refit_authorized": false,
+    "policy_selected": false,
+    "price_reconstruction_authorized": false,
+    "trading_authorized": false,
+    "truth_access_before_verified_prediction_ledger_authorized": false
+  },
+  "metrics": {
+    "bootstrap": {
+      "block_sessions": [
+        5,
+        10,
+        20
+      ],
+      "decision_block_sessions": 20,
+      "interval": "equal-tailed-95-percentile",
+      "method": "shared-circular-target-session-block",
+      "replicates": 10000,
+      "seed": 20260725,
+      "weighting": "stock-macro"
+    },
+    "descriptive": [
+      "mean-absolute-error",
+      "direction-accuracy",
+      "market-regime-cells",
+      "seed-dispersion",
+      "nondecision-block-intervals"
+    ],
+    "descriptive_role": "report-only-cannot-rescue-failed-gate",
+    "leave_one_stock_out_convention": "scoring-omission-only-without-refit",
+    "paired_gain": "reference-squared-error-minus-candidate-squared-error",
+    "raw_residual_r2_convention": "one-minus-sse-over-uncentered-zero-baseline-truth-energy",
+    "references": [
+      "zero",
+      "unchanged-five-seed-mean"
+    ],
+    "stock_win_convention": "strictly-positive-per-stock-mean-paired-squared-error-gain"
+  },
+  "schema": 1,
+  "sources": {
+    "alignment_report": {
+      "path": "reports/h13-spy-residual-20260725-01-alignment/alignment.json",
+      "sha256": "8aee02761357927097a74d13c3d62271fd57f629a4eeb6ac1bebc84a77fd3fa1"
+    },
+    "calibration_fits": {
+      "path": "reports/h13-spy-residual-20260725-01/calibration-fits.jsonl",
+      "sha256": "93237f9962a64665950252094e9119d1e1a806d7288af0d5c331cd724954203e"
+    },
+    "residual_attempt": {
+      "path": "experiments/h13-spy-residual-20260725-01-attempt.json",
+      "sha256": "0fb90623c90b418dfff93d35dde1bb49024c25d3b2b27b799ce752b8deed9ea3"
+    },
+    "residual_outcome": {
+      "path": "experiments/h13-spy-residual-20260725-01-outcome.json",
+      "sha256": "132c17cd7dde7abcdf625581d6b399d7e9b0011f4a9c8bc6d4d0f4065d3a0488"
+    }
+  },
+  "transformer_states": [
+    {
+      "seed": 7,
+      "state_fingerprint": "fe12e7e77d81eb6761defa27f423739e634d55c608beb30d9125b2631fc1049b"
+    },
+    {
+      "seed": 19,
+      "state_fingerprint": "3e2ccdc591baaf9d3b94efdeeddd86b6fed913bf7ea7fce29b6ec38f0c0fc2d2"
+    },
+    {
+      "seed": 31,
+      "state_fingerprint": "3f09fcd8c5af5e17019ed4f907c4ade5d2a62c77a958718341efff40bdedb770"
+    },
+    {
+      "seed": 43,
+      "state_fingerprint": "723554c420e19286431ce476d9f5ebfe4ed4941c3d5cbbd49c4bdae0b99f11e6"
+    },
+    {
+      "seed": 61,
+      "state_fingerprint": "3a5309a9aa318eb2b4093a95a7185610f6cce5a1f15d3ba2856b8a8bdae7132e"
+    }
+  ],
+  "universe": [
+    "KRYS",
+    "TGT",
+    "STM",
+    "SSNC",
+    "NWL",
+    "AAON",
+    "GEV",
+    "SWKS",
+    "BMRN",
+    "ACI",
+    "HUN"
+  ]
+}
