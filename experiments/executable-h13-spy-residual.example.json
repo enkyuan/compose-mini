@@ -1,0 +1,118 @@
+{
+  "alignment_horizon_bars": 13,
+  "baselines": [
+    "zero"
+  ],
+  "batch_size": 128,
+  "bootstrap": {
+    "applies_to": "stock-macro-paired-absolute-error",
+    "block_days": [
+      5,
+      10,
+      20
+    ],
+    "interval": "equal-tailed-95-percentile",
+    "method": "shared-circular-date-block",
+    "replicates": 10000,
+    "seed": 20260725,
+    "weighting": "stock-macro"
+  },
+  "data_interval": {
+    "end": "2026-07-21",
+    "minutes": 30,
+    "start": "2024-11-01"
+  },
+  "evidence_role": "development-calibration-not-forward-clean",
+  "feature_set": "ohlcv",
+  "history_bars": 17,
+  "locks": {
+    "absolute_forecast_authorized": false,
+    "backtest_run": false,
+    "forward_clean": false,
+    "trading_authorized": false,
+    "universe_expansion_authorized": false
+  },
+  "metrics": {
+    "primary": [
+      "pooled-raw-residual-r2-vs-zero",
+      "stock-macro-paired-absolute-error"
+    ],
+    "secondary": [
+      "pooled-timestamp-centered-cross-sectional-r2",
+      "mean-valid-timestamp-spearman-rank-ic"
+    ]
+  },
+  "model_inputs": {
+    "global_mlp": "stock-only",
+    "global_ridge": "stock-only",
+    "panel_transformer": "stock-plus-final-completed-spy-row"
+  },
+  "models": [
+    "global_ridge",
+    "global_mlp",
+    "panel_transformer"
+  ],
+  "neural_checkpoint_policy": "reuse-context-prior-selections",
+  "output_role": "residual-only-not-executable-return",
+  "paired_absolute_error_comparisons": [
+    [
+      "global_ridge",
+      "zero"
+    ],
+    [
+      "global_mlp",
+      "zero"
+    ],
+    [
+      "global_mlp",
+      "global_ridge"
+    ],
+    [
+      "panel_transformer",
+      "zero"
+    ],
+    [
+      "panel_transformer",
+      "global_ridge"
+    ],
+    [
+      "panel_transformer",
+      "global_mlp"
+    ]
+  ],
+  "paired_absolute_error_convention": "reference-mae-minus-candidate-mae-positive",
+  "phases": [
+    {
+      "name": "fold-1",
+      "updates_per_checkpoint": 302
+    },
+    {
+      "name": "calibration",
+      "updates_per_checkpoint": 349
+    }
+  ],
+  "residualization": "stock-minus-spy-fixed-beta-1",
+  "sampling_policy": "stock-balanced",
+  "scalers": {
+    "residual_target": "per-stock-training-prefix",
+    "spy_features": "per-stock-aligned-training-prefix",
+    "stock_features": "per-stock-training-prefix"
+  },
+  "seed_aggregation": {
+    "primary": "arithmetic-mean-predictions-before-metrics",
+    "report": {
+      "per_observation": "population-standard-deviation-across-seeds",
+      "summary": "stock-macro-mean-over-common-grid"
+    }
+  },
+  "seeds": [
+    7,
+    19,
+    31,
+    43,
+    61
+  ],
+  "target_horizon_bars": 13,
+  "target_kind": "spy-residual-executable-return-v1",
+  "timestamp_policy": "exact-triples-and-common-cross-section"
+}
