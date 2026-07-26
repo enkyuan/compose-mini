@@ -2,31 +2,46 @@
 """Verify the exact Torch-free SPY-residual calibration protocol."""
 
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
+from types import MappingProxyType
 import hashlib
 import math
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
 
+from tools.analyze_context_cross_section import ANALYSIS_SOURCE_PATHS
+from tools.context_diagnostic_contract import (
+    CONTEXT_CONFIG, CONTEXT_SOURCE_PATHS, PYTHON_FLAGS, SOURCE_EVIDENCE,
+    ContextAttempt,
+)
 from test_context_diagnostic_finalizer import MASTER, phase_for
 from tools.context_diagnostic_contract import (
     ContextPhase, _phase_value, context_phase_sha256,
 )
-from tools.panel_contract import read_canonical_json
+from tools.files import write_json
+from tools.panel_contract import (
+    ExecutableBinding, FileBinding, SourceTree, TorchIdentity, _tree_digest,
+    read_canonical_json,
+)
 from tools.relative_context_contract import (
+    EXPECTED_RESIDUAL_FITS_PER_PHASE,
+    EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE,
     HISTORY_BARS, HORIZON_BARS, MODELS, PHASE_BUDGETS,
     RESIDUAL_BENCHMARK, RESIDUAL_CALENDAR, RESIDUAL_CONFIG,
-    RESIDUAL_SOURCE, SPY_RESIDUAL_TARGET, ResidualPhaseInput,
-    ResidualScalerInput, ResidualTruthRow, expected_residual_fits,
+    RESIDUAL_SOURCE, RESIDUAL_SOURCE_PATHS, SPY_RESIDUAL_TARGET,
+    ResidualAttempt, ResidualPhaseInput, ResidualReceipt,
+    ResidualScalerInput, ResidualTruthRow, expected_residual_command,
+    expected_residual_fits,
     expected_residual_predictions, expected_residual_protocol,
     expected_source_context_outcome, expected_spy_fetch_report,
     parse_residual_phases, residual_fit_provenance_id,
-    residual_fit_record, residual_prediction_record,
+    residual_fit_record, residual_phase_sha256, residual_prediction_record,
     residual_scaler_inputs_sha256, validate_residual_fit_records,
     validate_residual_prediction_records, validate_residual_protocol,
     validate_source_context_outcome, validate_spy_fetch_report,
@@ -108,6 +123,87 @@ def spy_audit() -> dict[str, object]:
     }
 
 
+def source_context(root: Path) -> ContextAttempt:
+    phases = (source_phase(), source_phase("calibration"))
+    source_files = tuple(
+        FileBinding(path, digest(path)) for path in CONTEXT_SOURCE_PATHS
+    )
+    package_files = (FileBinding("torch.py", digest("torch.py")),)
+    python = str(Path(sys.executable).resolve())
+    executable = ExecutableBinding(
+        python, digest("source-python"), "synthetic",
+    )
+    return ContextAttempt(
+        RESIDUAL_SOURCE["context_attempt"].path,
+        "h13-context-diagnostic-20260725-03",
+        "reports/h13-context-diagnostic-20260725-03",
+        "1" * 40,
+        tuple(SOURCE_EVIDENCE.items()),
+        CONTEXT_CONFIG,
+        phases,
+        SourceTree(str(root), source_files, _tree_digest(source_files)),
+        executable,
+        (python, *PYTHON_FLAGS),
+        TorchIdentity(
+            executable, "synthetic", None, None, "cpu",
+            SourceTree(
+                str(root / "torch"), package_files,
+                _tree_digest(package_files),
+            ),
+        ),
+        MappingProxyType({
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX":
+                "reports/h13-context-diagnostic-20260725-03/.pycache",
+        }),
+    )
+
+
+def residual_attempt_value(
+    root: Path, context: ContextAttempt,
+    run_id: str = "spy-residual-run",
+) -> dict[str, object]:
+    files = tuple(
+        FileBinding(path, digest(path)) for path in RESIDUAL_SOURCE_PATHS
+    )
+    return {
+        "attempt_path": f"experiments/{run_id}-attempt.json",
+        "benchmark": {
+            name: asdict(binding)
+            for name, binding in RESIDUAL_BENCHMARK.items()
+        },
+        "config": asdict(RESIDUAL_CONFIG),
+        "environment": {
+            **dict(context.environment),
+            "PYTHONPYCACHEPREFIX": f"reports/{run_id}/.pycache",
+        },
+        "implementation_commit": "2" * 40,
+        "phases": [
+            phase_value(
+                phase,
+                residual_scaler_inputs_sha256(
+                    MASTER, scaler_inputs(phase.phase),
+                ),
+            )
+            for phase in context.phases
+        ],
+        "primary_python": asdict(context.primary_python),
+        "run_dir": f"reports/{run_id}",
+        "run_id": run_id,
+        "schema": 1,
+        "source": {
+            name: asdict(binding)
+            for name, binding in RESIDUAL_SOURCE.items()
+        },
+        "source_tree": asdict(SourceTree(
+            str(root), files, _tree_digest(files),
+        )),
+        "status": "armed",
+        "torch_argv": list(context.torch_argv),
+        "torch_probe": asdict(context.torch_probe),
+    }
+
+
 def verify_fixed_inputs() -> None:
     assert RESIDUAL_CONFIG.path == \
         "experiments/executable-h13-spy-residual.example.json"
@@ -127,6 +223,22 @@ def verify_fixed_inputs() -> None:
         "ce8de54c6fddac96d2866687e97cea2367579051c9da5b360ad4ccda53c1ed2b"
     assert RESIDUAL_CALENDAR.sha256 == \
         "b1e0835a60624a67e21f7941ac00ece6c488937989560bbd4d0333afd869e5f8"
+    assert RESIDUAL_SOURCE_PATHS == tuple(sorted({
+        *ANALYSIS_SOURCE_PATHS,
+        *CONTEXT_SOURCE_PATHS,
+        "tools/arm_spy_residual.py",
+        "tools/finalize_spy_residual.py",
+        "tools/relative_context.py",
+        "tools/relative_context_contract.py",
+        "tools/relative_context_inputs.py",
+        "tools/run_spy_residual.py",
+        "tools/spy_residual_controller.py",
+        "tools/spy_residual_runtime.py",
+    }))
+    assert (
+        EXPECTED_RESIDUAL_FITS_PER_PHASE,
+        EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE,
+    ) == (11, 121)
 
 
 def verify_source_outcome() -> None:
@@ -524,6 +636,237 @@ def verify_evidence_ledgers() -> None:
     )
 
 
+def verify_attempt_contract() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="residual-attempt-", dir=ROOT,
+    ) as parent:
+        root = Path(parent).resolve()
+        (root / "experiments").mkdir()
+        context = source_context(root)
+        value = residual_attempt_value(root, context)
+        logical = Path(value["attempt_path"])
+        path = root / logical
+
+        def parse(raw: dict[str, object]) -> ResidualAttempt:
+            write_json(path, raw)
+            return ResidualAttempt.read(path, logical, root, context)
+
+        attempt = parse(value)
+        assert (
+            attempt.attempt_path, attempt.run_id, attempt.run_dir,
+        ) == (
+            "experiments/spy-residual-run-attempt.json",
+            "spy-residual-run",
+            "reports/spy-residual-run",
+        )
+        assert dict(attempt.source) == RESIDUAL_SOURCE
+        assert dict(attempt.benchmark) == RESIDUAL_BENCHMARK
+        assert attempt.config == RESIDUAL_CONFIG
+        assert attempt.phases == parse_residual_phases(
+            value["phases"], context.phases,
+        )
+        assert attempt.source_tree.root == str(root)
+        assert attempt.primary_python == context.primary_python
+        assert attempt.torch_argv == context.torch_argv
+        assert attempt.torch_probe == context.torch_probe
+        assert dict(attempt.environment) == value["environment"]
+        assert attempt.runner_argv == (
+            "tools/run_spy_residual.py",
+            "experiments/spy-residual-run-attempt.json",
+        )
+        assert attempt.source_binding("context_attempt") == \
+            RESIDUAL_SOURCE["context_attempt"]
+        assert attempt.benchmark_binding("spy_csv") == \
+            RESIDUAL_BENCHMARK["spy_csv"]
+        raises(attempt.source_binding, "missing")
+        raises(attempt.benchmark_binding, "missing")
+        raises(setattr, attempt, "run_id", "changed")
+
+        mutations = (
+            lambda item: item.update({"schema": True}),
+            lambda item: item.update({"schema": 2}),
+            lambda item: item.update({"status": "complete"}),
+            lambda item: item.update({"run_id": "other-run"}),
+            lambda item: item.update({
+                "attempt_path": "experiments/other-attempt.json",
+            }),
+            lambda item: item.update({"run_dir": "reports/other"}),
+            lambda item: item.update({"implementation_commit": "A" * 40}),
+            lambda item: item["source"]["context_outcome"].update(
+                {"sha256": digest("wrong-context-outcome")},
+            ),
+            lambda item: item["config"].update(
+                {"sha256": digest("wrong-config")},
+            ),
+            lambda item: item["benchmark"]["spy_csv"].update(
+                {"sha256": digest("wrong-spy")},
+            ),
+            lambda item: item["phases"][0].update(
+                {"source_phase_sha256": digest("wrong-phase")},
+            ),
+            lambda item: item["source_tree"].update({
+                "files": list(reversed(item["source_tree"]["files"])),
+            }),
+            lambda item: item["source_tree"].update(
+                {"sha256": digest("wrong-source-tree")},
+            ),
+            lambda item: item["primary_python"].update(
+                {"sha256": digest("wrong-primary")},
+            ),
+            lambda item: item["torch_argv"].append("extra"),
+            lambda item: item["torch_probe"].update({"config": "changed"}),
+            lambda item: item["environment"].update(
+                {"PYTHONDONTWRITEBYTECODE": "0"},
+            ),
+            lambda item: item["environment"].update({"EXTRA": "1"}),
+            lambda item: item.update({"extra": True}),
+        )
+        for mutate in mutations:
+            invalid = deepcopy(value)
+            mutate(invalid)
+            raises(parse, invalid)
+
+        write_json(path, value)
+        raises(
+            ResidualAttempt.read, path, Path("experiments/other.json"),
+            root, context,
+        )
+        raises(
+            ResidualAttempt.read, path, logical, root,
+            replace(context, attempt_path="experiments/other.json"),
+        )
+        raises(
+            ResidualAttempt.read, path, logical, root,
+            replace(
+                context,
+                environment=MappingProxyType({
+                    **dict(context.environment),
+                    "PYTHONDONTWRITEBYTECODE": "0",
+                }),
+            ),
+        )
+
+    assert expected_residual_command(
+        Path("experiments/residual-attempt.json"),
+    ) == ("tools/run_spy_residual.py", "experiments/residual-attempt.json")
+    for path in (
+        Path("/tmp/residual-attempt.json"),
+        Path("experiments/../residual-attempt.json"),
+    ):
+        raises(expected_residual_command, path)
+
+
+def verify_receipt_contract() -> None:
+    source = source_phase()
+    phase = ResidualPhaseInput.parse(
+        phase_value(
+            source,
+            residual_scaler_inputs_sha256(
+                MASTER, scaler_inputs(source.phase),
+            ),
+        ),
+        source,
+    )
+    attempt = FileBinding(
+        "experiments/residual-attempt.json", digest("attempt"),
+    )
+    fits = FileBinding("reports/residual/fits.jsonl", digest("fits"))
+    predictions = FileBinding(
+        "reports/residual/predictions.jsonl", digest("predictions"),
+    )
+    run_identity = (7, 11)
+    source_tree = digest("source-tree")
+    value = {
+        "attempt": asdict(attempt),
+        "evaluation_grid_sha256": source.evaluation_grid_sha256,
+        "fit_count": EXPECTED_RESIDUAL_FITS_PER_PHASE,
+        "fits": asdict(fits),
+        "phase": source.phase,
+        "prediction_count": EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE,
+        "predictions": asdict(predictions),
+        "residual_phase_sha256": residual_phase_sha256(phase),
+        "run_identity": list(run_identity),
+        "schema": 1,
+        "source_phase_sha256": context_phase_sha256(source),
+        "source_tree_sha256": source_tree,
+    }
+    receipt = ResidualReceipt.parse(value)
+    assert receipt.value() == value
+    assert ResidualReceipt.parse(receipt.value()) == receipt
+    receipt.validate(
+        source, phase, attempt, fits, predictions,
+        source_tree, run_identity,
+    )
+    raises(setattr, receipt, "fit_count", 12)
+
+    parse_mutations = (
+        lambda item: item.update({"schema": True}),
+        lambda item: item.update({"schema": 2}),
+        lambda item: item.update({"phase": "fold-0"}),
+        lambda item: item["attempt"].update({"path": "/tmp/attempt.json"}),
+        lambda item: item["fits"].update(
+            {"path": item["attempt"]["path"]},
+        ),
+        lambda item: item.update({"fit_count": True}),
+        lambda item: item.update({"fit_count": 12}),
+        lambda item: item.update({"prediction_count": 120}),
+        lambda item: item.update({"run_identity": [7.0, 11]}),
+        lambda item: item.update({"extra": True}),
+    )
+    for mutate in parse_mutations:
+        invalid = deepcopy(value)
+        mutate(invalid)
+        raises(ResidualReceipt.parse, invalid)
+
+    for field in (
+        "source_phase_sha256", "residual_phase_sha256",
+        "evaluation_grid_sha256", "source_tree_sha256",
+    ):
+        invalid = deepcopy(value)
+        invalid[field] = digest(f"wrong-{field}")
+        raises(
+            ResidualReceipt.parse(invalid).validate,
+            source, phase, attempt, fits, predictions,
+            source_tree, run_identity,
+        )
+    for binding, changed in (
+        ("attempt", FileBinding(attempt.path, digest("other-attempt"))),
+        ("fits", FileBinding(fits.path, digest("other-fits"))),
+        (
+            "predictions",
+            FileBinding(predictions.path, digest("other-predictions")),
+        ),
+    ):
+        arguments = {
+            "attempt": attempt,
+            "fits": fits,
+            "predictions": predictions,
+        }
+        arguments[binding] = changed
+        raises(
+            receipt.validate, source, phase,
+            arguments["attempt"], arguments["fits"],
+            arguments["predictions"], source_tree, run_identity,
+        )
+    raises(
+        receipt.validate, source_phase("calibration"), phase,
+        attempt, fits, predictions, source_tree, run_identity,
+    )
+    raises(
+        receipt.validate, source,
+        replace(phase, scaler_inputs_sha256=digest("other-scalers")),
+        attempt, fits, predictions, source_tree, run_identity,
+    )
+    raises(
+        receipt.validate, source, phase, attempt, fits, predictions,
+        digest("other-source-tree"), run_identity,
+    )
+    raises(
+        receipt.validate, source, phase, attempt, fits, predictions,
+        source_tree, (7, 12),
+    )
+
+
 def verify_spy_audit() -> None:
     expected = spy_audit()
     assert validate_spy_session_audit(expected) == expected
@@ -558,6 +901,8 @@ def main() -> None:
     verify_controller_import()
     verify_phase_closure()
     verify_evidence_ledgers()
+    verify_attempt_contract()
+    verify_receipt_contract()
     verify_spy_audit()
     print("relative-context contract tests passed")
 

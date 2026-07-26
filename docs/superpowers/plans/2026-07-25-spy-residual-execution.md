@@ -331,13 +331,13 @@ $PYTHON tests/python/test_finalize_spy_residual.py
   `expected_residual_command(attempt_path: Path) -> tuple[str, str]`, returning
   only `("tools/run_spy_residual.py", attempt_path)`.
 
-- [ ] Require receipt counts of exactly 11 fits and 121 prediction vectors;
+- [x] Require receipt counts of exactly 11 fits and 121 prediction vectors;
   require every file path to be distinct and repository-relative.
-- [ ] Test exact attempt and receipt round trips. Reject unknown fields,
+- [x] Test exact attempt and receipt round trips. Reject unknown fields,
   changed status/schema/run ID/path/environment/source/config/benchmark/tree,
   wrong source phase, wrong residual phase, wrong grid, wrong run inode,
   changed ledger bindings, Boolean counts, and any count other than 11/121.
-- [ ] Run:
+- [x] Run:
 
 ```sh
 $PYTHON tests/python/test_relative_context_contract.py

@@ -6,13 +6,17 @@ from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 
+from tools.analyze_context_cross_section import ANALYSIS_SOURCE_PATHS
 from tools.context_diagnostic_contract import (
-    ContextFit, ContextPhase, ContextPrediction, _fit_value, _json_sha256,
-    _loss, context_phase_sha256, expected_context_fits,
+    CONTEXT_SOURCE_PATHS, ContextAttempt, ContextFit, ContextPhase,
+    ContextPrediction, _fit_value, _json_sha256, _loss, _run_identity,
+    context_phase_sha256, expected_context_fits,
 )
 from tools.float32 import decode_f32le_base64, encode_f32le_base64
 from tools.panel_contract import (
-    FileBinding, _exact_json, _integer, _object, _sha256, _string,
+    RUN_ID, ExecutableBinding, FileBinding, SourceTree, TorchIdentity, _argv,
+    _exact_json, _integer, _object, _relative, _sha256, _string,
+    read_canonical_json,
 )
 from tools.universe_contract import universe_roles
 from tools.universe_cross_section import CROSS_SECTION_SEED
@@ -38,6 +42,8 @@ PAIRED_COMPARISONS = (
     ("panel_transformer", "global_ridge"),
     ("panel_transformer", "global_mlp"),
 )
+EXPECTED_RESIDUAL_FITS_PER_PHASE = 11
+EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE = 121
 RESIDUAL_CONFIG = FileBinding(
     "experiments/executable-h13-spy-residual.example.json",
     "cd5103fa93835222ae789a228ff776765c23bd7d0de6a2200c1c610ec557af19",
@@ -66,6 +72,19 @@ RESIDUAL_CALENDAR = FileBinding(
     "universes/us-equities-core-2024-07-22_2026-07-21.json",
     "b1e0835a60624a67e21f7941ac00ece6c488937989560bbd4d0333afd869e5f8",
 )
+RESIDUAL_RUNNER = "tools/run_spy_residual.py"
+RESIDUAL_SOURCE_PATHS = tuple(sorted({
+    *ANALYSIS_SOURCE_PATHS,
+    *CONTEXT_SOURCE_PATHS,
+    "tools/arm_spy_residual.py",
+    "tools/finalize_spy_residual.py",
+    "tools/relative_context.py",
+    "tools/relative_context_contract.py",
+    "tools/relative_context_inputs.py",
+    RESIDUAL_RUNNER,
+    "tools/spy_residual_controller.py",
+    "tools/spy_residual_runtime.py",
+}))
 _SOURCE_PHASE_OUTPUTS = (
     ("fold-1", (
         ("access", "d82ae9819c08c43a805cc7d0c49e8997ce06404a64b2710b6c3089430b29c970"),
@@ -86,6 +105,13 @@ _SOURCE_PHASE_OUTPUTS = (
         ("receipt", "dfd7d6a8cbb04e9394ae28d32c1bb5f803639815c66c9333e281f0167524e183"),
     )),
 )
+
+
+def expected_residual_command(attempt_path: Path) -> tuple[str, str]:
+    """Return the sole source-bound residual runner invocation."""
+    return RESIDUAL_RUNNER, _relative(
+        attempt_path.as_posix(), "residual attempt path",
+    )
 
 
 def _binding_value(binding: FileBinding) -> dict[str, str]:
@@ -338,6 +364,157 @@ def validate_residual_protocol(
 
 
 @dataclass(frozen=True, slots=True)
+class ResidualAttempt:
+    """Bind one armed residual run to its authenticated source closure."""
+
+    attempt_path: str
+    run_id: str
+    run_dir: str
+    implementation_commit: str
+    source: tuple[tuple[str, FileBinding], ...]
+    config: FileBinding
+    benchmark: tuple[tuple[str, FileBinding], ...]
+    phases: tuple["ResidualPhaseInput", ...]
+    source_tree: SourceTree
+    primary_python: ExecutableBinding
+    torch_argv: tuple[str, ...]
+    torch_probe: TorchIdentity
+    environment: Mapping[str, str]
+
+    def source_binding(self, name: str) -> FileBinding:
+        """Return one required source-evidence binding by exact name."""
+        try:
+            return dict(self.source)[name]
+        except KeyError as error:
+            raise ValueError("residual source evidence is missing") from error
+
+    def benchmark_binding(self, name: str) -> FileBinding:
+        """Return one required benchmark binding by exact name."""
+        try:
+            return dict(self.benchmark)[name]
+        except KeyError as error:
+            raise ValueError("residual benchmark is missing") from error
+
+    @property
+    def runner_argv(self) -> tuple[str, str]:
+        """Derive the sole runner invocation from the bound attempt path."""
+        return expected_residual_command(Path(self.attempt_path))
+
+    @classmethod
+    def read(
+        cls, path: Path, logical_path: Path, repository_root: Path,
+        context: ContextAttempt,
+    ) -> "ResidualAttempt":
+        """Parse one armed residual attempt against its fixed closure."""
+        if not isinstance(context, ContextAttempt) or \
+           context.attempt_path != RESIDUAL_SOURCE["context_attempt"].path:
+            raise ValueError("residual source attempt changed")
+        value = _object(
+            read_canonical_json(path),
+            {
+                "schema", "status", "attempt_path", "run_id", "run_dir",
+                "implementation_commit", "source", "config", "benchmark",
+                "phases", "source_tree", "primary_python", "torch_argv",
+                "torch_probe", "environment",
+            },
+            "residual attempt",
+        )
+        if _integer(value["schema"], "residual attempt schema") != 1 or \
+           value["status"] != "armed":
+            raise ValueError("residual attempt must be schema 1 and armed")
+        attempt_path = _relative(
+            value["attempt_path"], "residual attempt path",
+        )
+        if attempt_path != _relative(
+            logical_path.as_posix(), "logical residual attempt path",
+        ):
+            raise ValueError("residual attempt path changed")
+        run_id = _string(value["run_id"], "residual run id")
+        run_dir = _relative(value["run_dir"], "residual run directory")
+        if not RUN_ID.fullmatch(run_id) or (
+            attempt_path, run_dir
+        ) != (
+            f"experiments/{run_id}-attempt.json",
+            f"reports/{run_id}",
+        ):
+            raise ValueError("residual attempt identity is invalid")
+        commit = _string(
+            value["implementation_commit"], "implementation commit",
+        )
+        if len(commit) != 40 or any(
+            byte not in "0123456789abcdef" for byte in commit
+        ):
+            raise ValueError("implementation commit is invalid")
+
+        raw_source = _object(
+            value["source"], set(RESIDUAL_SOURCE), "residual source",
+        )
+        source = tuple(
+            (name, FileBinding.parse(raw_source[name], f"source.{name}"))
+            for name in RESIDUAL_SOURCE
+        )
+        if dict(source) != RESIDUAL_SOURCE:
+            raise ValueError("residual source evidence changed")
+        config = FileBinding.parse(value["config"], "residual config")
+        if config != RESIDUAL_CONFIG:
+            raise ValueError("residual config changed")
+        raw_benchmark = _object(
+            value["benchmark"], set(RESIDUAL_BENCHMARK),
+            "residual benchmark",
+        )
+        benchmark = tuple(
+            (
+                name,
+                FileBinding.parse(
+                    raw_benchmark[name], f"benchmark.{name}",
+                ),
+            )
+            for name in RESIDUAL_BENCHMARK
+        )
+        if dict(benchmark) != RESIDUAL_BENCHMARK:
+            raise ValueError("residual benchmark changed")
+
+        phases = parse_residual_phases(value["phases"], context.phases)
+        source_tree = SourceTree.parse(
+            value["source_tree"], "residual source tree",
+            RESIDUAL_SOURCE_PATHS,
+        )
+        root = _repository_root(repository_root)
+        if source_tree.root != str(root):
+            raise ValueError("residual source root changed")
+        primary = ExecutableBinding.parse(
+            value["primary_python"], "residual primary Python",
+        )
+        torch_argv = _argv(value["torch_argv"], "residual Torch argv")
+        torch = TorchIdentity.parse(value["torch_probe"])
+        if (primary, torch_argv, torch) != (
+            context.primary_python, context.torch_argv, context.torch_probe,
+        ):
+            raise ValueError("residual runtime changed")
+        source_environment = dict(context.environment)
+        if source_environment.get("PYTHONDONTWRITEBYTECODE") != "1" or \
+           set(source_environment) != {
+               "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX",
+           }:
+            raise ValueError("residual source environment changed")
+        environment = _object(
+            value["environment"], set(source_environment),
+            "residual environment",
+        )
+        expected_environment = {
+            **source_environment,
+            "PYTHONPYCACHEPREFIX": f"{run_dir}/.pycache",
+        }
+        if environment != expected_environment:
+            raise ValueError("residual environment changed")
+        return cls(
+            attempt_path, run_id, run_dir, commit, source, config,
+            benchmark, phases, source_tree, primary, torch_argv, torch,
+            MappingProxyType(dict(environment)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ResidualScalerInput:
     series: str
     stock_training_prefix_sha256: str
@@ -511,7 +688,7 @@ def expected_residual_fits(
             for model in MODELS[1:] for seed in SEEDS
         ),
     )
-    if len(fits) != 11 or tuple(
+    if len(fits) != EXPECTED_RESIDUAL_FITS_PER_PHASE or tuple(
         (fit.phase, fit.model, fit.history, fit.seed) for fit in fits
     ) != expected:
         raise ValueError("residual fit closure changed")
@@ -547,7 +724,7 @@ def expected_residual_predictions(
         for fit in expected_residual_fits(master, phase)
         for series, count, grid in phase.evaluation_rows
     )
-    if len(predictions) != 121:
+    if len(predictions) != EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE:
         raise ValueError("residual prediction closure changed")
     return predictions
 
@@ -701,6 +878,107 @@ def validate_residual_prediction_records(
             ),
         ))
     return tuple(records)
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualReceipt:
+    """Bind complete residual evidence to one immutable run directory."""
+
+    phase: str
+    attempt: FileBinding
+    fits: FileBinding
+    predictions: FileBinding
+    source_phase_sha256: str
+    residual_phase_sha256: str
+    evaluation_grid_sha256: str
+    source_tree_sha256: str
+    run_identity: tuple[int, int]
+    fit_count: int
+    prediction_count: int
+
+    @classmethod
+    def parse(cls, value: object) -> "ResidualReceipt":
+        item = _object(
+            value,
+            {
+                "schema", "phase", "attempt", "fits", "predictions",
+                "source_phase_sha256", "residual_phase_sha256",
+                "evaluation_grid_sha256", "source_tree_sha256",
+                "run_identity", "fit_count", "prediction_count",
+            },
+            "residual receipt",
+        )
+        phase = _string(item["phase"], "residual receipt phase")
+        if _integer(item["schema"], "residual receipt schema") != 1 or \
+           phase not in dict(PHASE_BUDGETS):
+            raise ValueError("residual receipt identity is invalid")
+        attempt = FileBinding.parse(item["attempt"], "receipt attempt")
+        fits = FileBinding.parse(item["fits"], "receipt fits")
+        predictions = FileBinding.parse(
+            item["predictions"], "receipt predictions",
+        )
+        if len({attempt.path, fits.path, predictions.path}) != 3:
+            raise ValueError("residual receipt paths must be distinct")
+        fit_count = _integer(item["fit_count"], "receipt fit count")
+        prediction_count = _integer(
+            item["prediction_count"], "receipt prediction count",
+        )
+        if (fit_count, prediction_count) != (
+            EXPECTED_RESIDUAL_FITS_PER_PHASE,
+            EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE,
+        ):
+            raise ValueError("residual receipt closure changed")
+        return cls(
+            phase, attempt, fits, predictions,
+            _sha256(item["source_phase_sha256"], "receipt source phase"),
+            _sha256(
+                item["residual_phase_sha256"],
+                "receipt residual phase",
+            ),
+            _sha256(
+                item["evaluation_grid_sha256"],
+                "receipt evaluation grid",
+            ),
+            _sha256(item["source_tree_sha256"], "receipt source tree"),
+            _run_identity(item["run_identity"]),
+            fit_count, prediction_count,
+        )
+
+    def value(self) -> dict[str, object]:
+        """Serialize the exact canonical receipt schema."""
+        return {
+            "attempt": asdict(self.attempt),
+            "evaluation_grid_sha256": self.evaluation_grid_sha256,
+            "fit_count": self.fit_count,
+            "fits": asdict(self.fits),
+            "phase": self.phase,
+            "prediction_count": self.prediction_count,
+            "predictions": asdict(self.predictions),
+            "residual_phase_sha256": self.residual_phase_sha256,
+            "run_identity": list(self.run_identity),
+            "schema": 1,
+            "source_phase_sha256": self.source_phase_sha256,
+            "source_tree_sha256": self.source_tree_sha256,
+        }
+
+    def validate(
+        self, source: ContextPhase, phase: ResidualPhaseInput,
+        attempt: FileBinding, fits: FileBinding, predictions: FileBinding,
+        source_tree_sha256: str, run_identity: tuple[int, int],
+    ) -> None:
+        if not isinstance(source, ContextPhase) or \
+           not isinstance(phase, ResidualPhaseInput) or \
+           ResidualPhaseInput.parse(_phase_value(phase), source) != phase or \
+           self != ResidualReceipt(
+               source.phase, attempt, fits, predictions,
+               context_phase_sha256(source), residual_phase_sha256(phase),
+               source.evaluation_grid_sha256,
+               _sha256(source_tree_sha256, "receipt source tree"),
+               _run_identity(run_identity),
+               EXPECTED_RESIDUAL_FITS_PER_PHASE,
+               EXPECTED_RESIDUAL_PREDICTIONS_PER_PHASE,
+           ):
+            raise ValueError("residual receipt does not bind the phase")
 
 
 def validate_spy_session_audit(
