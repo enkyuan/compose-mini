@@ -89,6 +89,10 @@
       "path": "reports/h13-spy-residual-20260725-01/calibration-fits.jsonl",
       "sha256": "93237f9962a64665950252094e9119d1e1a806d7288af0d5c331cd724954203e"
     },
+    "forward_calendar": {
+      "path": "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
+      "sha256": "997d751a5a2ae8b2c51f4b500bd27ec94155359e211d1f9cfef198d5f156c362"
+    },
     "residual_attempt": {
       "path": "experiments/h13-spy-residual-20260725-01-attempt.json",
       "sha256": "0fb90623c90b418dfff93d35dde1bb49024c25d3b2b27b799ce752b8deed9ea3"

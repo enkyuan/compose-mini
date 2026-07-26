@@ -1,0 +1,23 @@
+{
+  "close_minute": 960,
+  "closed_dates": [
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-03"
+  ],
+  "early_closes": {},
+  "end": "2026-08-18",
+  "open_minute": 570,
+  "purpose": "Freeze the XNAS and XNYS core sessions for the SPY-residual forward test.",
+  "schema": 1,
+  "sources": [
+    "https://www.nyse.com/trade/hours-calendars",
+    "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar"
+  ],
+  "start": "2026-05-19",
+  "timezone": "America/New_York",
+  "venues": [
+    "XNAS",
+    "XNYS"
+  ]
+}

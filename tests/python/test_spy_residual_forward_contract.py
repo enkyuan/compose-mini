@@ -9,9 +9,10 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from tools.files import file_sha256
 from tools.panel_contract import _exact_json, read_canonical_json
 from tools.spy_residual_forward_contract import (
-    expected_forward_protocol, validate_forward_protocol,
+    FORWARD_CALENDAR, expected_forward_protocol, validate_forward_protocol,
 )
 
 CONFIG = ROOT / \
@@ -49,6 +50,12 @@ SOURCES = {
             "reports/h13-spy-residual-20260725-01/calibration-fits.jsonl",
         "sha256":
             "93237f9962a64665950252094e9119d1e1a806d7288af0d5c331cd724954203e",
+    },
+    "forward_calendar": {
+        "path":
+            "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
+        "sha256":
+            "997d751a5a2ae8b2c51f4b500bd27ec94155359e211d1f9cfef198d5f156c362",
     },
 }
 LOCKS = {
@@ -119,6 +126,11 @@ def verify_exact_profile_and_literals() -> None:
         "inactive_output": 0.0,
     }
     assert value["sources"] == SOURCES
+    name, path, sha256 = FORWARD_CALENDAR
+    assert value["sources"][name] == {
+        "path": path, "sha256": sha256,
+    }
+    assert file_sha256(ROOT / path) == sha256
     assert tuple(value["universe"]) == UNIVERSE
     assert value["forward_window"] == {
         "interval_minutes": 30,
@@ -226,6 +238,9 @@ def verify_required_rejections() -> None:
             {"path": "experiments/other.json"},
         ),
         lambda item: item["sources"]["residual_outcome"].update(
+            {"sha256": "0" * 64},
+        ),
+        lambda item: item["sources"]["forward_calendar"].update(
             {"sha256": "0" * 64},
         ),
         lambda item: item["metrics"]["references"].reverse(),

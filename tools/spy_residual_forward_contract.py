@@ -35,6 +35,11 @@ FORWARD_SOURCES = (
         "93237f9962a64665950252094e9119d1e1a806d7288af0d5c331cd724954203e",
     ),
 )
+FORWARD_CALENDAR = (
+    "forward_calendar",
+    "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
+    "997d751a5a2ae8b2c51f4b500bd27ec94155359e211d1f9cfef198d5f156c362",
+)
 STATE_FINGERPRINTS = (
     "fe12e7e77d81eb6761defa27f423739e634d55c608beb30d9125b2631fc1049b",
     "3e2ccdc591baaf9d3b94efdeeddd86b6fed913bf7ea7fce29b6ec38f0c0fc2d2",
@@ -81,7 +86,7 @@ def expected_forward_protocol() -> dict[str, object]:
         },
         "sources": {
             name: {"path": path, "sha256": sha256}
-            for name, path, sha256 in FORWARD_SOURCES
+            for name, path, sha256 in (*FORWARD_SOURCES, FORWARD_CALENDAR)
         },
         "transformer_states": [
             {"seed": seed, "state_fingerprint": fingerprint}
