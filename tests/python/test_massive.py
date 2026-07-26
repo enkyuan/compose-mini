@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Verify Massive downloads and strict universe fetching without network."""
 
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, localcontext
 from email.message import Message
+from functools import cache
 from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -17,6 +19,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,14 +27,18 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+import tools.fetch_benchmark as benchmark_fetch
 from tools.data_v1 import FEATURE_COUNT, read_bars, read_csv
 from tools.apply_universe_coverage_overlay import (
     apply_overlay, replacement_candidate, revised_manifest,
 )
+from tools.fetch_benchmark import (
+    END as BENCHMARK_END, START as BENCHMARK_START, fetch_benchmark,
+)
 from tools.fetch_massive import (
-    aggregate_url, api_key, authorized_url, fetch_bars, regular_bars,
-    request_gate, request_json, scan_regular_bars, session_grid_audit,
-    write_csv,
+    Bar, Requester, aggregate_url, api_key, authorized_url, fetch_bars,
+    regular_bars, request_gate, request_json, scan_regular_bars,
+    session_grid_audit, write_csv,
 )
 from tools.fetch_universe import (
     SeriesSpec, UniverseManifest, fetch_universe, parse_args as universe_args,
@@ -41,7 +48,9 @@ from tools.files import (
     ExclusiveTemp, file_sha256, rename_noreplace, write_json,
     write_json_exclusive,
 )
-from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
+from tools.session_calendar import (
+    DEFAULT_CALENDAR, SessionCalendar, expected_bins,
+)
 from tools.select_universe import (
     Candidate, DailyRow, Reference, SelectionPolicy, SourceArchive,
     SourceBundle, _candidate_value, _canonical_sha256, _decimal_text,
@@ -2602,6 +2611,430 @@ def fake_requester(requested: list[str],
     return request
 
 
+def benchmark_reference(**changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "ticker": "SPY", "active": True, "market": "stocks",
+        "locale": "us", "type": "ETF", "currency_name": "usd",
+        "primary_exchange": "ARCX",
+    }
+    value.update(changes)
+    return value
+
+
+@cache
+def benchmark_aggregates() -> tuple[dict[str, object], ...]:
+    calendar = SessionCalendar.read(DEFAULT_CALENDAR)
+    rows = [
+        aggregate(item.timestamp, 100.0 + index / 10_000)
+        for index, item in enumerate(expected_bins(
+            calendar, BENCHMARK_START, BENCHMARK_END, 30,
+        ))
+    ]
+    rows.append(aggregate("2024-11-29T18:00:00+00:00", 99.0))
+    return tuple(sorted(rows, key=lambda item: item["t"]))
+
+
+def benchmark_requester(
+    requested: list[str],
+    *,
+    reference: object | None = None,
+    rows: object | None = None,
+) -> Requester:
+    def request(url: str) -> dict[str, object]:
+        requested.append(url)
+        if urlsplit(url).path == "/v3/reference/tickers/SPY":
+            return {
+                "status": "OK",
+                "results": benchmark_reference()
+                if reference is None else reference,
+            }
+        return {
+            "adjusted": True, "status": "OK", "ticker": "SPY",
+            "results": list(benchmark_aggregates())
+            if rows is None else rows,
+        }
+    return request
+
+
+def test_benchmark_fetch(directory: Path) -> None:
+    bundle = directory.resolve() / "spy-bundle"
+    csv_path, report_path = bundle / "spy.csv", bundle / "fetch.json"
+    requested: list[str] = []
+
+    report = fetch_benchmark(
+        bundle, key="fake-secret",
+        requester=benchmark_requester(requested),
+    )
+    timestamps_, _ = read_bars(csv_path)
+    assert len(timestamps_) == 5_534
+    assert "2024-11-29T18:00:00Z" not in timestamps_
+    assert report["csv"]["session_audit"] == {
+        "scope": "all-expected-session-bins",
+        "expected_sessions": 428,
+        "affected_sessions": 0,
+        "missing_sessions": [],
+        "expected_bins": 5_534,
+        "missing_bins": 0,
+        "ranges": [],
+    }
+    assert report["calendar"]["applicability"] == {
+        "benchmark": "SPY",
+        "calendar_venue": "XNYS",
+        "exchange_source": (
+            "https://massive.com/docs/rest/stocks/"
+            "market-operations/exchanges"
+        ),
+        "market_group": "NYSE Group",
+        "operating_mic": "XNYS",
+        "primary_exchange": "ARCX",
+        "session": "core",
+        "session_source": "https://www.nyse.com/trade/hours-calendars",
+    }
+    assert report["csv"]["sha256"] == file_sha256(csv_path)
+    assert json.loads(report_path.read_text(encoding="utf-8")) == report
+    assert [
+        (urlsplit(url).path, parse_qs(urlsplit(url).query))
+        for url in requested
+    ] == [
+        (
+            "/v3/reference/tickers/SPY",
+            {"apiKey": ["fake-secret"], "date": ["2024-10-31"]},
+        ),
+        (
+            "/v2/aggs/ticker/SPY/range/30/minute/"
+            "2024-11-01/2026-07-21",
+            {
+                "adjusted": ["true"], "apiKey": ["fake-secret"],
+                "limit": ["50000"], "sort": ["asc"],
+            },
+        ),
+    ]
+    assert report["reference"]["request"] == {
+        "path": "/v3/reference/tickers/SPY",
+        "query": {"date": "2024-10-31"},
+    }
+    assert report["aggregate"]["request"] == {
+        "path": (
+            "/v2/aggs/ticker/SPY/range/30/minute/"
+            "2024-11-01/2026-07-21"
+        ),
+        "query": {
+            "adjusted": "true", "limit": "50000", "sort": "asc",
+        },
+    }
+    assert "fake-secret" not in csv_path.read_text(encoding="ascii")
+    assert "fake-secret" not in report_path.read_text(encoding="utf-8")
+
+
+def test_benchmark_import_boundary() -> None:
+    code = (
+        f"import sys; sys.path.insert(0, {str(ROOT)!r}); "
+        "import tools.fetch_benchmark; "
+        "blocked=('tools.experiment','tools.relative_context','tools.train'); "
+        "assert not any(name == 'torch' or name.startswith('torch.') "
+        "for name in sys.modules); "
+        "assert not any(name in sys.modules for name in blocked)"
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+
+
+def test_benchmark_source_rejections(directory: Path) -> None:
+    directory = directory.resolve()
+
+    def unreachable(*_args: object) -> object:
+        raise AssertionError("benchmark request was reached")
+
+    for index, (field, value) in enumerate((
+        ("ticker", "QQQ"),
+        ("active", False),
+        ("active", 1),
+        ("market", "crypto"),
+        ("locale", "global"),
+        ("type", "CS"),
+        ("currency_name", "eur"),
+        ("primary_exchange", "XNAS"),
+    )):
+        bundle = directory / f"spy-identity-{index}"
+        requested: list[str] = []
+        raises(
+            ValueError, fetch_benchmark, bundle, key="fake-secret",
+            requester=benchmark_requester(
+                requested,
+                reference=benchmark_reference(**{field: value}),
+            ),
+        )
+        assert len(requested) == 1
+        assert not bundle.exists()
+
+    for index, (field, value, remove) in enumerate((
+        ("ticker", "QQQ", False),
+        ("ticker", None, True),
+        ("adjusted", False, False),
+        ("adjusted", None, True),
+    )):
+        direct = benchmark_requester([])
+
+        def changed_request(
+            url: str, *, name: str = field,
+            replacement: object = value, absent: bool = remove,
+        ) -> Mapping[str, object]:
+            payload = dict(direct(url))
+            if urlsplit(url).path.startswith("/v2/aggs/"):
+                if absent:
+                    payload.pop(name, None)
+                else:
+                    payload[name] = replacement
+            return payload
+
+        bundle = directory / f"spy-aggregate-{index}"
+        raises(
+            ValueError, fetch_benchmark, bundle, key="fake-secret",
+            requester=changed_request,
+        )
+        assert not bundle.exists()
+
+    for index, response in enumerate((
+        {"status": "ERROR", "results": benchmark_reference()},
+        {"status": "OK", "results": [benchmark_reference()]},
+    )):
+        bundle = directory / f"spy-reference-payload-{index}"
+        raises(
+            ValueError, fetch_benchmark, bundle, key="fake-secret",
+            requester=lambda _url, item=response: item,
+        )
+        assert not bundle.exists()
+
+    pages = iter((
+        {
+            "adjusted": True, "status": "OK", "ticker": "SPY",
+            "results": [aggregate(
+                "2024-11-01T13:30:00+00:00", 100.0,
+            )],
+            "next_url": "https://api.massive.com/page?cursor=next",
+        },
+        {
+            "status": "OK", "ticker": "SPY",
+            "results": [aggregate(
+                "2024-11-01T14:00:00+00:00", 101.0,
+            )],
+        },
+    ))
+
+    def paginated(url: str) -> Mapping[str, object]:
+        return (
+            {"status": "OK", "results": benchmark_reference()}
+            if urlsplit(url).path == "/v3/reference/tickers/SPY"
+            else next(pages)
+        )
+
+    pagination_bundle = directory / "spy-pagination-fields"
+    raises(
+        ValueError, fetch_benchmark, pagination_bundle,
+        key="fake-secret", requester=paginated,
+    )
+    assert not pagination_bundle.exists()
+
+    source = list(benchmark_aggregates())
+    changed = (
+        source[1:],
+        [source[0], source[0], *source[1:]],
+        [dict(source[0]) | {"t": source[0]["t"] + 15 * 60_000}, *source[1:]],
+        [aggregate("2024-10-31T13:30:00+00:00", 100.0), *source],
+        tuple(source),
+    )
+    for index, rows in enumerate(changed):
+        bundle = directory / f"spy-grid-{index}"
+        raises(
+            ValueError, fetch_benchmark, bundle, key="fake-secret",
+            requester=benchmark_requester([], rows=rows),
+        )
+        assert not bundle.exists()
+
+    calendar = directory / "changed-calendar.json"
+    value = calendar_value()
+    value["purpose"] = "changed"
+    write_json(calendar, value)
+    raises(
+        ValueError, fetch_benchmark, directory / "wrong-calendar",
+        calendar_path=calendar, key="fake-secret",
+        requester=lambda _url: unreachable(),
+    )
+    for index, key in enumerate(("", "contains whitespace", 1)):
+        raises(
+            ValueError, fetch_benchmark, directory / f"wrong-key-{index}",
+            key=key, requester=lambda _url: unreachable(),
+        )
+
+
+def test_benchmark_target_rejections(directory: Path) -> None:
+    directory = directory.resolve()
+
+    def unreachable(*_args: object) -> object:
+        raise AssertionError("benchmark request was reached")
+
+    def rejected(bundle: Path,
+                 calendar_path: Path = DEFAULT_CALENDAR) -> None:
+        raises(
+            ValueError, fetch_benchmark, bundle,
+            calendar_path=calendar_path, key="fake-secret",
+            requester=lambda _url: unreachable(),
+        )
+
+    existing = directory / "existing-spy"
+    existing.mkdir()
+    rejected(existing)
+
+    broken = directory / "broken-spy"
+    broken.symlink_to(directory / "missing-spy")
+    rejected(broken)
+
+    hardlink_source = directory / "hardlink-source"
+    hardlink_source.write_text("occupied", encoding="ascii")
+    hardlink = directory / "hardlink-spy"
+    os.link(hardlink_source, hardlink)
+    rejected(hardlink)
+
+    real_parent = directory / "real-spy-parent"
+    real_parent.mkdir()
+    alias_parent = directory / "alias-spy-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    rejected(alias_parent / "spy")
+
+    child = real_parent / "child"
+    child.mkdir()
+    rejected(alias_parent / "child" / "spy")
+
+    calendar_alias = directory / "calendar-alias.json"
+    calendar_alias.symlink_to(DEFAULT_CALENDAR)
+    rejected(directory / "calendar-alias-spy", calendar_alias)
+
+    calendar_parent = directory / "calendar-parent"
+    calendar_parent.mkdir()
+    calendar_copy = calendar_parent / "calendar.json"
+    shutil.copyfile(DEFAULT_CALENDAR, calendar_copy)
+    calendar_parent_alias = directory / "calendar-parent-alias"
+    calendar_parent_alias.symlink_to(
+        calendar_parent, target_is_directory=True,
+    )
+    rejected(
+        directory / "calendar-ancestor-spy",
+        calendar_parent_alias / "calendar.json",
+    )
+
+    rejected(directory / "missing-parent" / "spy")
+
+
+def test_benchmark_publication_failures(directory: Path) -> None:
+    directory = directory.resolve()
+
+    def attempt(name: str, *, calendar: Path = DEFAULT_CALENDAR) -> Path:
+        bundle = directory / name
+        fetch_benchmark(
+            bundle, calendar_path=calendar,
+            key="fake-secret", requester=benchmark_requester([]),
+        )
+        return bundle
+
+    with patch(
+        "tools.fetch_benchmark.rename_noreplace",
+        side_effect=OSError("bundle publication failed"),
+    ):
+        raises(OSError, attempt, "rename-failure")
+    assert not (directory / "rename-failure").exists()
+
+    write = benchmark_fetch.write_csv
+
+    def mutate_stage(path: Path, bars: Sequence[Bar]) -> None:
+        write(path, bars)
+        text = path.read_text(encoding="ascii")
+        path.write_text(text.replace(",100,", ",101,", 1), encoding="ascii")
+
+    with patch(
+        "tools.fetch_benchmark.write_csv", side_effect=mutate_stage,
+    ):
+        raises(ValueError, attempt, "stage-mutation")
+    assert not (directory / "stage-mutation").exists()
+
+    publish = benchmark_fetch.rename_noreplace
+    calendar = directory / "mutable-spy-calendar.json"
+    shutil.copyfile(DEFAULT_CALENDAR, calendar)
+
+    def mutate_calendar(
+        source_fd: int, source: str, target_fd: int, target: str,
+    ) -> None:
+        calendar.write_bytes(calendar.read_bytes() + b" ")
+        publish(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.fetch_benchmark.rename_noreplace",
+        side_effect=mutate_calendar,
+    ):
+        raises(ValueError, attempt, "calendar-mutation", calendar=calendar)
+    assert tuple(sorted(
+        path.name for path in (directory / "calendar-mutation").iterdir()
+    )) == ("fetch.json", "spy.csv")
+
+    def mutate_csv(
+        source_fd: int, source: str, target_fd: int, target: str,
+    ) -> None:
+        path = directory / source / "spy.csv"
+        path.write_bytes(path.read_bytes() + b"\n")
+        publish(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.fetch_benchmark.rename_noreplace", side_effect=mutate_csv,
+    ):
+        raises(ValueError, attempt, "csv-mutation")
+    assert (directory / "csv-mutation").exists()
+
+    def occupy_target(
+        source_fd: int, source: str, target_fd: int, target: str,
+    ) -> None:
+        (directory / target).mkdir()
+        publish(source_fd, source, target_fd, target)
+
+    with patch(
+        "tools.fetch_benchmark.rename_noreplace",
+        side_effect=occupy_target,
+    ):
+        raises(OSError, attempt, "target-race")
+    assert not any((directory / "target-race").iterdir())
+
+    fsync = benchmark_fetch.os.fsync
+
+    def fail_stage_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("stage fsync failed")
+        fsync(descriptor)
+
+    with patch(
+        "tools.fetch_benchmark.os.fsync", side_effect=fail_stage_fsync,
+    ):
+        raises(OSError, attempt, "stage-fsync-failure")
+    assert not (directory / "stage-fsync-failure").exists()
+
+    directory_fsyncs = 0
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 2:
+                raise OSError("parent fsync failed")
+        fsync(descriptor)
+
+    with patch(
+        "tools.fetch_benchmark.os.fsync", side_effect=fail_parent_fsync,
+    ):
+        raises(OSError, attempt, "fsync-failure")
+    assert tuple(sorted(
+        path.name for path in (directory / "fsync-failure").iterdir()
+    )) == ("fetch.json", "spy.csv")
+
+
 def test_universe_fetch(directory: Path) -> None:
     manifest_path = directory / "manifest.json"
     write_manifest(manifest_path)
@@ -3324,6 +3757,11 @@ def main() -> None:
         test_universe_coverage_overlay(directory)
         test_target_rejections(directory)
         test_rate_validation(directory)
+        test_benchmark_import_boundary()
+        test_benchmark_fetch(directory)
+        test_benchmark_source_rejections(directory)
+        test_benchmark_target_rejections(directory)
+        test_benchmark_publication_failures(directory)
         test_universe_fetch(directory)
         test_observed_bar_gaps(directory)
         test_session_grid_audit()
