@@ -243,18 +243,18 @@ $TORCH_PYTHON tests/python/test_spy_residual_runtime.py
 - Add
   `finalize_residual_run(attempt: FileBinding, phases: Sequence[ResidualPhaseInput], evaluations: Mapping[str, Mapping[str, object]], phase_inputs: Sequence[Mapping[str, object]], source_tree_sha256: str) -> Mapping[str, object]`.
 
-- [ ] Ensemble each neural model by arithmetic-mean prediction across five
+- [x] Ensemble each neural model by arithmetic-mean prediction across five
   seeds before primary metrics.
-- [ ] Reparse `phase` against `source`, require its source/grid hashes to
+- [x] Reparse `phase` against `source`, require its source/grid hashes to
   match, and derive evaluation stock order, counts, and per-series grids only
   from the authenticated `ContextPhase`.
-- [ ] Compute pooled raw residual \(R^2\) against zero:
+- [x] Compute pooled raw residual \(R^2\) against zero:
 
 ```text
 1 - sum((z - prediction)^2) / sum(z^2)
 ```
 
-- [ ] Compute paired absolute-error gain as:
+- [x] Compute paired absolute-error gain as:
 
 ```text
 abs(z - reference) - abs(z - candidate)
@@ -262,37 +262,37 @@ abs(z - reference) - abs(z - candidate)
 
   Average within stock, then equally across stocks. Positive values favor the
   candidate.
-- [ ] Use shared circular date blocks of `5`, `10`, and `20` days, `10,000`
+- [x] Use shared circular date blocks of `5`, `10`, and `20` days, `10,000`
   replicates, seed `20260725`, and equal-tailed 95% intervals only for paired
   absolute-error gains.
-- [ ] Compute secondary timestamp-centered cross-sectional \(R^2\) and mean
+- [x] Compute secondary timestamp-centered cross-sectional \(R^2\) and mean
   valid-timestamp Spearman RankIC.
-- [ ] For centered cross-sectional \(R^2\), center truth and predictions within
+- [x] For centered cross-sectional \(R^2\), center truth and predictions within
   each exact common target timestamp, pool centered squared error and centered
   truth squares, and reject a zero pooled denominator.
-- [ ] For RankIC, assign average ranks to ties and use Pearson correlation of
+- [x] For RankIC, assign average ranks to ties and use Pearson correlation of
   ranks. Skip timestamps with fewer than two stocks or a constant truth or
   prediction rank vector; report the valid count and reject if it is zero.
-- [ ] Define a bootstrap date as the UTC target-date prefix `target[:10]`.
+- [x] Define a bootstrap date as the UTC target-date prefix `target[:10]`.
   Draw one circular sequence of dates and apply the identical multiplicities
   to every stock, model, and comparison before recomputing stock-macro gains.
-- [ ] Report population standard deviation across seed predictions per
+- [x] Report population standard deviation across seed predictions per
   observation, then stock-macro average it on the common grid.
-- [ ] Preserve the profile locks verbatim in every phase evaluation and
+- [x] Preserve the profile locks verbatim in every phase evaluation and
   terminal outcome.
-- [ ] Reject non-finite values, changed grids, incomplete seed/model closure,
+- [x] Reject non-finite values, changed grids, incomplete seed/model closure,
   or a zero denominator rather than silently substituting a metric.
-- [ ] Emit one exact phase object containing only `schema`, `phase`,
+- [x] Emit one exact phase object containing only `schema`, `phase`,
   `evidence_role`, `target_kind`, `observation_count`, `stock_count`,
   `timestamp_count`, `primary`, `secondary`, `seed_dispersion`, `locks`, and
   `integrity`. The terminal object contains only `schema`, `evidence_role`,
   `inputs`, `phases`, `decision`, `locks`, and `integrity`.
-- [ ] Add named tests for hand-calculated pooled \(R^2\), stock-macro
+- [x] Add named tests for hand-calculated pooled \(R^2\), stock-macro
   weighting, positive/negative paired gains, average-rank ties, constant-rank
   timestamp exclusion, shared circular-date sampling, seed population
   deviation, common-grid enforcement, and every zero-denominator rejection.
-- [ ] Verify that permuting rows, stocks, models, seeds, or dates is rejected.
-- [ ] Run:
+- [x] Verify that permuting rows, stocks, models, seeds, or dates is rejected.
+- [x] Run:
 
 ```sh
 $PYTHON tests/python/test_finalize_spy_residual.py
