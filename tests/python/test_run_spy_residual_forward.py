@@ -8,7 +8,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 import hashlib
+import inspect
 import json
+import subprocess
 import sys
 import tempfile
 
@@ -44,6 +46,7 @@ from tools.spy_residual_forward_inputs import (
     ForwardSeriesPrediction, SeedPrediction, SpyResidualForwardInputs,
 )
 from tools.spy_residual_forward_runtime import SpyResidualForwardRuntime
+from tools import run_spy_residual_forward as forward_runner
 from tools.run_spy_residual_forward import publish_forward_candidate
 from tools.universe_forward_runner import ForwardFeatureWindows
 
@@ -358,6 +361,31 @@ def test_runner_stops_before_truth() -> None:
     assert callable(truth)
 
 
+def test_live_entrypoint_rejects_imported_callers_before_arming() -> None:
+    assert tuple(inspect.signature(
+        forward_runner.execute_forward_attempt,
+    ).parameters) == ("massive_bundle",)
+    with patch.object(forward_runner, "arm_forward_inputs") as arm:
+        rejects(forward_runner.execute_forward_attempt, ROOT)
+        arm.assert_not_called()
+
+
+def test_live_script_bootstraps_only_under_the_exact_flags() -> None:
+    script = ROOT / "tools/run_spy_residual_forward.py"
+    isolated = subprocess.run(
+        (sys.executable, "-I", "-S", "-B", str(script), "--help"),
+        check=False, capture_output=True, text=True,
+    )
+    unisolated = subprocess.run(
+        (sys.executable, str(script), str(ROOT)),
+        check=False, capture_output=True, text=True,
+    )
+    assert isolated.returncode == 0
+    assert "massive_bundle" in isolated.stdout
+    assert unisolated.returncode != 0
+    assert "requires isolated bytecode-free Python" in unisolated.stderr
+
+
 def test_provenance_is_fixed_data_not_executable_code() -> None:
     prepared = prepared_phase("calibration", FORWARD_UNIVERSE)
     tree = selected_source_tree(ROOT, FORWARD_SOURCE_PATHS)
@@ -388,6 +416,8 @@ def main() -> None:
     test_forward_inference_reauthenticates_state()
     test_candidate_is_one_runtime_bound_publication()
     test_runner_stops_before_truth()
+    test_live_entrypoint_rejects_imported_callers_before_arming()
+    test_live_script_bootstraps_only_under_the_exact_flags()
     test_provenance_is_fixed_data_not_executable_code()
     print("SPY residual forward runner tests passed")
 

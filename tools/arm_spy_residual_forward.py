@@ -45,6 +45,7 @@ from tools.session_calendar import SessionCalendar, expected_bins
 from tools.spy_residual_forward_contract import (
     FORWARD_CALENDAR, FORWARD_CONFIG, FORWARD_RUN_ID, FORWARD_SOURCE_PATHS,
     FORWARD_SOURCES, FORWARD_UNIVERSE, STATE_FINGERPRINTS,
+    validate_forward_protocol,
 )
 from tools.spy_residual_forward_inputs import (
     ForwardGrid, ForwardPredictionSession, ForwardRunBinding,
@@ -332,7 +333,8 @@ def _bound_historical() -> Iterator[_Historical]:
         name: ROOT / path for name, path, _ in FORWARD_SOURCES
     }
     context_path = ROOT / RESIDUAL_SOURCE["context_attempt"].path
-    initial = (context_path, *source_paths.values())
+    config_path = ROOT / FORWARD_CONFIG.path
+    initial = (context_path, config_path, *source_paths.values())
     initial_identities = _single_link_inputs(initial, "forward sources")
     with freeze_inputs(initial) as first:
         frozen = dict(zip(initial, first, strict=True))
@@ -342,8 +344,11 @@ def _bound_historical() -> Iterator[_Historical]:
         if any(
             frozen[path].sha256 != expected_hashes[name]
             for name, path in source_paths.items()
-        ):
+        ) or frozen[config_path].sha256 != FORWARD_CONFIG.sha256:
             raise ValueError("forward fixed source changed")
+        validate_forward_protocol(read_canonical_json(
+            frozen[config_path].snapshot,
+        ))
         context = _source_context(frozen[context_path])
         attempt = ResidualAttempt.read(
             frozen[source_paths["residual_attempt"]].snapshot,
@@ -375,8 +380,11 @@ def _bound_historical() -> Iterator[_Historical]:
         if any(
             frozen[path].sha256 != expected_hashes[name]
             for name, path in source_paths.items()
-        ):
+        ) or frozen[config_path].sha256 != FORWARD_CONFIG.sha256:
             raise ValueError("forward fixed source changed")
+        validate_forward_protocol(read_canonical_json(
+            frozen[config_path].snapshot,
+        ))
         context = _source_context(frozen[context_path])
         authenticated, _, _ = _completed_run(
             source_paths["residual_attempt"],

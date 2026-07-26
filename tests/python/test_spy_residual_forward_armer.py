@@ -19,12 +19,14 @@ sys.path.insert(0, str(ROOT))
 from tools import arm_spy_residual_forward as armer
 from tools.data_v1 import CSV_HEADER
 from tools.files import file_sha256, freeze_inputs, write_json
-from tools.panel_contract import _directory_identity, selected_source_tree
+from tools.panel_contract import (
+    FileBinding, _directory_identity, selected_source_tree,
+)
 from tools.session_calendar import (
     SessionBin, SessionCalendar, expected_bins,
 )
 from tools.spy_residual_forward_contract import (
-    FORWARD_RUN_ID, FORWARD_SOURCE_PATHS, FORWARD_UNIVERSE,
+    FORWARD_CONFIG, FORWARD_RUN_ID, FORWARD_SOURCE_PATHS, FORWARD_UNIVERSE,
 )
 from tools.spy_residual_forward_inputs import ForwardRunBinding
 
@@ -289,11 +291,24 @@ def test_public_lease_binds_the_calendar_first_grid() -> None:
                         rejects(session.submit, current)
 
 
+def test_historical_closure_authenticates_the_protocol_bytes() -> None:
+    changed = FileBinding(FORWARD_CONFIG.path, "0" * 64)
+    with patch.object(armer, "FORWARD_CONFIG", changed):
+        rejects(armer._bound_historical().__enter__)
+    with patch.object(
+        armer, "validate_forward_protocol",
+        side_effect=ValueError("changed protocol"),
+    ) as validate:
+        rejects(armer._bound_historical().__enter__)
+        validate.assert_called_once()
+
+
 def main() -> None:
     test_requires_one_exact_massive_bundle()
     test_rejects_report_and_grid_changes()
     test_rejects_nonregular_torch_package_entries()
     test_public_lease_binds_the_calendar_first_grid()
+    test_historical_closure_authenticates_the_protocol_bytes()
     print("SPY residual forward armer tests passed")
 
 

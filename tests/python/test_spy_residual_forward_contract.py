@@ -12,7 +12,8 @@ sys.path.insert(0, str(ROOT))
 from tools.files import file_sha256
 from tools.panel_contract import _exact_json, read_canonical_json
 from tools.spy_residual_forward_contract import (
-    FORWARD_CALENDAR, expected_forward_protocol, validate_forward_protocol,
+    FORWARD_CALENDAR, FORWARD_CONFIG, FORWARD_SOURCE_PATHS,
+    expected_forward_protocol, validate_forward_protocol,
 )
 
 CONFIG = ROOT / \
@@ -101,6 +102,7 @@ def verify_exact_profile_and_literals() -> None:
     value = read_canonical_json(CONFIG)
     expected = expected_forward_protocol()
     assert _exact_json(value, expected)
+    assert file_sha256(CONFIG) == FORWARD_CONFIG.sha256
     assert validate_forward_protocol(value) == expected
     assert value["schema"] == 1
     assert value["evidence_role"] == \
@@ -176,6 +178,10 @@ def verify_exact_profile_and_literals() -> None:
     }
     assert value["gates"] == GATES
     assert value["locks"] == LOCKS
+    assert {
+        "tools/analyze_spy_residual_shrinkage.py",
+        "tools/finalize_spy_residual_forward.py",
+    }.issubset(FORWARD_SOURCE_PATHS)
 
 
 def verify_fresh_copy() -> None:

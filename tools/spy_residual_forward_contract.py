@@ -20,7 +20,9 @@ FORWARD_CONFIG = FileBinding(
 )
 FORWARD_SOURCE_PATHS = tuple(sorted({
     *RESIDUAL_SOURCE_PATHS,
+    "tools/analyze_spy_residual_shrinkage.py",
     "tools/arm_spy_residual_forward.py",
+    "tools/finalize_spy_residual_forward.py",
     "tools/run_spy_residual_forward.py",
     "tools/spy_residual_forward_contract.py",
     "tools/spy_residual_forward_inputs.py",
