@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import tools.fetch_benchmark as benchmark_fetch
+from tools import atomic_bundle
 from tools.data_v1 import FEATURE_COUNT, read_bars, read_csv
 from tools.apply_universe_coverage_overlay import (
     apply_overlay, replacement_candidate, revised_manifest,
@@ -2939,7 +2940,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         return bundle
 
     with patch(
-        "tools.fetch_benchmark.rename_noreplace",
+        "tools.atomic_bundle.rename_noreplace",
         side_effect=OSError("bundle publication failed"),
     ):
         raises(OSError, attempt, "rename-failure")
@@ -2958,7 +2959,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         raises(ValueError, attempt, "stage-mutation")
     assert not (directory / "stage-mutation").exists()
 
-    publish = benchmark_fetch.rename_noreplace
+    publish = atomic_bundle.rename_noreplace
     calendar = directory / "mutable-spy-calendar.json"
     shutil.copyfile(DEFAULT_CALENDAR, calendar)
 
@@ -2969,7 +2970,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         publish(source_fd, source, target_fd, target)
 
     with patch(
-        "tools.fetch_benchmark.rename_noreplace",
+        "tools.atomic_bundle.rename_noreplace",
         side_effect=mutate_calendar,
     ):
         raises(ValueError, attempt, "calendar-mutation", calendar=calendar)
@@ -2985,7 +2986,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         publish(source_fd, source, target_fd, target)
 
     with patch(
-        "tools.fetch_benchmark.rename_noreplace", side_effect=mutate_csv,
+        "tools.atomic_bundle.rename_noreplace", side_effect=mutate_csv,
     ):
         raises(ValueError, attempt, "csv-mutation")
     assert (directory / "csv-mutation").exists()
@@ -2997,7 +2998,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         publish(source_fd, source, target_fd, target)
 
     with patch(
-        "tools.fetch_benchmark.rename_noreplace",
+        "tools.atomic_bundle.rename_noreplace",
         side_effect=occupy_target,
     ):
         raises(OSError, attempt, "target-race")
@@ -3011,7 +3012,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         fsync(descriptor)
 
     with patch(
-        "tools.fetch_benchmark.os.fsync", side_effect=fail_stage_fsync,
+        "tools.atomic_bundle.os.fsync", side_effect=fail_stage_fsync,
     ):
         raises(OSError, attempt, "stage-fsync-failure")
     assert not (directory / "stage-fsync-failure").exists()
@@ -3027,7 +3028,7 @@ def test_benchmark_publication_failures(directory: Path) -> None:
         fsync(descriptor)
 
     with patch(
-        "tools.fetch_benchmark.os.fsync", side_effect=fail_parent_fsync,
+        "tools.atomic_bundle.os.fsync", side_effect=fail_parent_fsync,
     ):
         raises(OSError, attempt, "fsync-failure")
     assert tuple(sorted(

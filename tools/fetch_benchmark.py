@@ -11,7 +11,6 @@ from urllib.parse import parse_qsl, urlsplit
 import argparse
 import json
 import os
-import stat
 import sys
 import tempfile
 
@@ -25,10 +24,8 @@ from tools.fetch_massive import (
     fetch_bars, request_json, scan_regular_bars, session_grid_audit, write_csv,
 )
 from tools.fetch_universe import reference_url
-from tools.files import (
-    file_sha256, freeze_inputs, rename_may_have_committed, rename_noreplace,
-    require_disjoint, verify_frozen, write_json,
-)
+from tools import atomic_bundle
+from tools.files import file_sha256, freeze_inputs, require_disjoint, verify_frozen, write_json
 from tools.relative_context_contract import validate_spy_session_audit
 from tools.session_calendar import DEFAULT_CALENDAR, SessionCalendar
 
@@ -62,51 +59,16 @@ APPLICABILITY = MappingProxyType({
 PURPOSE = "Authenticate SPY bars for development-only residual calibration."
 RETURN_BASIS = "split-adjusted-price-return-not-dividend-adjusted"
 BUNDLE_FILES = ("fetch.json", "spy.csv")
-Identity = tuple[int, int]
 Verify = Callable[[], None]
-
-
-def _absent(path: Path, name: str) -> None:
-    if os.path.lexists(path):
-        raise ValueError(f"{name} must not already exist")
-
-
-def _identity(path: Path, name: str, *, directory: bool = False) -> Identity:
-    try:
-        value = path.stat(follow_symlinks=False)
-    except OSError as error:
-        raise ValueError(f"{name} must be a regular path") from error
-    kind = stat.S_ISDIR if directory else stat.S_ISREG
-    if not kind(value.st_mode) or (
-        not directory and value.st_nlink != 1
-    ):
-        raise ValueError(f"{name} must be a regular path")
-    return value.st_dev, value.st_ino
-
-
-def _verify_identity(
-    path: Path, expected: Identity, name: str, *, directory: bool = False,
-) -> None:
-    if _identity(path, name, directory=directory) != expected:
-        raise ValueError(f"{name} changed during the fetch")
-
-
-def _without_symlinks(path: Path, name: str) -> Path:
-    absolute = Path(os.path.abspath(path))
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current /= part
-        if os.path.lexists(current) and current.is_symlink():
-            raise ValueError(f"{name} must not traverse symlinks")
-    return absolute
+Identity = atomic_bundle.Identity
 
 
 def _paths(bundle: Path, calendar: Path) -> tuple[Path, Path]:
-    bundle = _without_symlinks(bundle, "benchmark bundle")
-    calendar = _without_symlinks(calendar, "session calendar")
-    _absent(bundle, "benchmark bundle")
-    _identity(bundle.parent, "benchmark output parent", directory=True)
-    _identity(calendar, "session calendar")
+    bundle = atomic_bundle.without_symlinks(bundle, "benchmark bundle")
+    calendar = atomic_bundle.without_symlinks(calendar, "session calendar")
+    atomic_bundle.absent(bundle, "benchmark bundle")
+    atomic_bundle.path_identity(bundle.parent, "benchmark output parent", directory=True)
+    atomic_bundle.path_identity(calendar, "session calendar")
     require_disjoint((calendar,), (bundle,))
     if bundle in calendar.parents or calendar in bundle.parents:
         raise ValueError("benchmark bundle must not contain its calendar")
@@ -161,74 +123,20 @@ def _matches_source(path: Path, bars: Sequence[Bar]) -> bool:
     )
 
 
-def _entry(
-    directory_fd: int, name: str,
-) -> tuple[Identity, int] | None:
-    try:
-        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return None
-    return (value.st_dev, value.st_ino), stat.S_IFMT(value.st_mode)
-
-
-def _publish_bundle(stage: Path, bundle: Path, verify: Verify) -> Identity:
-    parent_fd = os.open(
-        bundle.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
-        getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        stage_identity = _identity(
-            stage, "staged benchmark bundle", directory=True,
-        )
-        verify()
-        stage_fd = os.open(
-            stage.name,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
-            getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_fd,
-        )
-        try:
-            os.fsync(stage_fd)
-        finally:
-            os.close(stage_fd)
-
-        failure: OSError | None = None
-        try:
-            rename_noreplace(
-                parent_fd, stage.name, parent_fd, bundle.name,
-            )
-        except OSError as error:
-            failure = error
-        committed = rename_may_have_committed(failure) and \
-            _entry(parent_fd, stage.name) is None and \
-            _entry(parent_fd, bundle.name) == (
-                stage_identity, stat.S_IFDIR,
-            )
-        if not committed:
-            if failure is not None:
-                raise failure
-            raise OSError("benchmark bundle publication failed")
-        os.fsync(parent_fd)
-        return stage_identity
-    finally:
-        os.close(parent_fd)
-
-
 def _verify_bundle(
     bundle: Path,
     bundle_identity: Identity,
     bindings: Mapping[str, tuple[Identity, str]],
     report: Mapping[str, object],
 ) -> None:
-    _verify_identity(
+    atomic_bundle.verify_identity(
         bundle, bundle_identity, "benchmark bundle", directory=True,
     )
     if tuple(sorted(path.name for path in bundle.iterdir())) != BUNDLE_FILES:
         raise ValueError("benchmark bundle contents changed")
     for name, (identity, sha256) in bindings.items():
         path = bundle / name
-        _verify_identity(path, identity, f"benchmark {name}")
+        atomic_bundle.verify_identity(path, identity, f"benchmark {name}")
         if file_sha256(path) != sha256:
             raise ValueError(f"benchmark {name} changed")
     try:
@@ -249,10 +157,10 @@ def fetch_benchmark(
 ) -> Mapping[str, object]:
     """Publish SPY only after its identity and complete grid are authenticated."""
     bundle, calendar_path = _paths(bundle, calendar_path)
-    parent_identity = _identity(
+    parent_identity = atomic_bundle.path_identity(
         bundle.parent, "benchmark output parent", directory=True,
     )
-    calendar_identity = _identity(calendar_path, "session calendar")
+    calendar_identity = atomic_bundle.path_identity(calendar_path, "session calendar")
 
     with freeze_inputs((calendar_path,)) as (calendar_input,):
         if calendar_input.sha256 != CALENDAR_SHA256:
@@ -285,7 +193,7 @@ def fetch_benchmark(
             prefix=".compose-mini-spy-", dir=bundle.parent,
         ) as directory:
             stage = Path(directory)
-            stage_identity = _identity(
+            stage_identity = atomic_bundle.path_identity(
                 stage, "staged benchmark bundle", directory=True,
             )
             csv_path, report_path = stage / "spy.csv", stage / "fetch.json"
@@ -323,10 +231,10 @@ def fetch_benchmark(
                 }
                 write_json(report_path, report)
                 with freeze_inputs((report_path,)) as (report_input,):
-                    csv_identity = _identity(
+                    csv_identity = atomic_bundle.path_identity(
                         csv_path, "staged benchmark CSV",
                     )
-                    report_identity = _identity(
+                    report_identity = atomic_bundle.path_identity(
                         report_path, "staged benchmark report",
                     )
 
@@ -334,35 +242,35 @@ def fetch_benchmark(
                         verify_frozen((
                             calendar_input, csv_input, report_input,
                         ))
-                        _verify_identity(
+                        atomic_bundle.verify_identity(
                             bundle.parent, parent_identity,
                             "benchmark output parent", directory=True,
                         )
-                        _verify_identity(
+                        atomic_bundle.verify_identity(
                             calendar_path, calendar_identity,
                             "session calendar",
                         )
-                        _verify_identity(
+                        atomic_bundle.verify_identity(
                             stage, stage_identity,
                             "staged benchmark bundle", directory=True,
                         )
-                        _verify_identity(
+                        atomic_bundle.verify_identity(
                             csv_path, csv_identity, "staged benchmark CSV",
                         )
-                        _verify_identity(
+                        atomic_bundle.verify_identity(
                             report_path, report_identity,
                             "staged benchmark report",
                         )
-                        _absent(bundle, "benchmark bundle")
+                        atomic_bundle.absent(bundle, "benchmark bundle")
 
-                    bundle_identity = _publish_bundle(
+                    bundle_identity = atomic_bundle.publish_directory(
                         stage, bundle, verify,
                     )
                     verify_frozen((calendar_input,))
-                    _verify_identity(
+                    atomic_bundle.verify_identity(
                         calendar_path, calendar_identity, "session calendar",
                     )
-                    _verify_identity(
+                    atomic_bundle.verify_identity(
                         bundle.parent, parent_identity,
                         "benchmark output parent", directory=True,
                     )
