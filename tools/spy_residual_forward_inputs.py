@@ -1,4 +1,4 @@
-"""Stream one fixed SPY-residual holdout without exposing future labels."""
+"""Stream the fixed August 5 diagnostic without exposing future labels."""
 
 from __future__ import annotations
 
@@ -38,19 +38,19 @@ from tools.session_calendar import (
 )
 from tools.session_samples import SampleRows, SessionSamples, session_samples
 from tools.spy_residual_forward_contract import (
-    FORWARD_UNIVERSE, STATE_FINGERPRINTS,
+    FORWARD_TARGET_SESSIONS, FORWARD_UNIVERSE, STATE_FINGERPRINTS,
 )
 from tools.spy_residual_gate import gate_mean_predictions, market_regimes
 from tools.universe_contract import PackedRows
 
-TARGET_SESSIONS = 60
+TARGET_SESSIONS = len(FORWARD_TARGET_SESSIONS)
 TimestampTriple = tuple[str, str, str]
 Verify = Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
 class ForwardGrid:
-    """Describe the sole calendar-derived forward target grid."""
+    """Describe the six fixed target sessions and their causal triples."""
 
     boundary: str
     target_sessions: tuple[date, ...]
@@ -59,7 +59,7 @@ class ForwardGrid:
     def __post_init__(self) -> None:
         sessions = tuple(map(str, self.target_sessions))
         if type(self.boundary) is not str or not self.boundary or \
-           len(self.target_sessions) != TARGET_SESSIONS or \
+           sessions != FORWARD_TARGET_SESSIONS or \
            tuple(sorted(set(self.target_sessions))) != self.target_sessions or \
            not self.triples or any(
                type(row) is not tuple or len(row) != 3 or
@@ -324,7 +324,7 @@ def derive_forward_grid(
     forward_calendar: SessionCalendar,
     source_boundary: str,
 ) -> ForwardGrid:
-    """Freeze the first 60 complete future target sessions."""
+    """Freeze the six post-preregistration target sessions."""
     calendar = _calendar(
         source_calendar, forward_calendar, source_boundary,
     )
@@ -367,22 +367,14 @@ def derive_forward_grid(
             bin_by_time[triple[2]].session, [],
         ).append(triple)
 
-    first = next((
-        session for session, expected in session_bins.items()
-        if tuple(row[2] for row in observed.get(session, ())) ==
-        tuple(expected)
-    ), None)
-    sessions = tuple(session_bins)
-    if first is None:
-        raise ValueError("forward calendar has no complete target session")
-    start = sessions.index(first)
-    selected_sessions = sessions[start:start + TARGET_SESSIONS]
-    if len(selected_sessions) != TARGET_SESSIONS or any(
+    selected_sessions = tuple(map(date.fromisoformat, FORWARD_TARGET_SESSIONS))
+    if any(
+        session not in session_bins or
         tuple(row[2] for row in observed.get(session, ())) !=
         tuple(session_bins[session])
         for session in selected_sessions
     ):
-        raise ValueError("forward calendar lacks 60 complete target sessions")
+        raise ValueError("forward calendar lacks the fixed target sessions")
     selected = frozenset(selected_sessions)
     return ForwardGrid(
         source_boundary, selected_sessions,

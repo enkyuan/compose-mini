@@ -307,8 +307,8 @@ def test_candidate_is_one_runtime_bound_publication() -> None:
             while isinstance(result, SpyResidualForwardInputs):
                 result = session.submit(result)
 
-            assert calls == 780
-            assert result.records == 780 * len(FORWARD_UNIVERSE)
+            assert calls == 78
+            assert result.records == 78 * len(FORWARD_UNIVERSE)
             assert not value.receipt.exists()
             header, first = (
                 json.loads(line)

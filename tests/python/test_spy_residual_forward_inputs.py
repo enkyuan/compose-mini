@@ -109,16 +109,16 @@ def fixture(
     gap_timestamp: str | None = None,
     boundary_bin: int = -1,
     poison_source_tail: bool = False,
-    source_end: date = date(2026, 2, 20),
+    source_end: date = date(2026, 5, 18),
 ) -> Fixture:
     parent.mkdir(parents=True, exist_ok=True)
-    source_calendar = calendar(date(2026, 2, 2), source_end)
-    future_calendar = calendar(date(2026, 2, 21), date(2026, 6, 5))
+    source_calendar = calendar(date(2026, 5, 1), source_end)
+    future_calendar = calendar(date(2026, 5, 19), date(2026, 8, 5))
     source_bins = tuple(expected_bins(
         source_calendar, source_calendar.start, source_calendar.end, 30,
     ))
     boundary = tuple(expected_bins(
-        source_calendar, date(2026, 2, 20), date(2026, 2, 20), 30,
+        source_calendar, date(2026, 5, 18), date(2026, 5, 18), 30,
     ))[boundary_bin].timestamp
     future_bins = tuple(expected_bins(
         future_calendar, future_calendar.start, future_calendar.end, 30,
@@ -229,7 +229,7 @@ def publish(session: ForwardPredictionSession) -> CandidateLedger:
     result: SpyResidualForwardInputs | CandidateLedger = \
         session.current()
     while isinstance(result, SpyResidualForwardInputs):
-        assert result.index < 780
+        assert result.index < 78
         result = session.submit(result)
     return result
 
@@ -251,9 +251,9 @@ def prepare(
     )
 
 
-def test_selects_exactly_60_calendar_first_target_sessions() -> None:
-    source = calendar(date(2026, 2, 2), date(2026, 2, 20))
-    future = calendar(date(2026, 2, 21), date(2026, 6, 5))
+def test_selects_exactly_six_fixed_target_sessions() -> None:
+    source = calendar(date(2026, 5, 1), date(2026, 5, 18))
+    future = calendar(date(2026, 5, 19), date(2026, 8, 5))
     boundary = tuple(expected_bins(
         source, source.start, source.end, 30,
     ))[-1].timestamp
@@ -262,18 +262,30 @@ def test_selects_exactly_60_calendar_first_target_sessions() -> None:
     sessions = tuple(dict.fromkeys(targets))
 
     assert grid.boundary == boundary
-    assert len(grid.target_sessions) == 60
-    assert grid.target_sessions[0] == date(2026, 2, 24)
+    assert grid.target_sessions == (
+        date(2026, 7, 29), date(2026, 7, 30), date(2026, 7, 31),
+        date(2026, 8, 3), date(2026, 8, 4), date(2026, 8, 5),
+    )
     assert tuple(map(str, grid.target_sessions)) == sessions
     assert targets.count(sessions[0]) == 13
-    assert len(grid.triples) == 780
+    assert len(grid.triples) == 78
+    assert grid.triples[0] == (
+        "2026-07-28T13:30:00Z",
+        "2026-07-28T14:00:00Z",
+        "2026-07-29T13:30:00Z",
+    )
+    assert grid.triples[-1] == (
+        "2026-08-04T19:30:00Z",
+        "2026-08-05T13:30:00Z",
+        "2026-08-05T19:30:00Z",
+    )
     assert all(entry > boundary for _, entry, _ in grid.triples)
     assert derive_forward_grid(source, future, boundary) == grid
     rejects(
-        derive_forward_grid, source, future, "2026-02-10T20:30:00Z",
+        derive_forward_grid, source, future, "2026-05-15T20:00:00Z",
     )
 
-    later = calendar(future.start, date(2026, 6, 30))
+    later = calendar(future.start, date(2026, 8, 31))
     extended = derive_forward_grid(source, later, boundary)
     assert extended.target_sessions == grid.target_sessions
     assert extended.triples == grid.triples
@@ -283,7 +295,7 @@ def test_selects_exactly_60_calendar_first_target_sessions() -> None:
     )
     future = SessionCalendar.read(
         ROOT /
-        "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
+        "universes/us-equities-core-forward-2026-05-19_2026-08-05.json",
     )
     grid = derive_forward_grid(
         source, future, "2026-05-18T18:00:00Z",
@@ -291,8 +303,8 @@ def test_selects_exactly_60_calendar_first_target_sessions() -> None:
     assert (
         grid.target_sessions[0], grid.target_sessions[-1],
         len(grid.target_sessions),
-    ) == (date(2026, 5, 22), date(2026, 8, 18), 60)
-    assert len(grid.triples) == 780
+    ) == (date(2026, 7, 29), date(2026, 8, 5), 6)
+    assert len(grid.triples) == 78
 
 
 def test_requires_complete_unique_ordered_common_grid() -> None:
@@ -378,7 +390,7 @@ def test_rejects_links_and_replacements() -> None:
             substitute = source.with_suffix(".replacement")
             substitute.write_bytes(source.read_bytes())
             os.replace(substitute, source)
-            for _ in range(779):
+            for _ in range(77):
                 current = session.current()
                 session.submit(current)
             current = session.current()
@@ -433,18 +445,18 @@ def test_ignores_the_uninspected_source_tail() -> None:
         for item in (
             fixture(
                 root / "valid", boundary_bin=-4,
-                source_end=date(2026, 3, 31),
+                source_end=date(2026, 5, 29),
             ),
             fixture(
                 root / "poisoned", boundary_bin=-4,
                 poison_source_tail=True,
-                source_end=date(2026, 3, 31),
+                source_end=date(2026, 5, 29),
             ),
         ):
             grid = derive_forward_grid(
                 item.source_calendar, item.future_calendar, item.boundary,
             )
-            assert grid.target_sessions[0] == date(2026, 2, 26)
+            assert grid.target_sessions[0] == date(2026, 7, 29)
             with frozen_files(item) as (stocks, spy, verify):
                 session, _ = prepare(item, stocks, spy, verify)
                 current = session.current()
@@ -588,7 +600,7 @@ def test_replaced_draft_before_truth_fails_closed() -> None:
 
 
 def main() -> None:
-    test_selects_exactly_60_calendar_first_target_sessions()
+    test_selects_exactly_six_fixed_target_sessions()
     test_requires_complete_unique_ordered_common_grid()
     test_rejects_links_and_replacements()
     test_decodes_only_the_current_as_of_window()

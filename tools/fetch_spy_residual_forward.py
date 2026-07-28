@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch the fixed complete SPY-residual forward holdout bundle."""
+"""Fetch the fixed complete expedited SPY-residual forward bundle."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -26,17 +27,31 @@ from tools.fetch_massive import (
     API_HOST, Bar, Requester, aggregate_url, api_key, fetch_bars,
     request_gate, request_json, scan_regular_bars, session_grid_audit, write_csv,
 )
-from tools.files import file_sha256, freeze_inputs, require_disjoint, verify_frozen, write_json
+from tools.files import (
+    file_sha256, freeze_inputs, require_disjoint, verify_frozen, write_json,
+)
+from tools.panel_contract import SourceTree, selected_source_tree
 from tools.relative_context_contract import INTERVAL_MINUTES
 from tools.session_calendar import SessionCalendar, expected_bins
-from tools.spy_residual_forward_contract import FORWARD_CALENDAR, FORWARD_UNIVERSE
+from tools.spy_residual_forward_contract import (
+    FORWARD_CALENDAR, FORWARD_SOURCE_PATHS, FORWARD_UNIVERSE,
+)
 
 FORWARD_CALENDAR_PATH = ROOT / FORWARD_CALENDAR[1]
 TICKERS = (*FORWARD_UNIVERSE, "SPY")
 FILES = tuple(sorted((
     "fetch.json", *(f"{ticker.lower()}-30m.csv" for ticker in TICKERS),
 )))
-PURPOSE = "Authenticate the fixed SPY-residual forward holdout."
+PURPOSE = "Authenticate the fixed expedited SPY-residual forward diagnostic."
+
+
+def _source_tree_value(value: SourceTree) -> dict[str, object]:
+    """Serialize one source tree into JSON-native containers."""
+    return {
+        "files": [asdict(item) for item in value.files],
+        "root": value.root,
+        "sha256": value.sha256,
+    }
 
 
 def _paths(bundle: Path) -> Path:
@@ -115,7 +130,10 @@ def fetch_forward_bundle(
 ) -> Mapping[str, object]:
     """Publish all fixed forward series only after the final bar is available."""
     bundle = _paths(bundle)
-    parent_identity = path_identity(bundle.parent, "forward output parent", directory=True)
+    implementation = selected_source_tree(ROOT, FORWARD_SOURCE_PATHS)
+    parent_identity = path_identity(
+        bundle.parent, "forward output parent", directory=True,
+    )
     calendar_identity = path_identity(FORWARD_CALENDAR_PATH, "forward calendar")
     with freeze_inputs((FORWARD_CALENDAR_PATH,)) as (calendar_input,):
         if calendar_input.sha256 != FORWARD_CALENDAR[2]:
@@ -194,7 +212,9 @@ def fetch_forward_bundle(
             prefix=".compose-mini-forward-", dir=bundle.parent,
         ) as directory:
             stage = Path(directory)
-            stage_identity = path_identity(stage, "staged forward bundle", directory=True)
+            stage_identity = path_identity(
+                stage, "staged forward bundle", directory=True,
+            )
             csv_paths = []
             for ticker, _aggregate, bars, _source_rows in fetched:
                 path = stage / f"{ticker.lower()}-30m.csv"
@@ -233,6 +253,7 @@ def fetch_forward_bundle(
                     },
                     "end": str(calendar.end),
                     "interval_minutes": INTERVAL_MINUTES,
+                    "implementation_tree": _source_tree_value(implementation),
                     "provider": "massive",
                     "purpose": PURPOSE,
                     "schema": 1,
@@ -256,6 +277,12 @@ def fetch_forward_bundle(
 
                     def verify() -> None:
                         verify_frozen((calendar_input, *snapshots))
+                        if selected_source_tree(
+                            ROOT, FORWARD_SOURCE_PATHS,
+                        ) != implementation:
+                            raise ValueError(
+                                "forward fetch implementation changed",
+                            )
                         verify_identity(
                             bundle.parent, parent_identity,
                             "forward output parent", directory=True,
@@ -288,6 +315,12 @@ def fetch_forward_bundle(
                         bundle, bundle_identity, bindings, report,
                         report_input.snapshot.read_bytes(),
                     )
+                    if selected_source_tree(
+                        ROOT, FORWARD_SOURCE_PATHS,
+                    ) != implementation:
+                        raise ValueError(
+                            "forward fetch implementation changed",
+                        )
                     return report
 
 

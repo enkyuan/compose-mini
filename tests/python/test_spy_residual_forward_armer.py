@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -116,6 +117,9 @@ def report(
         },
         "end": str(value.end),
         "interval_minutes": 30,
+        "implementation_tree": json.loads(json.dumps(asdict(
+            selected_source_tree(ROOT, FORWARD_SOURCE_PATHS),
+        ))),
         "provider": "massive",
         "purpose": armer.PURPOSE,
         "schema": 1,
@@ -129,7 +133,7 @@ def future_bundle(
     parent: Path,
 ) -> tuple[Path, Path, SessionCalendar]:
     parent.mkdir(parents=True)
-    value = calendar(date(2026, 2, 21), date(2026, 5, 18))
+    value = calendar(date(2026, 5, 19), date(2026, 8, 5))
     calendar_path, bundle = parent / "forward-calendar.json", parent / "data"
     bundle.mkdir()
     write_calendar(calendar_path, value)
@@ -147,7 +151,7 @@ def historical(
     parent: Path,
 ) -> Iterator[armer._Historical]:
     parent.mkdir(parents=True)
-    value = calendar(date(2026, 2, 2), date(2026, 2, 20))
+    value = calendar(date(2026, 5, 1), date(2026, 5, 18))
     bins = tuple(expected_bins(value, value.start, value.end, 30))
     paths = []
     for index, ticker in enumerate((*FORWARD_UNIVERSE, "SPY"), 1):
@@ -211,12 +215,19 @@ def test_rejects_report_and_grid_changes() -> None:
         write_json(report_path, value)
         rejects(enter_future, calendar_path, bundle)
 
+        calendar_path, bundle, _ = future_bundle(root / "implementation")
+        report_path = bundle / "fetch.json"
+        value = json.loads(report_path.read_text(encoding="utf-8"))
+        value["implementation_tree"]["sha256"] = "0" * 64
+        write_json(report_path, value)
+        rejects(enter_future, calendar_path, bundle)
+
         calendar_path, bundle, _ = future_bundle(root / "gap")
         csv = bundle / "krys-30m.csv"
         rows = csv.read_text(encoding="ascii").splitlines()
         csv.write_text("\n".join((rows[0], *rows[2:])) + "\n", encoding="ascii")
         value = report(calendar_path, calendar(
-            date(2026, 2, 21), date(2026, 5, 18),
+            date(2026, 5, 19), date(2026, 8, 5),
         ), bundle)
         write_json(bundle / "fetch.json", value)
         rejects(enter_future, calendar_path, bundle)
@@ -233,7 +244,7 @@ def test_rejects_nonregular_torch_package_entries() -> None:
         rejects(armer._closed_source_tree, package)
 
 
-def test_public_lease_binds_the_calendar_first_grid() -> None:
+def test_public_lease_binds_the_fixed_diagnostic_grid() -> None:
     with tempfile.TemporaryDirectory(
         prefix="spy-forward-armer-public-", dir=ROOT,
     ) as directory:
@@ -274,10 +285,10 @@ def test_public_lease_binds_the_calendar_first_grid() -> None:
                         lease()
                         assert not hasattr(lease, "prepare")
                         assert not hasattr(lease, "_calibration")
-                        assert len(lease.grid.target_sessions) == 60
-                        assert len(lease.grid.triples) == 780
+                        assert len(lease.grid.target_sessions) == 6
+                        assert len(lease.grid.triples) == 78
                         assert lease.grid.target_sessions[0] == \
-                            date(2026, 2, 24)
+                            date(2026, 7, 29)
                         rejects(lease._prepare)
                         context = armer.ForwardRunContext(
                             selected_source_tree(ROOT, FORWARD_SOURCE_PATHS),
@@ -307,7 +318,7 @@ def main() -> None:
     test_requires_one_exact_massive_bundle()
     test_rejects_report_and_grid_changes()
     test_rejects_nonregular_torch_package_entries()
-    test_public_lease_binds_the_calendar_first_grid()
+    test_public_lease_binds_the_fixed_diagnostic_grid()
     test_historical_closure_authenticates_the_protocol_bytes()
     print("SPY residual forward armer tests passed")
 

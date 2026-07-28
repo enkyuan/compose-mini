@@ -15,9 +15,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools import arm_spy_residual_forward as armer
+from tools.panel_contract import SourceTree, selected_source_tree
 from tools.session_calendar import SessionCalendar, expected_bins
 from tools.spy_residual_forward_contract import (
-    FORWARD_CALENDAR, FORWARD_UNIVERSE,
+    FORWARD_CALENDAR, FORWARD_SOURCE_PATHS, FORWARD_UNIVERSE,
 )
 
 
@@ -83,12 +84,16 @@ def test_fetches_one_exact_bundle(directory: Path) -> None:
     report = fetch_forward_bundle(
         bundle, key="fake-secret", requester=requester(),
         requests_per_minute=0,
-        current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+        current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
     )
     assert [item["ticker"] for item in report["series"]] == [
         *FORWARD_UNIVERSE, "SPY",
     ]
-    assert all(item["csv"]["rows"] == 819 for item in report["series"])
+    assert all(item["csv"]["rows"] == 702 for item in report["series"])
+    assert SourceTree.parse(
+        report["implementation_tree"], "forward fetch implementation",
+        FORWARD_SOURCE_PATHS,
+    ) == selected_source_tree(ROOT, FORWARD_SOURCE_PATHS)
     assert "fake-secret" not in (bundle / "fetch.json").read_text()
     with armer._bound_future(FORWARD_CALENDAR_PATH, bundle, FORWARD_CALENDAR[2]):
         pass
@@ -115,7 +120,7 @@ def test_rejects_early_or_incomplete_bundle(directory: Path) -> None:
     rejects(
         fetch_forward_bundle, incomplete_bundle, key="fake-secret",
         requester=requester(missing=True), requests_per_minute=0,
-        current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+        current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
     )
     assert not incomplete_bundle.exists()
 
@@ -152,7 +157,7 @@ def test_default_transport_rejects_forged_future_time(directory: Path) -> None:
             try:
                 forward.fetch_forward_bundle(
                     bundle, key="fake-secret", requests_per_minute=0,
-                    current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+                    current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
                     **arguments,
                 )
             except ValueError as error:
@@ -182,7 +187,7 @@ def test_sanitizes_authenticated_request_failure(directory: Path) -> None:
         fetch_forward_bundle(
             bundle, key="fake-secret", requester=leaking,
             requests_per_minute=0,
-            current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+            current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
         )
     except ValueError as error:
         assert str(error) == "Massive forward request failed"
@@ -235,7 +240,7 @@ def test_validates_frozen_csv_before_reporting(directory: Path) -> None:
         rejects(
             forward.fetch_forward_bundle, bundle, key="fake-secret",
             requester=requester(), requests_per_minute=0,
-            current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+            current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
         )
     assert mutations == 1
     assert not bundle.exists()
@@ -255,7 +260,7 @@ def test_cleans_private_stage_when_publication_fails(directory: Path) -> None:
         rejects(
             fetch_forward_bundle, bundle, key="fake-secret",
             requester=requester(), requests_per_minute=0,
-            current_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+            current_time=datetime(2026, 8, 6, tzinfo=timezone.utc),
         )
     assert not bundle.exists()
     assert not tuple(directory.glob(".compose-mini-forward-*"))

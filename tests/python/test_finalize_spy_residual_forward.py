@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.finalize_spy_residual_forward import (
-    evaluate_forward_candidate, finalize_forward_run, gate_results,
+    evaluate_forward_candidate, finalize_forward_run,
 )
 from tools.panel_contract import (
     _directory_identity, read_canonical_json, selected_source_tree,
@@ -76,8 +76,8 @@ def fixture(
     Mapping[str, tuple[ResidualTruthRow, ...]], TruthReader, list[int],
     ForwardGrid,
 ]:
-    source = calendar(date(2026, 2, 2), date(2026, 2, 20))
-    future = calendar(date(2026, 2, 21), date(2026, 6, 5))
+    source = calendar(date(2026, 5, 1), date(2026, 5, 18))
+    future = calendar(date(2026, 5, 19), date(2026, 8, 5))
     boundary = tuple(expected_bins(
         source, source.start, source.end, 30,
     ))[-1].timestamp
@@ -204,42 +204,42 @@ def bound_paths(parent: Path) -> Iterator[None]:
         yield
 
 
-def test_evaluates_only_the_preregistered_primary_gates() -> None:
+def test_reports_preliminary_diagnostic_without_a_decision() -> None:
     with tempfile.TemporaryDirectory(
         prefix="spy-forward-finalizer-", dir=ROOT,
     ) as directory:
         _, records, truth, _, _, _ = fixture(Path(directory))
         value = evaluate_forward_candidate(records, truth)
 
-    primary = value["primary"]
+    diagnostic = value["diagnostic"]
     assert isclose(
-        primary["pooled_raw_residual_r2_vs_zero"],
+        diagnostic["pooled_raw_residual_r2_vs_zero"],
         48 / 49, rel_tol=0.0, abs_tol=1e-15,
     )
-    assert value["decision"]["all_gates_passed"]
-    assert value["primary"]["paired_squared_error"]["zero"]["wins"] == 11
-    assert set(value["primary"]["paired_squared_error"]["zero"]) == {
-        "candidate", "date_count", "decision_interval_20", "losses",
+    zero = diagnostic["paired_squared_error"]["zero"]
+    assert zero["wins"] == 11
+    assert set(zero) == {
+        "candidate", "date_count", "intervals", "losses",
         "mean_gain", "per_stock_mean_gain", "reference", "ties", "wins",
     }
-    assert tuple(
-        value["descriptive"]["nondecision_block_intervals"]["zero"],
-    ) == ("5", "10")
+    assert tuple(zero["intervals"]) == ("5",)
+    assert value["descriptive"]["nondecision_block_intervals"]["zero"] == \
+        zero["intervals"]
     assert value["descriptive"]["direction_accuracy"][
         "unchanged-five-seed-mean"
     ] > value["descriptive"]["direction_accuracy"][
         "spy-direction-gated-five-seed-mean"
     ]
+    assert value["interpretation"] == {
+        "candidate_status":
+            "unchanged-pending-confirmatory-forward-evidence",
+        "output_role": "residual-only-not-executable-return",
+        "policy": "none-preliminary-diagnostic",
+        "uncertainty_role":
+            "conditional-descriptive-not-confidence-interval",
+    }
+    assert not {"decision", "gates", "primary"} & set(value)
     assert value["locks"] == expected_forward_protocol()["locks"]
-
-
-def test_all_five_gates_are_strict_and_conjunctive() -> None:
-    passing = (0.1, 0.1, 0.1, 0.1, 6)
-    assert gate_results(*passing)["all_gates_passed"]
-    for index, replacement in enumerate((0.0, 0.0, 0.0, 0.0, 5)):
-        values = list(passing)
-        values[index] = replacement
-        assert not gate_results(*values)["all_gates_passed"]
 
 
 def test_finalization_keeps_evidence_live_through_publication() -> None:
@@ -257,10 +257,54 @@ def test_finalization_keeps_evidence_live_through_publication() -> None:
                 with finalize_forward_run(
                     candidate, read_truth,
                 ) as (value, verify):
+                    runner._validate_outcome(claim, value)
+                    for mutate in (
+                        lambda item: item.update(
+                            {"diagnostic": {"x": True}},
+                        ),
+                        lambda item: item["diagnostic"][
+                            "paired_squared_error"
+                        ]["zero"].update({"date_count": 5}),
+                        lambda item: item["diagnostic"][
+                            "paired_squared_error"
+                        ]["zero"]["intervals"].update({"20": [0.0, 1.0]}),
+                        lambda item: item.update(
+                            {"descriptive": {"x": True}},
+                        ),
+                        lambda item: item["descriptive"][
+                            "direction_accuracy"
+                        ].update({
+                            "spy-direction-gated-five-seed-mean": 1.1,
+                        }),
+                        lambda item: item["descriptive"][
+                            "market_regime_cells"
+                        ]["negative"].update({"observation_count": 1}),
+                        lambda item: item["descriptive"][
+                            "nondecision_block_intervals"
+                        ]["zero"].update({"5": [1.0, 0.0]}),
+                        lambda item: item["descriptive"][
+                            "seed_dispersion"
+                        ].update({"mean_raw_population_std": -1.0}),
+                    ):
+                        changed = json_value(value)
+                        mutate(changed)
+                        rejects(runner._validate_outcome, claim, changed)
+                    changed = json_value(value)
+                    name = expected_forward_protocol()["candidate"]["name"]
+                    accuracy = changed["descriptive"][
+                        "direction_accuracy"
+                    ]
+                    accuracy[name] = 0.0 if accuracy[name] != 0.0 else 1.0
+                    runner._validate_outcome(claim, changed)
+                    rejects(
+                        runner.publish_forward_outcome,
+                        claim, changed, verify,
+                    )
+                    assert not (parent / "outcome.json").exists()
                     marker = runner.publish_forward_outcome(
                         claim, value, verify,
                     )
-                    verify()
+                    verify(value)
             finally:
                 runner._CLAIMS.pop(id(claim), None)
 
@@ -414,8 +458,7 @@ def test_truth_grid_must_exactly_match_the_candidate() -> None:
 
 
 def main() -> None:
-    test_evaluates_only_the_preregistered_primary_gates()
-    test_all_five_gates_are_strict_and_conjunctive()
+    test_reports_preliminary_diagnostic_without_a_decision()
     test_finalization_keeps_evidence_live_through_publication()
     test_imported_callers_cannot_claim_or_publish()
     test_candidate_and_receipt_tampering_after_truth_is_rejected()

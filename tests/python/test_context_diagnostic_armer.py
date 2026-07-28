@@ -62,6 +62,13 @@ def authenticate(attempt: object) -> None:
         lease()
 
 
+def replay(attempt: object) -> None:
+    with armer.replay_context_attempt(
+        attempt,  # type: ignore[arg-type]
+    ) as lease:
+        lease()
+
+
 def test_private_snapshot_mutation_fails_verification() -> None:
     with tempfile.TemporaryDirectory(
         prefix="context-snapshot-", dir=ROOT,
@@ -291,6 +298,52 @@ def test_exact_one_shot_attempt() -> None:
             raises(fixture.arm)
 
 
+def test_historical_replay_keeps_strict_authentication_default() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-replay-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        files = tuple(
+            FileBinding(path, digest(f"historical-{path}"))
+            for path in fixture.source_paths
+        )
+        historical_tree = SourceTree(
+            str(fixture.root), files, _tree_digest(files),
+        )
+        seen = []
+        with fixture.patched():
+            original = fixture.arm()
+            attempt = replace(original, source_tree=historical_tree)
+            with patch.object(
+                armer, "_validate_commit",
+                side_effect=lambda _commit, tree: seen.append(tree),
+            ):
+                raises(authenticate, attempt)
+                replay(attempt)
+        assert seen == [original.source_tree, historical_tree]
+
+
+def test_historical_replay_rejects_forged_source_trees() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="context-replay-forgery-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        with fixture.patched():
+            original = fixture.arm()
+            empty = SourceTree(str(fixture.root), (), _tree_digest(()))
+            wrong = (
+                FileBinding("source/wrong.py", digest("wrong")),
+            )
+            for tree in (
+                empty,
+                replace(original.source_tree, root=str(fixture.root.parent)),
+                SourceTree(
+                    str(fixture.root), wrong, _tree_digest(wrong),
+                ),
+            ):
+                raises(replay, replace(original, source_tree=tree))
+
+
 def test_existing_destination_blocks_all_work() -> None:
     for destination in ("attempt", "run"):
         with tempfile.TemporaryDirectory(
@@ -401,6 +454,8 @@ def test_commit_must_bind_the_source_tree() -> None:
 
     with patch.object(armer.subprocess, "run", side_effect=run):
         armer._validate_commit("1" * 40, tree)
+        for commit in ("1" * 12, "HEAD", "1" * 39):
+            raises(armer._validate_commit, commit, tree)
 
     def changed(
         command: tuple[str, ...], **_kwargs: object,
@@ -434,6 +489,8 @@ def test_path_identity_is_fixed() -> None:
 def main() -> None:
     test_private_snapshot_mutation_fails_verification()
     test_exact_one_shot_attempt()
+    test_historical_replay_keeps_strict_authentication_default()
+    test_historical_replay_rejects_forged_source_trees()
     test_existing_destination_blocks_all_work()
     test_input_mutation_prevents_publication()
     test_source_tree_mutation_prevents_publication()

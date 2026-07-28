@@ -127,6 +127,7 @@ if __name__ == "__main__":
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import fmean
 import argparse
 import math
 import os
@@ -156,7 +157,7 @@ from tools.spy_residual_forward_inputs import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
-Verify = Callable[[], None]
+Verify = Callable[[Mapping[str, object]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,13 +247,167 @@ def publish_forward_outcome(
             _TERMINAL_OUTCOME = marker
 
     _write_json(
-        outcome, value, verify, claim.identity,
+        outcome, value, lambda: verify(value), claim.identity,
         accept_committed_error=True, on_committed=committed,
     )
     if marker is None:
         raise OSError("terminal forward outcome was not authenticated")
     _verify_terminal_outcome(marker)
     return marker
+
+
+def _validate_diagnostic(
+    value: object, protocol: Mapping[str, object],
+) -> None:
+    """Require the exact finite nondecision metric schema."""
+    fields = {
+        "paired_squared_error", "pooled_raw_residual_r2_vs_zero",
+        "pooled_raw_residual_r2_without_stock",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields or \
+       not isinstance(value["paired_squared_error"], Mapping) or \
+       set(value["paired_squared_error"]) != set(
+           protocol["metrics"]["references"],
+       ) or not isinstance(
+           value["pooled_raw_residual_r2_without_stock"], Mapping,
+       ) or set(
+           value["pooled_raw_residual_r2_without_stock"],
+       ) != set(FORWARD_UNIVERSE) or not all(
+           type(item) is float and math.isfinite(item)
+           for item in (
+               value["pooled_raw_residual_r2_vs_zero"],
+               *value["pooled_raw_residual_r2_without_stock"].values(),
+           )
+       ):
+        raise ValueError("forward diagnostic changed")
+
+    candidate = protocol["candidate"]["name"]
+    widths = tuple(map(
+        str, protocol["metrics"]["bootstrap"]["block_sessions"],
+    ))
+    comparison_fields = {
+        "candidate", "date_count", "intervals", "losses", "mean_gain",
+        "per_stock_mean_gain", "reference", "ties", "wins",
+    }
+    for reference, comparison in value["paired_squared_error"].items():
+        if not isinstance(comparison, Mapping) or \
+           set(comparison) != comparison_fields or \
+           comparison["candidate"] != candidate or \
+           comparison["reference"] != reference or \
+           comparison["date_count"] != TARGET_SESSIONS or \
+           not isinstance(comparison["intervals"], Mapping) or \
+           tuple(comparison["intervals"]) != widths or \
+           not isinstance(comparison["per_stock_mean_gain"], Mapping) or \
+           set(comparison["per_stock_mean_gain"]) != set(FORWARD_UNIVERSE):
+            raise ValueError("forward paired diagnostic changed")
+        gains = tuple(comparison["per_stock_mean_gain"].values())
+        counts = tuple(comparison[name] for name in (
+            "wins", "ties", "losses",
+        ))
+        bounds = tuple(comparison["intervals"].values())
+        if any(
+            type(item) is not float or not math.isfinite(item)
+            for item in (*gains, comparison["mean_gain"])
+        ) or comparison["mean_gain"] != fmean(gains) or any(
+            type(item) is not int or item < 0 for item in counts
+        ) or counts != (
+            sum(item > 0.0 for item in gains),
+            sum(item == 0.0 for item in gains),
+            sum(item < 0.0 for item in gains),
+        ) or any(
+            not isinstance(interval, list) or len(interval) != 2 or
+            any(
+                type(item) is not float or not math.isfinite(item)
+                for item in interval
+            ) or interval[0] > interval[1]
+            for interval in bounds
+        ):
+            raise ValueError("forward paired diagnostic changed")
+
+
+def _finite(value: object, lower: float = -math.inf,
+            upper: float = math.inf) -> bool:
+    return type(value) is float and math.isfinite(value) and \
+        lower <= value <= upper
+
+
+def _validate_descriptive(
+    value: object, diagnostic: Mapping[str, object],
+    protocol: Mapping[str, object], expected_count: int,
+) -> None:
+    """Require the exact bounded descriptive metric schema."""
+    fields = {
+        "direction_accuracy", "market_regime_cells", "mean_absolute_error",
+        "nondecision_block_intervals", "seed_dispersion",
+    }
+    candidate = protocol["candidate"]["name"]
+    references = tuple(protocol["metrics"]["references"])
+    family = {candidate, *references}
+    if not isinstance(value, Mapping) or set(value) != fields or any(
+        not isinstance(value.get(name), Mapping)
+        for name in fields
+    ) or set(value["direction_accuracy"]) != family or \
+       set(value["mean_absolute_error"]) != family or any(
+           not _finite(item, 0.0, 1.0)
+           for item in value["direction_accuracy"].values()
+       ) or any(
+           not _finite(item, 0.0)
+           for item in value["mean_absolute_error"].values()
+       ):
+        raise ValueError("forward descriptive metrics changed")
+
+    cells = value["market_regime_cells"]
+    cell_fields = {
+        "candidate_direction_accuracy", "candidate_mean_absolute_error",
+        "mean_squared_error_gain_vs_unchanged_five_seed_mean",
+        "mean_squared_error_gain_vs_zero", "observation_count",
+    }
+    if set(cells) != {"negative", "nonnegative"}:
+        raise ValueError("forward regime cells changed")
+    counts = []
+    for cell in cells.values():
+        if not isinstance(cell, Mapping) or set(cell) != cell_fields:
+            raise ValueError("forward regime cell changed")
+        count = cell["observation_count"]
+        values = tuple(cell[name] for name in cell_fields - {
+            "observation_count",
+        })
+        if type(count) is not int or count < 0 or \
+           (count == 0) != all(item is None for item in values) or \
+           count and (
+               not _finite(cell["candidate_direction_accuracy"], 0.0, 1.0) or
+               not _finite(cell["candidate_mean_absolute_error"], 0.0) or
+               any(not _finite(cell[name]) for name in (
+                   "mean_squared_error_gain_vs_unchanged_five_seed_mean",
+                   "mean_squared_error_gain_vs_zero",
+               ))
+           ):
+            raise ValueError("forward regime cell changed")
+        counts.append(count)
+    if sum(counts) != expected_count or any(
+        count % len(FORWARD_UNIVERSE) for count in counts
+    ):
+        raise ValueError("forward regime counts changed")
+
+    widths = tuple(map(
+        str, protocol["metrics"]["bootstrap"]["block_sessions"],
+    ))
+    intervals = value["nondecision_block_intervals"]
+    paired = diagnostic["paired_squared_error"]
+    if set(intervals) != set(references) or any(
+        not isinstance(intervals[reference], Mapping) or
+        tuple(intervals[reference]) != widths or
+        not _exact_json(
+            intervals[reference], paired[reference]["intervals"],
+        )
+        for reference in references
+    ):
+        raise ValueError("forward descriptive intervals changed")
+    dispersion = value["seed_dispersion"]
+    if set(dispersion) != {
+        "mean_gated_population_std", "mean_raw_population_std",
+    } or any(not _finite(item, 0.0) for item in dispersion.values()):
+        raise ValueError("forward seed dispersion changed")
 
 
 def _validate_outcome(
@@ -265,28 +420,25 @@ def _validate_outcome(
             raise ValueError("forward failure outcome changed")
         return
     fields = {
-        "descriptive", "decision", "evidence_role", "gates", "inputs",
-        "integrity", "locks", "primary", "run", "sample", "schema", "type",
+        "descriptive", "diagnostic", "evidence_role", "inputs", "integrity",
+        "interpretation", "locks", "run", "sample", "schema", "type",
     }
     batches = TARGET_SESSIONS * HORIZON_BARS
     expected_count = batches * len(FORWARD_UNIVERSE)
-    decision = value.get("decision")
+    interpretation = value.get("interpretation")
     run = value.get("run")
     sample = value.get("sample")
     inputs = value.get("inputs")
-    gates = value.get("gates")
     integrity = value.get("integrity")
     protocol = expected_forward_protocol()
     if set(value) != fields or value.get("schema") != 1 or \
        kind != "spy-residual-forward-outcome" or \
        value.get("evidence_role") != \
-            "preregistered-forward-test-terminal" or \
+            "predeclared-expedited-forward-diagnostic-terminal" or \
        not isinstance(value.get("descriptive"), Mapping) or \
        not value["descriptive"] or \
-       not isinstance(value.get("primary"), Mapping) or \
-       not value["primary"] or \
-       not isinstance(gates, Mapping) or \
-       set(gates) != set(protocol["gates"]) - {"policy"} or \
+       not isinstance(value.get("diagnostic"), Mapping) or \
+       not value["diagnostic"] or \
        not isinstance(integrity, Mapping) or set(integrity) != {
            "config_sha256", "grid_sha256",
            "implementation_tree_sha256", "prediction_rows_sha256",
@@ -296,16 +448,14 @@ def _validate_outcome(
            integrity["transformer_states"],
            protocol["transformer_states"],
        ) or \
-       not isinstance(decision, Mapping) or set(decision) != {
-           "all_gates_passed", "candidate_status", "output_role", "policy",
-       } or type(decision["all_gates_passed"]) is not bool or \
-       decision["candidate_status"] != (
-           "retained-for-separate-absolute-return-experiment"
-           if decision["all_gates_passed"] else
-           "rejected-retain-zero-residual-and-stop-family"
-       ) or decision["output_role"] != \
-            "residual-only-not-executable-return" or \
-       decision["policy"] != "all-required" or \
+       not _exact_json(interpretation, {
+           "candidate_status":
+               "unchanged-pending-confirmatory-forward-evidence",
+           "output_role": "residual-only-not-executable-return",
+           "policy": "none-preliminary-diagnostic",
+           "uncertainty_role":
+               "conditional-descriptive-not-confidence-interval",
+       }) or \
        not _exact_json(run, {
            "batches": batches,
            "id": FORWARD_RUN_ID,
@@ -319,8 +469,12 @@ def _validate_outcome(
            "target_session_count": TARGET_SESSIONS,
        }) or not isinstance(inputs, Mapping) or set(inputs) != {
            "candidate", "truth_access",
-       }:
+        }:
         raise ValueError("forward success outcome changed")
+    _validate_diagnostic(value["diagnostic"], protocol)
+    _validate_descriptive(
+        value["descriptive"], value["diagnostic"], protocol, expected_count,
+    )
     candidate, receipt = inputs["candidate"], inputs["truth_access"]
     if not isinstance(candidate, Mapping) or set(candidate) != {
         "directory_identity", "identity", "path", "records", "sha256",
@@ -338,33 +492,6 @@ def _validate_outcome(
         ):
             raise ValueError("forward outcome identity changed")
         _sha256(binding["sha256"], "forward outcome binding")
-    for name, gate in gates.items():
-        expected = protocol["gates"][name]
-        observed = gate.get("observed") if isinstance(gate, Mapping) else None
-        operator = (
-            "greater-than-or-equal"
-            if name == "minimum_stocks_with_positive_mse_gain_vs_zero"
-            else "greater-than"
-        )
-        valid_observation = (
-            type(observed) is int and 0 <= observed <= len(FORWARD_UNIVERSE)
-            if operator.endswith("or-equal") else
-            type(observed) is float and math.isfinite(observed)
-        )
-        if not isinstance(gate, Mapping) or set(gate) != {
-            "observed", "operator", "passed", "required",
-        } or type(gate["passed"]) is not bool or \
-           not _exact_json(gate["required"], expected) or \
-           gate["operator"] != operator or not valid_observation or \
-           gate["passed"] != (
-               observed >= expected
-               if operator.endswith("or-equal") else observed > expected
-           ):
-            raise ValueError("forward outcome gate changed")
-    if decision["all_gates_passed"] != all(
-        gate["passed"] for gate in gates.values()
-    ):
-        raise ValueError("forward outcome decision changed")
     for name in (
         "grid_sha256", "implementation_tree_sha256",
         "prediction_rows_sha256",
@@ -443,9 +570,11 @@ def execute_forward_attempt(
                 candidate, read_truth,
             ) as (value, verify_evidence):
 
-                def verify_terminal() -> None:
+                def verify_terminal(
+                    observed: Mapping[str, object],
+                ) -> None:
                     verify()
-                    verify_evidence()
+                    verify_evidence(observed)
 
                 terminal = publish_forward_outcome(
                     claim, value, verify_terminal,
@@ -461,7 +590,7 @@ def execute_forward_attempt(
             try:
                 publish_forward_outcome(
                     claim, _failure_value(stage),
-                    lambda: _verify_claim(claim),
+                    lambda _value: _verify_claim(claim),
                 )
             except (OSError, ValueError):
                 pass

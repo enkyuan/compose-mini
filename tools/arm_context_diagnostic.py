@@ -452,6 +452,8 @@ def _derive_phases(
 
 def _validate_commit(commit: str, tree: SourceTree) -> None:
     """Require the declared commit to contain the exact bound source bytes."""
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        raise ValueError("implementation commit is invalid")
     try:
         kind = subprocess.run(
             (
@@ -641,10 +643,10 @@ def _bound_context(
 
 
 @contextmanager
-def authenticate_context_attempt(
-    attempt: ContextAttempt,
+def _context_attempt_lease(
+    attempt: ContextAttempt, *, replay: bool,
 ) -> Iterator[ContextLease]:
-    """Hold one source-derived attempt lease through execution."""
+    """Authenticate one attempt against its live or recorded source tree."""
     _require_isolated_execution()
     if not isinstance(attempt, ContextAttempt):
         raise ValueError("context attempt is invalid")
@@ -652,16 +654,45 @@ def authenticate_context_attempt(
         Path(attempt.primary_python.path),
         Path(attempt.torch_probe.python.path),
     ) as bound:
-        _validate_commit(attempt.implementation_commit, bound.tree)
+        if replay:
+            recorded = asdict(attempt.source_tree)
+            recorded["files"] = list(recorded["files"])
+            tree = SourceTree.parse(
+                recorded, "context attempt source tree",
+                CONTEXT_SOURCE_PATHS,
+            )
+            if tree.root != str(ROOT.resolve(strict=True)):
+                raise ValueError("context attempt source root changed")
+        else:
+            tree = bound.tree
+        _validate_commit(attempt.implementation_commit, tree)
         if attempt.master != bound.master or \
            attempt.phases != bound.phases or \
            attempt.primary_python != bound.primary or \
            attempt.torch_argv != bound.torch_argv or \
            attempt.torch_probe != bound.torch or \
-           attempt.source_tree != bound.tree:
+           attempt.source_tree != tree:
             raise ValueError("context attempt is not source-derived")
         bound.verify()
         yield ContextLease(bound.snapshots, bound.verify)
+
+
+@contextmanager
+def authenticate_context_attempt(
+    attempt: ContextAttempt,
+) -> Iterator[ContextLease]:
+    """Hold one attempt whose implementation is still the live source tree."""
+    with _context_attempt_lease(attempt, replay=False) as lease:
+        yield lease
+
+
+@contextmanager
+def replay_context_attempt(
+    attempt: ContextAttempt,
+) -> Iterator[ContextLease]:
+    """Re-derive inputs while authenticating the recorded implementation."""
+    with _context_attempt_lease(attempt, replay=True) as lease:
+        yield lease
 
 
 def arm(

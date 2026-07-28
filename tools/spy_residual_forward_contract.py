@@ -1,4 +1,4 @@
-"""Freeze one SPY-direction-gated residual forward test."""
+"""Freeze the six-session SPY-residual forward diagnostic."""
 
 from collections.abc import Mapping
 
@@ -9,19 +9,19 @@ from tools.relative_context_contract import (
 )
 from tools.spy_residual_gate import SPY_DIRECTION_SCALE
 from tools.universe_cross_section import CROSS_SECTION_SEED
-from tools.universe_scaling import (
-    BOOTSTRAP_BLOCK_DAYS, BOOTSTRAP_REPLICATES,
-)
+from tools.universe_scaling import BOOTSTRAP_REPLICATES
 
-FORWARD_RUN_ID = "h13-spy-direction-forward-20260726-01"
+FORWARD_RUN_ID = "h13-spy-direction-forward-20260727-01"
 FORWARD_CONFIG = FileBinding(
-    "experiments/executable-h13-spy-direction-forward.example.json",
-    "7714ac740f45c940a110eb52f7fa1a0d86706b4d1ba91184ff57cab8fbd23510",
+    "experiments/executable-h13-spy-direction-forward-aug5.example.json",
+    "360093b398c1dabb5411a1b60d14a1c93046188b383a27a921fbc86e5783efc3",
 )
 FORWARD_SOURCE_PATHS = tuple(sorted({
     *RESIDUAL_SOURCE_PATHS,
     "tools/analyze_spy_residual_shrinkage.py",
     "tools/arm_spy_residual_forward.py",
+    "tools/atomic_bundle.py",
+    "tools/fetch_spy_residual_forward.py",
     "tools/finalize_spy_residual_forward.py",
     "tools/run_spy_residual_forward.py",
     "tools/spy_residual_forward_contract.py",
@@ -53,8 +53,12 @@ FORWARD_SOURCES = (
 )
 FORWARD_CALENDAR = (
     "forward_calendar",
-    "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
-    "997d751a5a2ae8b2c51f4b500bd27ec94155359e211d1f9cfef198d5f156c362",
+    "universes/us-equities-core-forward-2026-05-19_2026-08-05.json",
+    "d2d7670c4574157fa1d34d0c3ff66866364c982fdb67f687101033d2592a8bb0",
+)
+FORWARD_TARGET_SESSIONS = (
+    "2026-07-29", "2026-07-30", "2026-07-31",
+    "2026-08-03", "2026-08-04", "2026-08-05",
 )
 STATE_FINGERPRINTS = (
     "fe12e7e77d81eb6761defa27f423739e634d55c608beb30d9125b2631fc1049b",
@@ -80,10 +84,11 @@ EXECUTION_LOCKS = (
 
 
 def expected_forward_protocol() -> dict[str, object]:
-    """Return a fresh copy of the sole allowed forward-test profile."""
+    """Return a fresh copy of the fixed August 5 diagnostic."""
     return {
         "schema": 1,
-        "evidence_role": "preregistered-forward-test-not-yet-executed",
+        "evidence_role":
+            "predeclared-expedited-forward-diagnostic-not-yet-executed",
         "candidate": {
             "name": "spy-direction-gated-five-seed-mean",
             "model": "panel_transformer",
@@ -117,15 +122,16 @@ def expected_forward_protocol() -> dict[str, object]:
             "sampling": "session_samples-identical-canonical-triples",
             "entry_boundary":
                 "strictly-after-final-inspected-calibration-target",
-            "first_target_session": "earliest-full-target-session",
-            "target_session_count": 60,
-            "target_session_sequence": "first-plus-next-calendar-sessions",
+            "target_session_count": len(FORWARD_TARGET_SESSIONS),
+            "target_session_sequence": "explicit-calendar-sessions",
+            "target_sessions": list(FORWARD_TARGET_SESSIONS),
             "optional_stopping": False,
             "coverage": "complete-universe-and-spy-grids-or-fail",
             "missing_coverage": "fail-without-changing-window",
             "sample_selection":
                 "all-canonical-triples-with-target-in-fixed-session-set",
-            "window_derivation": "bound-calendar-before-market-data",
+            "window_derivation":
+                "bound-calendar-and-target-sessions-before-market-data",
         },
         "metrics": {
             "paired_gain":
@@ -133,11 +139,12 @@ def expected_forward_protocol() -> dict[str, object]:
             "references": ["zero", "unchanged-five-seed-mean"],
             "bootstrap": {
                 "method": "shared-circular-target-session-block",
-                "block_sessions": list(BOOTSTRAP_BLOCK_DAYS),
-                "decision_block_sessions": 20,
+                "block_sessions": [5],
                 "replicates": BOOTSTRAP_REPLICATES,
                 "seed": CROSS_SECTION_SEED,
                 "interval": "equal-tailed-95-percentile",
+                "interpretation":
+                    "conditional-descriptive-not-confidence-interval",
                 "weighting": "stock-macro",
             },
             "descriptive": [
@@ -147,7 +154,8 @@ def expected_forward_protocol() -> dict[str, object]:
                 "seed-dispersion",
                 "nondecision-block-intervals",
             ],
-            "descriptive_role": "report-only-cannot-rescue-failed-gate",
+            "descriptive_role":
+                "preliminary-only-cannot-authorize-promotion-or-trading",
             "raw_residual_r2_convention":
                 "one-minus-sse-over-uncentered-zero-baseline-truth-energy",
             "leave_one_stock_out_convention":
@@ -155,18 +163,7 @@ def expected_forward_protocol() -> dict[str, object]:
             "stock_win_convention":
                 "strictly-positive-per-stock-mean-paired-squared-error-gain",
         },
-        "gates": {
-            "pooled_raw_residual_r2_vs_zero_min_exclusive": 0.0,
-            "decision_paired_mse_gain_lower_bound_vs_zero_min_exclusive": 0.0,
-            (
-                "decision_paired_mse_gain_lower_bound_vs_"
-                "unchanged_five_seed_mean_min_exclusive"
-            ): 0.0,
-            "minimum_leave_one_stock_out_raw_residual_r2_vs_zero_exclusive":
-                0.0,
-            "minimum_stocks_with_positive_mse_gain_vs_zero": 6,
-            "policy": "all-required",
-        },
+        "gates": {"policy": "none-preliminary-diagnostic"},
         "locks": {name: False for name in EXECUTION_LOCKS},
     }
 
@@ -174,8 +171,8 @@ def expected_forward_protocol() -> dict[str, object]:
 def validate_forward_protocol(
     value: object,
 ) -> Mapping[str, object]:
-    """Reject any choice outside the preregistered forward test."""
+    """Reject any change to the preregistered diagnostic."""
     expected = expected_forward_protocol()
     if not _exact_json(value, expected):
-        raise ValueError("config does not match the SPY residual forward test")
+        raise ValueError("config does not match the SPY residual diagnostic")
     return expected

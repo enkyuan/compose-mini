@@ -92,7 +92,7 @@ if __name__ == "__main__":
     _bootstrap_main()
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import argparse
@@ -109,6 +109,7 @@ if str(ROOT) not in tuple(map(os.path.realpath, sys.path)):
 from tools.analyze_context_cross_section import _completed_run
 from tools.arm_context_diagnostic import (
     ContextLease, _validate_commit, authenticate_context_attempt,
+    replay_context_attempt,
 )
 from tools.context_diagnostic_contract import (
     ContextAttempt, PYTHON_FLAGS,
@@ -327,8 +328,13 @@ def _binding_matches(
 
 
 @contextmanager
-def _bound_residual() -> Iterator[_BoundResidual]:
+def _bound_residual(
+    authenticate_context: Callable[
+        [ContextAttempt], AbstractContextManager[ContextLease],
+    ] | None = None,
+) -> Iterator[_BoundResidual]:
     """Freeze and continuously verify the executable residual closure."""
+    authenticate_context = authenticate_context or authenticate_context_attempt
     source_attempt_path = ROOT / RESIDUAL_SOURCE["context_attempt"].path
     attempt_identities = _single_link_inputs(
         (source_attempt_path,), "source context attempt",
@@ -397,7 +403,7 @@ def _bound_residual() -> Iterator[_BoundResidual]:
             (name, _frozen(frozen, ROOT / binding.path))
             for name, binding in RESIDUAL_BENCHMARK.items()
         )
-        with authenticate_context_attempt(context) as context_lease:
+        with authenticate_context(context) as context_lease:
             calendar = context_lease.snapshots.calendar
             if calendar.source != ROOT / RESIDUAL_CALENDAR.path or \
                calendar.sha256 != RESIDUAL_CALENDAR.sha256:
@@ -433,10 +439,10 @@ def _bound_residual() -> Iterator[_BoundResidual]:
 
 
 @contextmanager
-def authenticate_residual_attempt(
-    attempt: ResidualAttempt,
+def _residual_attempt_lease(
+    attempt: ResidualAttempt, *, replay: bool,
 ) -> Iterator[ResidualLease]:
-    """Hold one source-derived residual attempt lease through execution."""
+    """Authenticate one residual attempt against live or recorded sources."""
     _require_isolated_execution()
     if not isinstance(attempt, ResidualAttempt):
         raise ValueError("residual attempt is invalid")
@@ -450,17 +456,23 @@ def authenticate_residual_attempt(
     path = ROOT / logical
     identities = _single_link_inputs((path,), "residual attempt")
     with freeze_inputs((path,)) as frozen:
-        with _bound_residual() as bound:
+        context_authenticator = (
+            replay_context_attempt if replay else authenticate_context_attempt
+        )
+        with _bound_residual(context_authenticator) as bound:
             published = ResidualAttempt.read(
                 frozen[0].snapshot, Path(attempt.attempt_path),
                 ROOT, bound.context_attempt,
             )
-            _validate_commit(attempt.implementation_commit, bound.tree)
+            tree = attempt.source_tree if replay else bound.tree
+            _validate_commit(attempt.implementation_commit, tree)
+            value = _attempt_value(
+                Path(attempt.attempt_path),
+                attempt.implementation_commit, attempt.run_id, bound,
+            )
+            value["source_tree"] = asdict(tree)
             expected = _parse_constructed(
-                _attempt_value(
-                    Path(attempt.attempt_path),
-                    attempt.implementation_commit, attempt.run_id, bound,
-                ),
+                value,
                 Path(attempt.attempt_path), bound.context_attempt,
             )
             if attempt != published or published != expected:
@@ -479,6 +491,24 @@ def authenticate_residual_attempt(
                 bound.context_lease, bound.benchmark, verify,
             )
             verify()
+
+
+@contextmanager
+def authenticate_residual_attempt(
+    attempt: ResidualAttempt,
+) -> Iterator[ResidualLease]:
+    """Hold one attempt whose implementation is still the live source tree."""
+    with _residual_attempt_lease(attempt, replay=False) as lease:
+        yield lease
+
+
+@contextmanager
+def replay_residual_attempt(
+    attempt: ResidualAttempt,
+) -> Iterator[ResidualLease]:
+    """Re-derive inputs while authenticating the recorded implementation."""
+    with _residual_attempt_lease(attempt, replay=True) as lease:
+        yield lease
 
 
 def _published_bytes(

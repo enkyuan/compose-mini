@@ -21,7 +21,7 @@ from tools.analyze_spy_residual_shrinkage import (
 )
 from tools.arm_spy_residual import (
     ResidualLease, _directory_members, _single_link_inputs,
-    authenticate_residual_attempt,
+    replay_residual_attempt,
 )
 from tools.context_diagnostic_contract import ContextAttempt
 from tools.context_diagnostic_inputs import (
@@ -54,7 +54,7 @@ from tools.spy_residual_forward_inputs import (
 )
 
 Verify = Callable[[], None]
-PURPOSE = "Authenticate the fixed SPY-residual forward holdout."
+PURPOSE = "Authenticate the fixed expedited SPY-residual forward diagnostic."
 FORWARD_RUN_DIR = ROOT / "reports" / FORWARD_RUN_ID
 FORWARD_CANDIDATE = FORWARD_RUN_DIR / "candidate.jsonl"
 FORWARD_TRUTH_RECEIPT = FORWARD_RUN_DIR / "truth-access.json"
@@ -399,7 +399,7 @@ def _bound_historical() -> Iterator[_Historical]:
             frozen[source_paths["calibration_fits"]].snapshot,
             context, attempt,
         )
-        with authenticate_residual_attempt(attempt) as lease:
+        with replay_residual_attempt(attempt) as lease:
             calendar_input = lease.context.snapshots.calendar
             calendar = SessionCalendar.read(calendar_input.snapshot)
             csv = dict(lease.context.snapshots.csv)
@@ -500,6 +500,19 @@ def _validate_bundle_report(
     calendar: SessionCalendar,
     future: Sequence[tuple[str, FrozenInput]],
 ) -> None:
+    supplied_tree = (
+        value.get("implementation_tree")
+        if isinstance(value, Mapping) else None
+    )
+    try:
+        implementation = SourceTree.parse(
+            supplied_tree, "forward fetch implementation",
+            FORWARD_SOURCE_PATHS,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("forward Massive bundle report changed") from error
+    if implementation != selected_source_tree(ROOT, FORWARD_SOURCE_PATHS):
+        raise ValueError("forward Massive bundle report changed")
     bins = tuple(expected_bins(
         calendar, calendar.start, calendar.end, INTERVAL_MINUTES,
     ))
@@ -529,6 +542,7 @@ def _validate_bundle_report(
         },
         "end": str(calendar.end),
         "interval_minutes": INTERVAL_MINUTES,
+        "implementation_tree": supplied_tree,
         "provider": "massive",
         "purpose": PURPOSE,
         "schema": 1,

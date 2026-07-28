@@ -741,7 +741,7 @@ def test_sensitivity_report_remains_planning_only() -> None:
         comparisons, "d" * 40,
     )
     changed = expected_forward_protocol()
-    changed["forward_window"]["target_session_count"] = 61
+    changed["forward_window"]["target_session_count"] = 7
     rejects(
         _sensitivity_report, SENSITIVITY_INPUTS, changed,
         comparisons, "d" * 40,
@@ -980,8 +980,8 @@ def test_sensitivity_reads_calibration_only() -> None:
         def sensitivity(*args: object, **kwargs: object) -> object:
             events.append("sensitivity")
             assert kwargs == {
-                "target_sessions": 60,
-                "block_sessions": 20,
+                "target_sessions": 6,
+                "block_sessions": 5,
                 "replicates": 10_000,
                 "seed": 20_260_725,
             }

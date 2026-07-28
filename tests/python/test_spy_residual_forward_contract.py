@@ -17,7 +17,7 @@ from tools.spy_residual_forward_contract import (
 )
 
 CONFIG = ROOT / \
-    "experiments/executable-h13-spy-direction-forward.example.json"
+    "experiments/executable-h13-spy-direction-forward-aug5.example.json"
 STATES = (
     (7, "fe12e7e77d81eb6761defa27f423739e634d55c608beb30d9125b2631fc1049b"),
     (19, "3e2ccdc591baaf9d3b94efdeeddd86b6fed913bf7ea7fce29b6ec38f0c0fc2d2"),
@@ -54,9 +54,9 @@ SOURCES = {
     },
     "forward_calendar": {
         "path":
-            "universes/us-equities-core-forward-2026-05-19_2026-08-18.json",
+            "universes/us-equities-core-forward-2026-05-19_2026-08-05.json",
         "sha256":
-            "997d751a5a2ae8b2c51f4b500bd27ec94155359e211d1f9cfef198d5f156c362",
+            "d2d7670c4574157fa1d34d0c3ff66866364c982fdb67f687101033d2592a8bb0",
     },
 }
 LOCKS = {
@@ -69,17 +69,10 @@ LOCKS = {
     "candidate_search_authorized": False,
     "truth_access_before_verified_prediction_ledger_authorized": False,
 }
-GATES = {
-    "decision_paired_mse_gain_lower_bound_vs_zero_min_exclusive": 0.0,
-    (
-        "decision_paired_mse_gain_lower_bound_vs_"
-        "unchanged_five_seed_mean_min_exclusive"
-    ): 0.0,
-    "minimum_leave_one_stock_out_raw_residual_r2_vs_zero_exclusive": 0.0,
-    "minimum_stocks_with_positive_mse_gain_vs_zero": 6,
-    "policy": "all-required",
-    "pooled_raw_residual_r2_vs_zero_min_exclusive": 0.0,
-}
+TARGET_SESSIONS = (
+    "2026-07-29", "2026-07-30", "2026-07-31",
+    "2026-08-03", "2026-08-04", "2026-08-05",
+)
 
 
 def rejects(mutate: object) -> None:
@@ -106,7 +99,7 @@ def verify_exact_profile_and_literals() -> None:
     assert validate_forward_protocol(value) == expected
     assert value["schema"] == 1
     assert value["evidence_role"] == \
-        "preregistered-forward-test-not-yet-executed"
+        "predeclared-expedited-forward-diagnostic-not-yet-executed"
     candidate = value["candidate"]
     assert candidate["name"] == "spy-direction-gated-five-seed-mean"
     assert candidate["model"] == "panel_transformer"
@@ -140,15 +133,16 @@ def verify_exact_profile_and_literals() -> None:
         "sampling": "session_samples-identical-canonical-triples",
         "entry_boundary":
             "strictly-after-final-inspected-calibration-target",
-        "first_target_session": "earliest-full-target-session",
-        "target_session_count": 60,
-        "target_session_sequence": "first-plus-next-calendar-sessions",
+        "target_session_count": len(TARGET_SESSIONS),
+        "target_session_sequence": "explicit-calendar-sessions",
+        "target_sessions": list(TARGET_SESSIONS),
         "optional_stopping": False,
         "coverage": "complete-universe-and-spy-grids-or-fail",
         "missing_coverage": "fail-without-changing-window",
         "sample_selection":
             "all-canonical-triples-with-target-in-fixed-session-set",
-        "window_derivation": "bound-calendar-before-market-data",
+        "window_derivation":
+            "bound-calendar-and-target-sessions-before-market-data",
     }
     assert value["metrics"] == {
         "paired_gain":
@@ -156,11 +150,12 @@ def verify_exact_profile_and_literals() -> None:
         "references": ["zero", "unchanged-five-seed-mean"],
         "bootstrap": {
             "method": "shared-circular-target-session-block",
-            "block_sessions": [5, 10, 20],
-            "decision_block_sessions": 20,
+            "block_sessions": [5],
             "replicates": 10_000,
             "seed": 20_260_725,
             "interval": "equal-tailed-95-percentile",
+            "interpretation":
+                "conditional-descriptive-not-confidence-interval",
             "weighting": "stock-macro",
         },
         "descriptive": [
@@ -168,7 +163,8 @@ def verify_exact_profile_and_literals() -> None:
             "market-regime-cells", "seed-dispersion",
             "nondecision-block-intervals",
         ],
-        "descriptive_role": "report-only-cannot-rescue-failed-gate",
+        "descriptive_role":
+            "preliminary-only-cannot-authorize-promotion-or-trading",
         "raw_residual_r2_convention":
             "one-minus-sse-over-uncentered-zero-baseline-truth-energy",
         "leave_one_stock_out_convention":
@@ -176,10 +172,12 @@ def verify_exact_profile_and_literals() -> None:
         "stock_win_convention":
             "strictly-positive-per-stock-mean-paired-squared-error-gain",
     }
-    assert value["gates"] == GATES
+    assert value["gates"] == {"policy": "none-preliminary-diagnostic"}
     assert value["locks"] == LOCKS
     assert {
         "tools/analyze_spy_residual_shrinkage.py",
+        "tools/atomic_bundle.py",
+        "tools/fetch_spy_residual_forward.py",
         "tools/finalize_spy_residual_forward.py",
     }.issubset(FORWARD_SOURCE_PATHS)
 
@@ -223,10 +221,15 @@ def verify_required_rejections() -> None:
             {"target_kind": "executable-return-v1"},
         ),
         lambda item: item["forward_window"].update(
-            {"target_session_count": 59},
+            {"target_session_count": 5},
         ),
         lambda item: item["forward_window"].update(
-            {"target_session_count": 61},
+            {"target_session_count": 7},
+        ),
+        lambda item: item["forward_window"]["target_sessions"].pop(),
+        lambda item: item["forward_window"]["target_sessions"].reverse(),
+        lambda item: item["forward_window"].update(
+            {"target_session_sequence": "first-plus-next-calendar-sessions"},
         ),
         lambda item: item["forward_window"].update(
             {"optional_stopping": True},
@@ -260,10 +263,10 @@ def verify_required_rejections() -> None:
             {"stock_win_convention": "positive-point-count"},
         ),
         lambda item: item["gates"].update(
-            {"minimum_stocks_with_positive_mse_gain_vs_zero": 5},
+            {"policy": "all-required"},
         ),
         lambda item: item["metrics"]["bootstrap"].update(
-            {"decision_block_sessions": 10},
+            {"block_sessions": [5, 10]},
         ),
         lambda item: item.update({"extra": True}),
         lambda item: item.pop("metrics"),

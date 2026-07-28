@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from tools import arm_spy_residual as armer
 from tools.files import ExclusiveTemp, FrozenInput
 from tools.panel_contract import (
-    ExecutableBinding, FileBinding, SourceTree, TorchIdentity,
+    ExecutableBinding, FileBinding, SourceTree, TorchIdentity, _tree_digest,
 )
 from tools.relative_context_contract import (
     RESIDUAL_BENCHMARK, RESIDUAL_CALENDAR, RESIDUAL_CONFIG,
@@ -143,7 +143,9 @@ class ArmFixture:
         self.verify_calls += 1
 
     @contextmanager
-    def closure(self) -> Iterator[armer._BoundResidual]:
+    def closure(
+        self, _authenticate_context: object = None,
+    ) -> Iterator[armer._BoundResidual]:
         yield self.bound
 
     @contextmanager
@@ -227,6 +229,46 @@ def test_exact_attempt_and_ordered_lease() -> None:
         assert value["run_id"] == fixture.run_id
         assert value["run_dir"] == f"reports/{fixture.run_id}"
         assert not (fixture.root / "reports" / fixture.run_id).exists()
+
+
+def test_historical_replay_keeps_strict_authentication_default() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="residual-replay-", dir=ROOT,
+    ) as directory:
+        fixture = ArmFixture(Path(directory))
+        files = (
+            FileBinding("tools/historical.py", digest("historical")),
+        )
+        historical_tree = SourceTree(
+            str(fixture.root), files, _tree_digest(files),
+        )
+        attempt = replace(fixture.attempt, source_tree=historical_tree)
+        write(fixture.output_path, "{}\n")
+        seen = []
+
+        def constructed(
+            value: object, *_args: object,
+        ) -> ResidualAttempt:
+            tree = value["source_tree"]  # type: ignore[index]
+            return attempt if tree["sha256"] == historical_tree.sha256 else \
+                fixture.attempt
+
+        with fixture.patched(), patch.object(
+            armer.ResidualAttempt, "read", return_value=attempt,
+        ), patch.object(
+            armer, "_parse_constructed", side_effect=constructed,
+        ), patch.object(
+            armer, "_validate_commit",
+            side_effect=lambda _commit, tree: seen.append(tree),
+        ):
+            raises(
+                lambda: armer.authenticate_residual_attempt(
+                    attempt,
+                ).__enter__(),
+            )
+            with armer.replay_residual_attempt(attempt) as lease:
+                lease()
+        assert seen == [fixture.tree, historical_tree]
 
 
 def test_existing_destination_blocks_before_discovery() -> None:
@@ -539,6 +581,7 @@ def main() -> None:
     test_import_boundary_is_training_free()
     test_attempt_value_inherits_runtime_and_localizes_cache()
     test_exact_attempt_and_ordered_lease()
+    test_historical_replay_keeps_strict_authentication_default()
     test_existing_destination_blocks_before_discovery()
     test_attempt_identity_is_exact()
     test_publication_callbacks_precede_public_inode_verification()

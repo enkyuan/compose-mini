@@ -1,4 +1,4 @@
-"""Evaluate the sole preregistered SPY-residual forward candidate."""
+"""Evaluate the predeclared six-session SPY-residual diagnostic."""
 
 from __future__ import annotations
 
@@ -321,92 +321,22 @@ def _descriptive(
     }
 
 
-def gate_results(
-    pooled: float, zero_lower: float, unchanged_lower: float,
-    minimum_leave_one_out: float, wins: int,
-) -> dict[str, object]:
-    """Apply only the five immutable, strict forward-test requirements."""
-    values = tuple(
-        _finite(value, "forward gate observation")
-        for value in (
-            pooled, zero_lower, unchanged_lower, minimum_leave_one_out,
-        )
-    )
-    if type(wins) is not int or not 0 <= wins <= len(FORWARD_UNIVERSE):
-        raise ValueError("forward stock-win count is invalid")
-    protocol = expected_forward_protocol()
-    thresholds = protocol["gates"]
-    observations = (
-        (
-            "pooled_raw_residual_r2_vs_zero_min_exclusive",
-            values[0], "greater-than",
-        ),
-        (
-            "decision_paired_mse_gain_lower_bound_vs_zero_min_exclusive",
-            values[1], "greater-than",
-        ),
-        (
-            "decision_paired_mse_gain_lower_bound_vs_"
-            "unchanged_five_seed_mean_min_exclusive",
-            values[2], "greater-than",
-        ),
-        (
-            "minimum_leave_one_stock_out_raw_residual_r2_vs_zero_exclusive",
-            values[3], "greater-than",
-        ),
-        (
-            "minimum_stocks_with_positive_mse_gain_vs_zero",
-            wins, "greater-than-or-equal",
-        ),
-    )
-    gates = {
-        name: {
-            "observed": observed,
-            "operator": operator,
-            "passed": observed >= thresholds[name]
-            if operator.endswith("or-equal") else observed > thresholds[name],
-            "required": thresholds[name],
-        }
-        for name, observed, operator in observations
-    }
-    return {
-        "all_gates_passed": all(
-            value["passed"] for value in gates.values()
-        ),
-        "gates": gates,
-    }
-
-
-def _primary_comparison(value: Mapping[str, object]) -> dict[str, object]:
-    """Keep only the preregistered 20-session interval in primary evidence."""
-    intervals = value["intervals"]
-    if not isinstance(intervals, Mapping):
-        raise ValueError("forward comparison intervals changed")
-    return {
-        **{
-            name: item
-            for name, item in value.items() if name != "intervals"
-        },
-        "decision_interval_20": intervals["20"],
-    }
-
-
 def evaluate_forward_candidate(
     records: Sequence[Mapping[str, object]],
     values: Mapping[str, Sequence[ResidualTruthRow]],
 ) -> dict[str, object]:
-    """Score fixed prediction rows without exposing executable returns."""
+    """Report the fixed six-session diagnostic without making a decision."""
     rows = _prediction_rows(records)
     truth = _truth(values, rows.triples)
     zero = _paired_mse_metrics(
-        truth, rows.predictions, CANDIDATE, ZERO,
+        truth, rows.predictions, CANDIDATE, ZERO, block_sessions=(5,),
     )
     unchanged = _paired_mse_metrics(
-        truth, rows.predictions, CANDIDATE, UNCHANGED,
+        truth, rows.predictions, CANDIDATE, UNCHANGED, block_sessions=(5,),
     )
     if any(
         comparison["date_count"] != TARGET_SESSIONS or
-        tuple(comparison["intervals"]) != ("5", "10", "20")
+        tuple(comparison["intervals"]) != ("5",)
         for comparison in (zero, unchanged)
     ):
         raise ValueError("forward paired comparison grid changed")
@@ -414,45 +344,35 @@ def evaluate_forward_candidate(
     without = _leave_one_out_r2(
         truth, rows.predictions[CANDIDATE],
     )
-    decision = gate_results(
-        pooled, zero["intervals"]["20"][0],
-        unchanged["intervals"]["20"][0],
-        min(without.values()), zero["wins"],
-    )
-    passed = decision["all_gates_passed"]
     protocol = expected_forward_protocol()
     descriptive = _descriptive(truth, rows)
     descriptive["nondecision_block_intervals"] = {
         reference: {
-            width: _json_value(comparison["intervals"][width])
-            for width in ("5", "10")
+            "5": _json_value(comparison["intervals"]["5"]),
         }
         for reference, comparison in (
             (ZERO, zero), (UNCHANGED, unchanged),
         )
     }
     return {
-        "decision": {
-            "all_gates_passed": passed,
-            "candidate_status": (
-                "retained-for-separate-absolute-return-experiment"
-                if passed else
-                "rejected-retain-zero-residual-and-stop-family"
-            ),
-            "output_role": "residual-only-not-executable-return",
-            "policy": protocol["gates"]["policy"],
-        },
-        "descriptive": descriptive,
-        "gates": decision["gates"],
-        "locks": protocol["locks"],
-        "primary": {
+        "diagnostic": {
             "paired_squared_error": {
-                ZERO: _primary_comparison(zero),
-                UNCHANGED: _primary_comparison(unchanged),
+                ZERO: _json_value(zero),
+                UNCHANGED: _json_value(unchanged),
             },
             "pooled_raw_residual_r2_vs_zero": pooled,
             "pooled_raw_residual_r2_without_stock": without,
         },
+        "interpretation": {
+            "candidate_status":
+                "unchanged-pending-confirmatory-forward-evidence",
+            "output_role": "residual-only-not-executable-return",
+            "policy": protocol["gates"]["policy"],
+            "uncertainty_role":
+                protocol["metrics"]["bootstrap"]["interpretation"],
+        },
+        "descriptive": descriptive,
+        "locks": protocol["locks"],
         "sample": {
             "batches": len(rows.triples),
             "observation_count": len(records),
@@ -555,7 +475,9 @@ def _receipt(
 @contextmanager
 def finalize_forward_run(
     candidate: CandidateLedger, read_truth: TruthReader,
-) -> Iterator[tuple[dict[str, object], Callable[[], None]]]:
+) -> Iterator[tuple[
+    dict[str, object], Callable[[Mapping[str, object]], None],
+]]:
     """Keep candidate and receipt evidence frozen until publication."""
     if type(candidate) is not CandidateLedger or not callable(read_truth):
         raise TypeError("forward finalization inputs are invalid")
@@ -578,9 +500,9 @@ def finalize_forward_run(
             closure = header["closure"]
             value = {
                 "descriptive": metrics["descriptive"],
-                "decision": metrics["decision"],
-                "evidence_role": "preregistered-forward-test-terminal",
-                "gates": metrics["gates"],
+                "diagnostic": metrics["diagnostic"],
+                "evidence_role":
+                    "predeclared-expedited-forward-diagnostic-terminal",
                 "inputs": {
                     "candidate": {
                         "directory_identity":
@@ -605,8 +527,8 @@ def finalize_forward_run(
                         closure["prediction_rows_sha256"],
                     "transformer_states": closure["states"],
                 },
+                "interpretation": metrics["interpretation"],
                 "locks": metrics["locks"],
-                "primary": metrics["primary"],
                 "run": {
                     "batches": BATCHES,
                     "id": FORWARD_RUN_ID,
@@ -621,8 +543,11 @@ def finalize_forward_run(
             value = _json_value(value)
             if not isinstance(value, dict):
                 raise ValueError("forward outcome is not an object")
+            sealed = _json_line(value)
 
-            def verify() -> None:
+            def verify(observed: Mapping[str, object]) -> None:
+                if _json_line(observed) != sealed:
+                    raise ValueError("forward finalized outcome changed")
                 if candidate.directory_identity != _directory_identity(
                     candidate.path.parent,
                 ) or candidate.identity != _private_identity(
@@ -640,6 +565,6 @@ def finalize_forward_run(
                     frozen_receipt[0].snapshot,
                 )
 
-            verify()
+            verify(value)
             yield value, verify
-            verify()
+            verify(value)

@@ -805,6 +805,8 @@ def _paired_mse_metrics(
     predictions: Mapping[str, Mapping[str, Sequence[float]]],
     candidate: str,
     reference: str,
+    *,
+    block_sessions: Sequence[int] = BOOTSTRAP_BLOCK_DAYS,
 ) -> dict[str, object]:
     """Compare squared errors over the existing common-date panel."""
     daily, _ = _paired_mse_days(
@@ -828,7 +830,7 @@ def _paired_mse_metrics(
             str(width): circular_block_interval(
                 daily, width, BOOTSTRAP_REPLICATES, CROSS_SECTION_SEED,
             )
-            for width in BOOTSTRAP_BLOCK_DAYS
+            for width in block_sessions
         },
         "losses": sum(value < 0.0 for value in per_stock.values()),
         "mean_gain": fmean(per_stock.values()),
@@ -1337,7 +1339,7 @@ def _sensitivity_comparisons(
             target_sessions=frozen["forward_window"][
                 "target_session_count"
             ],
-            block_sessions=bootstrap["decision_block_sessions"],
+            block_sessions=max(bootstrap["block_sessions"]),
             replicates=bootstrap["replicates"],
             seed=bootstrap["seed"],
         )
