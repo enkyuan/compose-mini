@@ -1,0 +1,42 @@
+{
+  "attempt": {
+    "path": "/Users/Enkang.Yuan1/Desktop/Projects/compose-mini/experiments/h13-universe-scaling-20260724-01-attempt.json",
+    "run_id": "h13-universe-scaling-20260724-01",
+    "sha256": "6eae4413d2abc6409fac053ab30cd9753f4460227ac54adb79e4194d51db0750"
+  },
+  "ended": "2026-07-25T13:00:45Z",
+  "exit": 3,
+  "integrity": {
+    "primary_python": {
+      "path": "/Users/Enkang.Yuan1/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3.12",
+      "sha256": "eb9d74b9c7cfdfb2c9b91614edb2c3607360ba46c5aa7fc4557b3a4a23e97cff"
+    },
+    "trusted_finalizer_tree": "a6cbe05f21d66fb891d3ecb46668747d1e501d0044582040c042eeec850324b1"
+  },
+  "outputs": {
+    "fits": {
+      "path": "/Users/Enkang.Yuan1/Desktop/Projects/compose-mini/reports/h13-universe-scaling-20260724-01/fits.jsonl",
+      "sha256": "a41fd3aac8807f7bab11455b0d632363f3b563a8ea691308ca3cac25e03a71c8",
+      "state": "present"
+    },
+    "outcome": {
+      "path": "/Users/Enkang.Yuan1/Desktop/Projects/compose-mini/experiments/h13-universe-scaling-20260724-01-outcome.json",
+      "sha256": null,
+      "state": "absent"
+    },
+    "predictions": {
+      "path": "/Users/Enkang.Yuan1/Desktop/Projects/compose-mini/reports/h13-universe-scaling-20260724-01/predictions.jsonl",
+      "sha256": "1ed1671fc435903b7e36620c3835d619059acdf754e20905ee2a1d276fea515c",
+      "state": "present"
+    },
+    "summary": {
+      "path": "/Users/Enkang.Yuan1/Desktop/Projects/compose-mini/reports/h13-universe-scaling-20260724-01/summary.json",
+      "sha256": "22607ed864f0074bbc2e1fa7447d48ffce23003beb43a0d70a7e0060e6f57b2f",
+      "state": "present"
+    }
+  },
+  "schema": 1,
+  "stage": "analysis",
+  "started": "2026-07-25T04:17:00Z",
+  "status": "gate-failure"
+}
