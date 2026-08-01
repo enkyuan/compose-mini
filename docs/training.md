@@ -295,6 +295,60 @@ This ablation is calibration-only. Do not run a policy-authorized historical
 test or inspect labels through 2026-07-21. Confirmatory evaluation requires a
 pre-registered policy against later, previously unavailable labels.
 
+### Calibrate one shared panel Transformer
+
+The panel experiment keeps each stock's feature and executable-return scalers
+independent and fitted only on that stock's retained training rows. It forms
+each stock's scaled windows first, concatenates only complete windows, and fits
+one unchanged, unconditioned `ForecastTransformer`. The local Transformer fits
+one model per stock; the panel Transformer fits one model across AAPL, MSFT,
+and SPY. There are no symbol or sector embeddings, per-symbol heads, Artifact
+V1 changes, C runtime changes, policy support, or historical-test access.
+
+The first panel contract requires the three CSVs in explicit AAPL, MSFT, SPY
+order with identical timestamp tuples. Each fold also proves the last training
+target is available by the first validation decision time. Total batch size
+remains 128. The run cap counts work in series-equivalent units: the existing
+local sweep costs 117, while panel validation and calibration add 30 and 15,
+respectively, for 162 total. The shared weights are physically fitted 15 times.
+
+After the immutable attempt is armed, use the one-shot driver in
+`docs/superpowers/plans/2026-07-23-panel-transformer.md` Task 7. It binds the
+no-bytecode environment, runs preflight, creates the run directory, analyzes,
+and finalizes exactly once. Do not invoke the experiment stage by itself; the
+driver executes that stage as:
+
+```zsh
+RUN_DIR=reports/h13-panel-20260723-01
+TORCH=(/Users/Enkang.Yuan1/.local/bin/uv run \
+  --offline --with torch python)
+
+"${TORCH[@]}" tools/experiment.py \
+  experiments/executable-h13-panel.example.json \
+  "$RUN_DIR/experiment.json" \
+  AAPL=data/aapl-30m.csv \
+  MSFT=data/msft-30m.csv \
+  SPY=data/spy-30m.csv \
+  --attempt-manifest experiments/executable-h13-panel-attempt.json \
+  --input-manifest experiments/executable-h13-panel-inputs.json \
+  --baseline-report reports/executable-h13-calibration.json \
+  --baseline-ledger reports/executable-h13-calibration.jsonl \
+  --device cpu \
+  --calibration-only \
+  --calibration-predictions "$RUN_DIR/calibration.jsonl" \
+  --max-runs 162
+```
+
+This is experiment-only and calibration-only. The predeclared gates require
+panel validation return MAE to beat every local model and zero return; a
+negative mean paired panel-minus-local Transformer validation delta, at least
+20 wins in 30 stock/fold/seed pairs, and a nonpositive mean delta for every
+stock; seed-ensemble calibration return MAE below every comparator; per-stock
+calibration return MAE below zero return; macro direction above the per-stock
+majority-sign reference and at least 50% for every stock; and positive mean
+per-stock relative close-MAE improvement over zero return. Equality fails every
+strict gate. No result has been recorded for this run.
+
 ### Predeclare the common-stock universe
 
 The `liquid-common-11` universe was declared and checkpointed on 2026-07-23

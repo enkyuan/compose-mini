@@ -26,7 +26,8 @@ STUB_TEST_SRC = $(filter-out $(BEHAVIOR_TEST_SRC), $(TEST_SRC))
 STUB_TEST_BIN = $(patsubst $(C_TEST_DIR)/%.c, bin/tests/%, $(STUB_TEST_SRC))
 PYTHON_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_artifact_v1.py \
               test_backtest.py test_data_v1.py test_e2e.py test_massive.py \
-              test_policy.py test_session_samples.py test_universe_analysis.py \
+              test_panel_analysis.py test_panel_driver.py test_policy.py \
+              test_session_samples.py test_universe_analysis.py \
               test_universe_scaling_arm.py test_universe_scaling_driver.py)
 PYTORCH_TEST = $(addprefix $(PYTHON_TEST_DIR)/, test_training.py \
                test_experiment.py)
