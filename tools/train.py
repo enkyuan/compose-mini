@@ -33,28 +33,35 @@ from tools.data_v1 import (
 from tools.float32 import f32
 from tools.session_samples import SampleRows
 
+# tier-a-v1 rolling context window (bars). 12 30-min bars ~= one session.
+TIER_A_WINDOW = 12
+
 FEATURE_NAMES = {
     "ohlcv": ("open", "high", "low", "close", "volume"),
     "stationary-v1": (
         "log_gap", "log_body", "log_upper_wick", "log_lower_wick",
         "log_volume_change",
     ),
+    # ponytail: Tier A = stationary-v1 + rolling context, no new data source.
+    "tier-a-v1": (
+        "log_gap", "log_body", "log_upper_wick", "log_lower_wick",
+        "log_volume_change", "realized_vol", "volume_zscore", "range_pct",
+    ),
 }
 FEATURE_SETS = tuple(FEATURE_NAMES)
+
+_LOOKBACK = {"ohlcv": 0, "stationary-v1": 1, "tier-a-v1": TIER_A_WINDOW}
 
 
 def feature_lookback(feature_set: str) -> int:
     """Return raw bars required before the first model feature row."""
     if feature_set not in FEATURE_SETS:
         raise ValueError(f"unsupported feature set: {feature_set}")
-    return int(feature_set != "ohlcv")
+    return _LOOKBACK[feature_set]
 
 
-def feature_values(raw: torch.Tensor, feature_set: str) -> torch.Tensor:
-    """Return five features aligned to each completed source bar."""
-    if feature_set == "ohlcv":
-        return raw
-    feature_lookback(feature_set)
+def _stationary(raw: torch.Tensor) -> torch.Tensor:
+    """Five per-bar log features aligned to each completed bar after the first."""
     open_, high, low, close, volume = raw.unbind(1)
     if not torch.all(raw[:, :4] > 0) or not torch.all(volume >= 0) or \
        not torch.all(low <= torch.minimum(open_, close)) or \
@@ -67,6 +74,36 @@ def feature_values(raw: torch.Tensor, feature_set: str) -> torch.Tensor:
         torch.log(high[1:] / torch.maximum(current_open, current_close)),
         torch.log(torch.minimum(current_open, current_close) / low[1:]),
         torch.log1p(volume[1:]) - torch.log1p(volume[:-1]),
+    ), 1)
+
+
+def feature_values(raw: torch.Tensor, feature_set: str) -> torch.Tensor:
+    """Return features aligned to each completed source bar past the lookback."""
+    if feature_set == "ohlcv":
+        return raw
+    if feature_set == "stationary-v1":
+        return _stationary(raw)
+    # tier-a-v1: rolling context from OHLCV only. Every window ends on the
+    # completed bar it describes, so no target-period bar leaks into a feature.
+    stat = _stationary(raw)                       # rows: len(raw) - 1
+    w = TIER_A_WINDOW
+    if stat.shape[0] < w:
+        raise ValueError("tier-a-v1 requires more bars than the context window")
+    log_return = stat[:, 1]                        # log(close/open) per bar
+    volume = raw[1:, 4]
+    high, low, close = raw[1:, 1], raw[1:, 2], raw[1:, 3]
+    # Rolling stats over the trailing w bars, indexed by the window's last bar.
+    ret_win = log_return.unfold(0, w, 1)           # rows: len(stat) - w + 1
+    vol_win = volume.unfold(0, w, 1)
+    realized_vol = ret_win.std(dim=1, unbiased=True)
+    vmean, vstd = vol_win.mean(dim=1), vol_win.std(dim=1, unbiased=True)
+    volume_zscore = (volume[w - 1:] - vmean) / (vstd + 1e-8)
+    range_pct = (high[w - 1:] - low[w - 1:]) / close[w - 1:]
+    # Trim the per-bar features to the same tail the rolling stats produce.
+    base = _stationary(raw)[w - 1:]
+    return torch.cat((
+        base,
+        torch.stack((realized_vol, volume_zscore, range_pct), 1),
     ), 1)
 
 

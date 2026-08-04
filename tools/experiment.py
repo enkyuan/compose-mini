@@ -176,7 +176,8 @@ class Candidate:
 
     def config(self) -> Config:
         return Config(self.model_dim, self.heads, self.ff_dim,
-                      self.layers, self.seq_len)
+                      self.layers, self.seq_len,
+                      in_dim=len(FEATURE_NAMES[self.feature_set]))
 
 
 def _model_fingerprint(model: nn.Module, data: TrainingData,
@@ -251,7 +252,7 @@ class Sweep:
            len(set(models_value)) != len(models_value):
             raise ValueError("models must be unique supported names")
         for candidate in candidates:
-            flat = candidate.seq_len * FEATURE_COUNT
+            flat = candidate.seq_len * len(FEATURE_NAMES[candidate.feature_set])
             if "linear" in models_value and flat > MAX_FLAT_FEATURES:
                 raise ValueError(f"{candidate.name} exceeds the linear feature cap")
             mlp_parameters = flat * candidate.mlp_dim + candidate.mlp_dim + 1
@@ -282,10 +283,11 @@ class Sweep:
 
 
 class FlatMLP(nn.Module):
-    def __init__(self, seq_len: int, hidden: int) -> None:
+    def __init__(self, seq_len: int, hidden: int,
+                 in_dim: int = FEATURE_COUNT) -> None:
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Flatten(), nn.Linear(seq_len * FEATURE_COUNT, hidden),
+            nn.Flatten(), nn.Linear(seq_len * in_dim, hidden),
             nn.GELU(approximate="none"), nn.Linear(hidden, 1),
         )
 
@@ -565,7 +567,8 @@ def _neural_model(model_name: str, candidate: Candidate,
     if model_name in TRANSFORMERS:
         return ForecastTransformer(candidate.config())
     if model_name == "mlp":
-        return FlatMLP(candidate.seq_len, candidate.mlp_dim)
+        return FlatMLP(candidate.seq_len, candidate.mlp_dim,
+                       len(FEATURE_NAMES[candidate.feature_set]))
     raise ValueError("unsupported neural model")
 
 

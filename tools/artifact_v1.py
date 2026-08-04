@@ -38,8 +38,8 @@ class Config:
         if any(type(value) is not int or not 0 < value <= 0x7FFF_FFFF
                for value in values):
             raise ValueError("model dimensions must be positive signed 32-bit integers")
-        if self.in_dim != FEATURE_COUNT:
-            raise ValueError("artifact V1 requires five OHLCV features")
+        # in_dim > FEATURE_COUNT is legal for in-memory experiments; the V1
+        # export path re-checks the OHLCV width in _prefix (feature stats == 5).
         if self.model_dim % self.num_heads:
             raise ValueError("model_dim must be divisible by num_heads")
         if self.parameter_count > MAX_PARAMETERS:
@@ -134,6 +134,8 @@ def _f32(value: float, name: str) -> float:
 def _prefix(artifact: Artifact) -> bytes:
     config = artifact.config
     config.validate()
+    if config.in_dim != FEATURE_COUNT:
+        raise ValueError("artifact V1 requires five OHLCV features")
     model_version, interval = _identifiers(artifact.model_version, artifact.interval)
     means = tuple(_f32(value, "feature mean") for value in artifact.feature_mean)
     scales = tuple(_f32(value, "feature scale") for value in artifact.feature_scale)
